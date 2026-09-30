@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/hood-core", "crates/recorder", "crates/enricher", "crates/decoders"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# WebSocket: yawc, because the feed requires permessage-deflate (RFC 7692)
+# and tungstenite 0.30 has no deflate support.
+yawc = "0.4"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-native-certs = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+alloy-primitives = "1"
+alloy-sol-types = "1"
+hood-core = { path = "crates/hood-core" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

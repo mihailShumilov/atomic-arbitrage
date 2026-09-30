@@ -1,0 +1,8 @@
+/target
+/data/
+*.env
+.env*
+!.env.example
+**/*.jsonl.zst
+.DS_Store
+/atomic-arbitrage-bootstrap.zip
