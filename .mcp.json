@@ -12,7 +12,7 @@
       ],
       "env": {
         "CLICKHOUSE_HOST": "localhost",
-        "CLICKHOUSE_PORT": "8123",
+        "CLICKHOUSE_PORT": "18123",
         "CLICKHOUSE_USER": "hood",
         "CLICKHOUSE_SECURE": "false"
       }

@@ -6,3 +6,4 @@
 **/*.jsonl.zst
 .DS_Store
 /atomic-arbitrage-bootstrap.zip
+.idea/

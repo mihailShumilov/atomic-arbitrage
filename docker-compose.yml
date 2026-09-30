@@ -1,7 +1,10 @@
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:latest
-    ports: ["8123:8123", "9000:9000"]
+    # Unique host ports (other local projects use 8123/9000); loopback only.
+    ports:
+      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-18123}:8123"
+      - "127.0.0.1:${CLICKHOUSE_TCP_PORT:-19100}:9000"
     environment:
       CLICKHOUSE_USER: hood
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}

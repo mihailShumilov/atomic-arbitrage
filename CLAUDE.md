@@ -60,6 +60,8 @@ cargo run --release -p enricher -- --from <N> --to <M> --out-dir data/blocks
 docker compose up -d clickhouse   # схема из sql/ применяется при первом старте
 ```
 
+Docker: только уникальные порты хоста и только `127.0.0.1` — на машине работают другие проекты. ClickHouse: HTTP `127.0.0.1:18123`, native `127.0.0.1:19100` (`CLICKHOUSE_HTTP_PORT` / `CLICKHOUSE_TCP_PORT` в `.env`). Новые сервисы — тоже на свободных нестандартных портах, проверять `lsof -iTCP -sTCP:LISTEN`.
+
 ## Как работать
 
 - Изменения кода — через индексатора (indexer-engineer); после изменения декодеров/загрузчиков — data-auditor; любой результат для Михаила — через skeptic-analyst.
