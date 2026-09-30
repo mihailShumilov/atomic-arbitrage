@@ -1,5 +1,5 @@
 # 001 — Проверка развёртывания: сборка, тесты, 10 минут фида, агенты, скиллы, MCP
-status: ready
+status: done
 phase: 1a
 depends-on: —
 executor: indexer-engineer

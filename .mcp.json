@@ -5,13 +5,15 @@
       "url": "https://mcp.context7.com/mcp"
     },
     "clickhouse": {
-      "command": "uvx",
-      "args": ["mcp-clickhouse"],
+      "command": "sh",
+      "args": [
+        "-c",
+        "set -a; . ./.env; set +a; exec uvx mcp-clickhouse"
+      ],
       "env": {
         "CLICKHOUSE_HOST": "localhost",
         "CLICKHOUSE_PORT": "8123",
         "CLICKHOUSE_USER": "hood",
-        "CLICKHOUSE_PASSWORD": "${CLICKHOUSE_PASSWORD}",
         "CLICKHOUSE_SECURE": "false"
       }
     }

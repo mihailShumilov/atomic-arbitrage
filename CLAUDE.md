@@ -28,9 +28,13 @@ analytics/          Python: исследования и бэктесты (пос
 docs/               общая папка с Cowork: STATE.md, costs.md, decisions/, research/,
                     handoff/to-code/ (задачи), handoff/from-code/ (отчёты), reviews/
 .claude/skills/     hoodchain-mev — конституция проекта;
-                    cowork-handoff — протокол работы с Cowork и шаблоны
+                    cowork-handoff — протокол работы с Cowork и шаблоны;
+                    feed-audit — скрипт проверки записи фида;
+                    clickhouse-best-practices, clickhouse-architecture-advisor —
+                    сторонние (clickhouse/agent-skills, skills-lock.json); при
+                    расхождении прав hoodchain-mev (data-model.md)
 .claude/agents/     indexer-engineer, data-auditor, skeptic-analyst, arb-researcher,
-                    engine-engineer, infra-ops, contract-reviewer
+                    engine-engineer, infra-ops, contract-reviewer, contract-registrar
 ```
 
 ## Кто исполняет и кто проверяет
@@ -41,6 +45,7 @@ docs/               общая папка с Cowork: STATE.md, costs.md, decisio
 | Аналитика: арбитраж, импульс, портреты конкурентов | arb-researcher | data-auditor (данные) + skeptic-analyst (выводы) |
 | Движок: revm, состояние пулов, маршруты, симулятор повтора, бумажная торговля, латентность | engine-engineer | бенчмарки; skeptic-analyst для оценок прибыли |
 | Серверы, мониторинг, бэкапы, деплой, учёт расходов | infra-ops | траты утверждает Михаил |
+| Реестр контрактов: адреса, ABI, статусы в `contracts.md` | contract-registrar | `verified` ставит Михаил |
 | Смарт-контракт исполнителя (фаза 2+) | engine-engineer | contract-reviewer — обязательно до развёртывания |
 | Любой вывод «стратегия прибыльна» | — | skeptic-analyst, затем решение Михаила |
 
