@@ -1,5 +1,5 @@
 # 006 — Цифры для решения по истории + перепроверка фактов прежней сессии
-status: ready
+status: done
 phase: 1a
 depends-on: 003
 executor: indexer-engineer (замеры), infra-ops (цены провайдеров и ноды)
