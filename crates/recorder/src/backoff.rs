@@ -159,6 +159,49 @@ impl Ladder {
     }
 }
 
+/// Why the process waits before its first connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupWaitReason {
+    /// A pause chosen by the previous process (e.g. `Retry-After` of a ban).
+    PendingPause,
+    /// Less than `--min-connect-interval-secs` since the last `connected`.
+    MinConnectInterval,
+}
+
+impl StartupWaitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StartupWaitReason::PendingPause => "pending_pause",
+            StartupWaitReason::MinConnectInterval => "min_connect_interval",
+        }
+    }
+}
+
+/// How long to wait before the first connection after a (re)start (task 008,
+/// item 2). Both limits come from connections.tsv of earlier runs:
+/// `pending_until_ns` is the end of the last chosen reconnect pause,
+/// `last_connected_ns` the time of the last successful upgrade. The longer
+/// remaining wait wins; None if neither is still running.
+pub fn startup_wait(
+    now_ns: u128,
+    pending_until_ns: Option<u128>,
+    last_connected_ns: Option<u128>,
+    min_interval: Duration,
+) -> Option<(Duration, StartupWaitReason)> {
+    let left = |until: u128| {
+        Duration::from_nanos(until.saturating_sub(now_ns).min(u64::MAX as u128) as u64)
+    };
+    let pending = pending_until_ns.map(left).unwrap_or_default();
+    let interval = last_connected_ns
+        .map(|t| left(t.saturating_add(min_interval.as_nanos())))
+        .unwrap_or_default();
+    match (pending.is_zero(), interval.is_zero()) {
+        (true, true) => None,
+        _ if pending >= interval => Some((pending, StartupWaitReason::PendingPause)),
+        _ => Some((interval, StartupWaitReason::MinConnectInterval)),
+    }
+}
+
 /// Parse an HTTP `Retry-After` value: delta-seconds or an HTTP-date.
 /// `now_unix` is used to turn a date into a delay.
 pub fn parse_retry_after(v: &str, now_unix: i64) -> Option<Duration> {
@@ -180,6 +223,59 @@ mod tests {
 
     fn minutes(n: u64) -> Duration {
         Duration::from_secs(n * 60)
+    }
+
+    const SEC: u128 = 1_000_000_000;
+
+    /// Acceptance for item 2: `connected` 30 s ago with the default 120 s
+    /// interval -> wait ~90 s.
+    #[test]
+    fn startup_wait_after_recent_connect() {
+        let now = 1_790_800_000 * SEC;
+        let min = Duration::from_secs(120);
+        let (w, r) = startup_wait(now, None, Some(now - 30 * SEC), min).unwrap();
+        assert_eq!(w, Duration::from_secs(90));
+        assert_eq!(r, StartupWaitReason::MinConnectInterval);
+        assert_eq!(r.as_str(), "min_connect_interval");
+        // Long ago, or never connected: no wait.
+        assert_eq!(startup_wait(now, None, Some(now - 121 * SEC), min), None);
+        assert_eq!(startup_wait(now, None, Some(now - 120 * SEC), min), None);
+        assert_eq!(startup_wait(now, None, None, min), None);
+        // Interval disabled.
+        assert_eq!(
+            startup_wait(now, None, Some(now - SEC), Duration::ZERO),
+            None
+        );
+        // Clock went backwards (connected "in the future"): wait at most the interval.
+        let (w, _) = startup_wait(now, None, Some(now + 5 * SEC), min).unwrap();
+        assert_eq!(w, Duration::from_secs(125));
+    }
+
+    #[test]
+    fn startup_wait_takes_the_longer_of_pause_and_interval() {
+        let now = 1_790_800_000 * SEC;
+        let min = Duration::from_secs(120);
+        // Ban pause (3600 s from 10 s ago) beats the interval.
+        let (w, r) = startup_wait(now, Some(now + 3590 * SEC), Some(now - 11 * SEC), min).unwrap();
+        assert_eq!(
+            (w, r),
+            (Duration::from_secs(3590), StartupWaitReason::PendingPause)
+        );
+        // Short pause already over, interval still running.
+        let (w, r) = startup_wait(now, Some(now - SEC), Some(now - 100 * SEC), min).unwrap();
+        assert_eq!(
+            (w, r),
+            (
+                Duration::from_secs(20),
+                StartupWaitReason::MinConnectInterval
+            )
+        );
+        // Pause still running, no connect in the log.
+        let (w, r) = startup_wait(now, Some(now + 3 * SEC), None, min).unwrap();
+        assert_eq!(
+            (w, r),
+            (Duration::from_secs(3), StartupWaitReason::PendingPause)
+        );
     }
 
     #[test]

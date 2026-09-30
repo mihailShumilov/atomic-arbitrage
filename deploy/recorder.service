@@ -18,11 +18,17 @@ Group=hood
 WorkingDirectory=/opt/hoodchain-mev
 Environment=RUST_LOG=info
 # Exactly one feed connection per IP from this unit. Do not run a second
-# recorder against the same IP (limit is 2, the 3rd gets 429).
+# recorder against the same IP. "Limit is 2, the 3rd gets 429" is UNVERIFIED
+# (from a lost session, never reproduced); what was observed is a
+# 403 + Retry-After: 3600 ban (2026-09-30), see deploy/README.md.
 ExecStart=/opt/hoodchain-mev/bin/recorder --out-dir /srv/hood/data/feed
 
 Restart=always
-RestartSec=30
+# 120 s between a crash and the next start. The 2026-09-30 ban followed a
+# reconnect 11 s after kill -9. The recorder also enforces this itself
+# (--min-connect-interval-secs 120, from connections.tsv), so a manual
+# `systemctl restart` is spaced out as well. See deploy/README.md.
+RestartSec=120
 # SIGTERM: drain queue, close the zstd frame, fsync, write last_seq.txt.
 KillSignal=SIGTERM
 KillMode=mixed

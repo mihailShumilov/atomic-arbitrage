@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Audit recorded sequencer-feed files (data/feed/**/feed-*.tsv.zst).
 
-Stdlib only (Python 3.9+); decompression via the `zstd` CLI, which handles
-multi-frame files. Streams line by line, so a full day of feed is fine.
+Stdlib only (Python 3.9+); decompression via the `zstd` CLI. Streams line by
+line, so a full day of feed is fine.
 
 Checks:
-  - every file decompresses completely (`zstd -dc` rc == 0);
+  - zstd integrity per frame: every complete frame decompresses (checksum);
+    bytes after the last complete frame are allowed only as the open frame of
+    the current UTC hour (<= 1 frame, recorder still writing). A torn tail in
+    a closed hour is a FAIL;
   - 4 TSV columns; seq_first/seq_last columns agree with the JSON;
+  - seq-0 lines are classified: recorderFrame:<opcode>,
+    confirmedSequenceNumberMessage, other (only "other" is a WARN);
   - sequence numbers strictly +1 in file order, no duplicates;
   - every missing range is listed in <feed-root>/gaps.tsv;
   - recv_unix_ns non-decreasing; last_seq.txt == last recorded seq;
@@ -14,25 +19,40 @@ Checks:
     (blockHash; l1BlockNumber vs feed header.blockNumber, see chain-facts.md:
     equal for kind 3, running max of header.blockNumber for delayed kinds).
 
-Prints numbers (blocks, blocks/s, MB/h, inter-arrival percentiles, kinds)
-and a PASS/FAIL verdict. Exit code: 0 PASS, 1 FAIL, 2 usage error.
+Rates (blocks/s, MB/h) are computed over session time: the recording is cut
+into sessions at `connected` events of <feed-root>/connections.tsv (if it
+exists) and wherever two neighbouring lines are more than --session-gap-s
+apart; a session lasts from its first to its last line. The plain first-to-
+last span is printed separately (recv_span_s, *_span).
+
+Ignored inputs: anything under `_torn/`, `connections.tsv`, `*.tmp`, and
+names that are not feed-*.tsv.zst.
+
+Exit code: 0 PASS, 1 FAIL, 2 usage error.
 
 Usage:
   feed_audit.py data/feed/2026/09/30/feed-20260930-11.tsv.zst
-  feed_audit.py --feed-root data/feed --rpc-sample 20 data/feed/2026/09/30/*.tsv.zst
+  feed_audit.py --feed-root data/feed --rpc-sample 20 'data/feed/2026/09/30/*.tsv.zst'
 """
 
 import argparse
+import base64
+import binascii
+import bisect
 import collections
+import datetime
+import fnmatch
 import glob
 import json
 import os
 import random
 import subprocess
 import sys
+import threading
 import urllib.request
 
 PUBLIC_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
+ZSTD_MAGIC = 0xFD2FB528
 
 
 def pct(sorted_vals, q):
@@ -50,6 +70,152 @@ def read_gaps(path):
                 if len(p) >= 2 and p[0].strip().isdigit():
                     gaps.append((int(p[0]), int(p[1])))
     return gaps
+
+
+def read_connected(path):
+    """Unix-ns timestamps of `connected` events in connections.tsv (sorted)."""
+    out = []
+    if not os.path.exists(path):
+        return None
+    with open(path, errors="replace") as f:
+        for ln in f:
+            c = ln.rstrip("\n").split("\t")
+            if len(c) >= 3 and c[2] == "connected" and c[1].isdigit():
+                out.append(int(c[1]))
+    return sorted(out)
+
+
+def frame_len(buf, pos):
+    """Length of the zstd (or skippable) frame starting at `pos`.
+
+    Returns (n, None) for a structurally complete frame, (None, "incomplete")
+    if the data ends inside the frame, (None, "invalid") for bad magic or a
+    reserved field. Content and checksum are verified later by `zstd -dc`.
+    """
+    n = len(buf)
+    if pos + 4 > n:
+        return None, "incomplete" if buf[pos:] == ZSTD_MAGIC.to_bytes(4, "little")[: n - pos] else "invalid"
+    magic = int.from_bytes(buf[pos:pos + 4], "little")
+    if 0x184D2A50 <= magic <= 0x184D2A5F:  # skippable frame
+        if pos + 8 > n:
+            return None, "incomplete"
+        end = pos + 8 + int.from_bytes(buf[pos + 4:pos + 8], "little")
+        return (end - pos, None) if end <= n else (None, "incomplete")
+    if magic != ZSTD_MAGIC:
+        return None, "invalid"
+    p = pos + 4
+    if p >= n:
+        return None, "incomplete"
+    fhd = buf[p]
+    p += 1
+    if (fhd >> 3) & 1:
+        return None, "invalid"
+    fcs_flag, single, checksum, did = fhd >> 6, (fhd >> 5) & 1, (fhd >> 2) & 1, fhd & 3
+    p += 0 if single else 1
+    p += (0, 1, 2, 4)[did]
+    p += (1 if single else 0, 2, 4, 8)[fcs_flag]
+    while True:
+        if p + 3 > n:
+            return None, "incomplete"
+        h = buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16)
+        p += 3
+        last, btype, bsize = h & 1, (h >> 1) & 3, h >> 3
+        if btype == 3:
+            return None, "invalid"
+        p += 1 if btype == 1 else bsize
+        if p > n:
+            return None, "incomplete"
+        if last:
+            break
+    if checksum:
+        p += 4
+    if p > n:
+        return None, "incomplete"
+    return p - pos, None
+
+
+def split_frames(buf):
+    """(frames, complete_end, tail_state): tail_state is None (no tail),
+    "incomplete" (one unfinished frame) or "invalid" (garbage)."""
+    pos, frames = 0, 0
+    while pos < len(buf):
+        n, state = frame_len(buf, pos)
+        if n is None:
+            return frames, pos, state
+        pos += n
+        frames += 1
+    return frames, pos, None
+
+
+def hour_of(path):
+    """'YYYYMMDD-HH' from feed-YYYYMMDD-HH.tsv.zst, else None."""
+    name = os.path.basename(path)
+    if name.startswith("feed-") and name.endswith(".tsv.zst"):
+        return name[len("feed-"):-len(".tsv.zst")]
+    return None
+
+
+def is_feed_file(path):
+    parts = os.path.normpath(path).split(os.sep)
+    name = parts[-1]
+    if "_torn" in parts[:-1] or name.endswith(".tmp") or name == "connections.tsv":
+        return False
+    return fnmatch.fnmatch(name, "feed-*.tsv.zst")
+
+
+def decompress_lines(data):
+    """Yield decompressed lines of `data` (complete frames only) and finally
+    (rc, stderr) via the returned holder."""
+    proc = subprocess.Popen(["zstd", "-dc"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    err = []
+
+    def feed():
+        try:
+            proc.stdin.write(data)
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+
+    def drain_err():
+        err.append(proc.stderr.read())
+
+    t, te = threading.Thread(target=feed), threading.Thread(target=drain_err)
+    t.start()
+    te.start()
+    for bline in proc.stdout:
+        yield bline
+    proc.stdout.close()
+    t.join()
+    te.join()
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError((err[0] if err else b"").decode(errors="replace").strip() or "rc=%d" % rc)
+
+
+def classify_seq0(raw):
+    """Category of a seq-0 line, or 'with_messages' if it wrongly has messages."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return "other"
+    if not isinstance(obj, dict):
+        return "other"
+    if obj.get("messages"):
+        return "with_messages"
+    rf = obj.get("recorderFrame")
+    if isinstance(rf, dict):
+        try:
+            base64.b64decode(rf.get("payloadBase64", ""), validate=True)
+        except (binascii.Error, TypeError, ValueError):
+            return "other"
+        return "recorderFrame:%s" % rf.get("opcode")
+    if "confirmedSequenceNumberMessage" in obj:
+        return "confirmedSequenceNumberMessage"
+    return "other"
 
 
 def rpc_blocks(url, numbers):
@@ -70,27 +236,42 @@ def rpc_blocks(url, numbers):
     return out
 
 
+def utc(ns):
+    return datetime.datetime.utcfromtimestamp(ns / 1e9).strftime("%Y-%m-%dT%H:%M:%S.%fZ")[:-4] + "Z"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("files", nargs="+", help="feed-*.tsv.zst files or globs")
-    ap.add_argument("--feed-root", help="recorder --out-dir (for gaps.tsv and last_seq.txt)")
+    ap.add_argument("--feed-root", help="recorder --out-dir (for gaps.tsv, last_seq.txt, connections.tsv)")
     ap.add_argument("--rpc-sample", type=int, default=0, help="blocks to compare with RPC (0 = none)")
     ap.add_argument("--rpc-url", default=os.environ.get("RPC_URL", PUBLIC_RPC_URL))
+    ap.add_argument("--session-gap-s", type=float, default=30.0,
+                    help="a pause between neighbouring lines longer than this starts a new session (default 30)")
+    ap.add_argument("--current-hour", default=None,
+                    help="YYYYMMDD-HH treated as the open hour (default: now, UTC)")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     a = ap.parse_args()
 
-    files = sorted({f for pat in a.files for f in (glob.glob(pat) or [pat])})
-    missing_files = [f for f in files if not os.path.exists(f)]
+    expanded = sorted({f for pat in a.files for f in (glob.glob(pat) or [pat])})
+    missing_files = [f for f in expanded if not os.path.exists(f)]
     if missing_files:
         print("no such file: %s" % ", ".join(missing_files), file=sys.stderr)
         return 2
+    files = [f for f in expanded if os.path.isfile(f) and is_feed_file(f)]
+    ignored = [f for f in expanded if f not in files]
+    if not files:
+        print("no feed-*.tsv.zst files among the inputs", file=sys.stderr)
+        return 2
+    current_hour = a.current_hour or datetime.datetime.utcnow().strftime("%Y%m%d-%H")
 
     fails = []
     warns = []
+    lines = 0
     envelopes = 0
     msgs_per_env = collections.Counter()
     kinds = collections.Counter()
-    seq0_lines = 0
+    seq0 = collections.Counter()
     col_errors = 0
     bad_json = 0
     col_mismatch = 0
@@ -99,74 +280,121 @@ def main():
     first_seq = last_seq = None
     first_ns = last_ns = None
     ns_backwards = 0
-    interarrival = []
     raw_bytes = 0
     zst_bytes = 0
+    frames_total = 0
+    open_tails = []
     # seq -> (blockHash, header.blockNumber, kind, running max header.blockNumber)
     blocks = {}
     l1_max = None
 
+    connected = read_connected(os.path.join(a.feed_root, "connections.tsv")) if a.feed_root else None
+    gap_ns = int(a.session_gap_s * 1e9)
+    # sessions: list of dicts; current session key
+    sessions = []
+    cur = None
+    prev_env_ns = None  # last sequenced line in the current session
+    interarrival = []
+
     for path in files:
         zst_bytes += os.path.getsize(path)
-        proc = subprocess.Popen(["zstd", "-dc", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        for bline in proc.stdout:
-            raw_bytes += len(bline)
-            line = bline.decode("utf-8", "replace").rstrip("\n")
-            parts = line.split("\t", 3)
-            if len(parts) != 4:
-                col_errors += 1
-                continue
-            ns, sf, sl = int(parts[0]), int(parts[1]), int(parts[2])
-            envelopes += 1
-            if last_ns is not None:
-                if ns < last_ns:
-                    ns_backwards += 1
-                interarrival.append((ns - last_ns) / 1e6)
-            if first_ns is None:
-                first_ns = ns
-            last_ns = ns
-            if sf == 0:
-                seq0_lines += 1  # stored unparseable envelope
-                continue
-            try:
-                env = json.loads(parts[3])
-            except ValueError:
-                bad_json += 1  # typically a cut-off last line of an unfinished frame
-                continue
-            msgs = env.get("messages") or []
-            msgs_per_env[len(msgs)] += 1
-            seqs = [m["sequenceNumber"] for m in msgs]
-            if not seqs or seqs[0] != sf or seqs[-1] != sl:
-                col_mismatch += 1
-            for m in msgs:
-                s = m["sequenceNumber"]
-                hdr = m["message"]["message"]["header"]
-                kinds[hdr["kind"]] += 1
-                if s in blocks:
-                    dups += 1
+        with open(path, "rb") as fh:
+            data = fh.read()
+        frames, end, tail = split_frames(data)
+        frames_total += frames
+        tail_bytes = len(data) - end
+        if tail_bytes:
+            if tail == "incomplete" and hour_of(path) == current_hour:
+                open_tails.append((path, tail_bytes))
+            elif tail == "incomplete":
+                fails.append("torn zstd tail in closed hour: %s (%d bytes after %d complete frames)" % (path, tail_bytes, frames))
+            else:
+                fails.append("garbage after the last complete zstd frame: %s (%d bytes)" % (path, tail_bytes))
+        if end == 0:
+            continue
+        try:
+            for bline in decompress_lines(data[:end]):
+                raw_bytes += len(bline)
+                line = bline.decode("utf-8", "replace").rstrip("\n")
+                parts = line.split("\t", 3)
+                try:
+                    if len(parts) != 4:
+                        raise ValueError
+                    ns, sf, sl = int(parts[0]), int(parts[1]), int(parts[2])
+                except ValueError:
+                    col_errors += 1
                     continue
-                if last_seq is not None and s != last_seq + 1:
-                    if s > last_seq + 1:
-                        gaps.append((last_seq + 1, s - 1))
-                    else:
-                        fails.append("seq went backwards: %d after %d" % (s, last_seq))
-                l1 = hdr["blockNumber"]
-                l1_max = l1 if l1_max is None else max(l1_max, l1)
-                blocks[s] = (m.get("blockHash"), l1, hdr["kind"], l1_max)
-                if first_seq is None:
-                    first_seq = s
-                last_seq = s
-        proc.stdout.close()
-        err = proc.stderr.read().decode().strip()
-        if proc.wait() != 0:
-            fails.append("zstd -dc failed on %s (incomplete frame?): %s" % (path, err))
+                lines += 1
+                if last_ns is not None and ns < last_ns:
+                    ns_backwards += 1
+                # session bookkeeping (all lines, pings included)
+                conn_idx = bisect.bisect_right(connected, ns) - 1 if connected else -1
+                new_session = (
+                    cur is None
+                    or conn_idx != cur["conn"]
+                    or (last_ns is not None and ns - last_ns > gap_ns)
+                )
+                if new_session:
+                    cur = {"conn": conn_idx, "first": ns, "last": ns, "blocks": 0}
+                    sessions.append(cur)
+                    prev_env_ns = None
+                cur["last"] = max(cur["last"], ns)
+                if first_ns is None:
+                    first_ns = ns
+                last_ns = ns
+
+                if sf == 0 and sl == 0:
+                    cat = classify_seq0(parts[3])
+                    seq0[cat] += 1
+                    continue
+                if sf == 0 or sl == 0:
+                    col_mismatch += 1
+                try:
+                    env = json.loads(parts[3])
+                except ValueError:
+                    bad_json += 1
+                    continue
+                envelopes += 1
+                if prev_env_ns is not None:
+                    interarrival.append((ns - prev_env_ns) / 1e6)
+                prev_env_ns = ns
+                msgs = env.get("messages") or []
+                msgs_per_env[len(msgs)] += 1
+                seqs = [m["sequenceNumber"] for m in msgs]
+                if not seqs or seqs[0] != sf or seqs[-1] != sl:
+                    col_mismatch += 1
+                for m in msgs:
+                    s = m["sequenceNumber"]
+                    hdr = m["message"]["message"]["header"]
+                    kinds[hdr["kind"]] += 1
+                    if s in blocks:
+                        dups += 1
+                        continue
+                    if last_seq is not None and s != last_seq + 1:
+                        if s > last_seq + 1:
+                            gaps.append((last_seq + 1, s - 1))
+                        else:
+                            fails.append("seq went backwards: %d after %d" % (s, last_seq))
+                    l1 = hdr["blockNumber"]
+                    l1_max = l1 if l1_max is None else max(l1_max, l1)
+                    blocks[s] = (m.get("blockHash"), l1, hdr["kind"], l1_max)
+                    cur["blocks"] += 1
+                    if first_seq is None:
+                        first_seq = s
+                    last_seq = s
+        except RuntimeError as e:
+            fails.append("zstd -dc failed on complete frames of %s (corrupt frame?): %s" % (path, e))
 
     if not blocks:
+        for p, b in open_tails:
+            print("open frame of current hour %s: %s, %d bytes (not audited)" % (current_hour, p, b), file=sys.stderr)
+        for f in fails:
+            print("FAIL  " + f, file=sys.stderr)
         print("no blocks found", file=sys.stderr)
         return 1
 
     if col_errors:
-        fails.append("%d lines without 4 TSV columns" % col_errors)
+        fails.append("%d lines without 4 TSV columns / integer seq columns" % col_errors)
     if bad_json:
         fails.append("%d lines with broken JSON" % bad_json)
     if col_mismatch:
@@ -175,8 +403,10 @@ def main():
         fails.append("%d duplicate sequence numbers" % dups)
     if ns_backwards:
         fails.append("recv_unix_ns went backwards %d times" % ns_backwards)
-    if seq0_lines:
-        warns.append("%d unparseable envelopes stored with seq 0" % seq0_lines)
+    if seq0.get("with_messages"):
+        fails.append("%d seq-0 lines carry messages" % seq0["with_messages"])
+    if seq0.get("other"):
+        warns.append("%d seq-0 lines are neither recorderFrame nor confirmedSequenceNumberMessage" % seq0["other"])
     no_hash = sum(1 for v in blocks.values() if not v[0])
     if no_hash:
         warns.append("%d blocks without blockHash" % no_hash)
@@ -229,10 +459,19 @@ def main():
 
     interarrival.sort()
     span_s = (last_ns - first_ns) / 1e9 if last_ns and first_ns else 0.0
+    session_s = sum((s["last"] - s["first"]) / 1e9 for s in sessions)
     n_blocks = len(blocks)
+    source = "gap>%gs" % a.session_gap_s
+    if connected is not None:
+        source = "connections.tsv (%d connected) + %s" % (len(connected), source)
     summary = {
         "files": len(files),
+        "ignored_inputs": len(ignored),
+        "zstd_frames": frames_total,
+        "open_tail": ["%s: %d bytes (open frame of current hour %s, not audited)" % (p, b, current_hour) for p, b in open_tails],
+        "lines": lines,
         "envelopes": envelopes,
+        "seq0_lines": dict(sorted(seq0.items())),
         "msgs_per_envelope": dict(msgs_per_env),
         "first_seq": first_seq,
         "last_seq": last_seq,
@@ -242,11 +481,19 @@ def main():
         "gaps": gaps,
         "gaps_tsv_entries": len(gaps_file),
         "kinds": dict(kinds),
-        "recv_span_s": round(span_s, 1),
-        "blocks_per_s": round(n_blocks / span_s, 3) if span_s else None,
+        "sessions": len(sessions),
+        "session_source": source,
+        "session_list": [
+            "%s +%.1fs blocks=%d" % (utc(s["first"]), (s["last"] - s["first"]) / 1e9, s["blocks"]) for s in sessions
+        ],
+        "session_s": round(session_s, 1),
+        "blocks_per_s": round(n_blocks / session_s, 3) if session_s else None,
         "zst_mb": round(zst_bytes / 1e6, 2),
         "raw_mb": round(raw_bytes / 1e6, 1),
-        "mb_per_hour": round(zst_bytes / 1e6 / span_s * 3600, 1) if span_s else None,
+        "mb_per_hour": round(zst_bytes / 1e6 / session_s * 3600, 1) if session_s else None,
+        "recv_span_s": round(span_s, 1),
+        "blocks_per_s_span": round(n_blocks / span_s, 3) if span_s else None,
+        "mb_per_hour_span": round(zst_bytes / 1e6 / span_s * 3600, 1) if span_s else None,
         "interarrival_ms": {
             "p50": round(pct(interarrival, 0.5), 1),
             "p99": round(pct(interarrival, 0.99), 1),
@@ -263,6 +510,11 @@ def main():
     else:
         for k, v in summary.items():
             if k in ("warnings", "failures", "verdict"):
+                continue
+            if isinstance(v, list) and k in ("session_list", "open_tail"):
+                print("%-18s %s" % (k, "" if v else "[]"))
+                for item in v:
+                    print("  " + item)
                 continue
             print("%-18s %s" % (k, v))
         for w in warns:

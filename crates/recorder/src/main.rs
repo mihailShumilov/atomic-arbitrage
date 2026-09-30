@@ -4,13 +4,18 @@
 //!   <out>/YYYY/MM/DD/feed-YYYYMMDD-HH.tsv.zst
 //! Line format (tab-separated, unchanged):
 //!   recv_unix_ns \t seq_first \t seq_last \t <raw envelope JSON>
-//! Lines without sequence numbers (envelopes without `messages`, non-text
-//! frames wrapped as `{"recorderFrame":...}`) have `seq_first = seq_last = 0`.
+//! Lines without sequence numbers (JSON envelopes without `messages`;
+//! non-text frames and text that is not JSON, wrapped as
+//! `{"recorderFrame":...}`) have `seq_first = seq_last = 0`.
+//!
+//! Start-up: repair torn zstd tails, add holes missing from gaps.tsv, wait
+//! out a pending pause / the minimum connect interval. Shutdown (SIGINT,
+//! SIGTERM): WebSocket Close 1000, wait <= 2 s for the reply, drain, commit.
 //!
 //! Side files in <out>:
 //!   gaps.tsv         `from \t to \t recv_ns` of missing L2 blocks (for RPC backfill)
 //!   last_seq.txt     highest seq that is fsynced to disk (atomic replace)
-//!   connections.tsv  connect/disconnect events and chosen reconnect pauses
+//!   connections.tsv  connect/disconnect/startup/shutdown events and chosen pauses
 //!   _torn/           torn zstd tails cut off after a crash (kept for analysis)
 //!
 //! Deliberately NOT done here: decoding l2Msg, signature checks, anything
@@ -31,8 +36,8 @@ use clap::Parser;
 use hood_core::FEED_URL;
 use tracing::{error, info, warn};
 
-use crate::backoff::Ladder;
-use crate::net::{now_ns, run_connection, tls_connector, ConnEvent, ConnLog};
+use crate::backoff::{startup_wait, Ladder, StartupWaitReason};
+use crate::net::{now_ns, run_connection, stopped, tls_connector, ConnEvent, ConnLog};
 use crate::route::Line;
 use crate::writer::FeedWriter;
 
@@ -54,10 +59,17 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     frame_secs: u64,
     /// Do not wait out a reconnect pause (e.g. Retry-After of a ban) that a
-    /// previous run recorded in connections.tsv. Use only if you know the
-    /// ban is over; the default is to honour it.
+    /// previous run recorded in connections.tsv, and skip the
+    /// --min-connect-interval-secs wait. Use only if you know the ban is
+    /// over; the default is to honour both.
     #[arg(long)]
     ignore_pending_pause: bool,
+    /// Minimum time between the last successful connect of an earlier run
+    /// (from connections.tsv) and the first connect after a (re)start. The
+    /// 403 + Retry-After: 3600 ban of 2026-09-30 followed a reconnect 11 s
+    /// after kill -9; the cause is unknown, so restarts are spaced out.
+    #[arg(long, default_value_t = 120)]
+    min_connect_interval_secs: u64,
 }
 
 /// Cheap jitter source in [0, 1) without an RNG dependency.
@@ -112,6 +124,18 @@ async fn main() -> Result<()> {
         torn_repairs = rec.repairs.len(), "recovery done"
     );
     let conn_log = ConnLog::new(&args.out_dir);
+    for g in &rec.reconciled {
+        let detail = format!(
+            "{}..{} recv_ns={} missing from gaps.tsv, appended",
+            g.from, g.to, g.recv_ns
+        );
+        conn_log.event(ConnEvent {
+            event: "gap_reconciled",
+            reason: "startup",
+            detail: &detail,
+            ..Default::default()
+        });
+    }
     for r in &rec.repairs {
         let detail = format!(
             "{} kept={} torn={} saved={}",
@@ -144,79 +168,141 @@ async fn main() -> Result<()> {
 
     let tls = tls_connector()?;
     let idle = Duration::from_secs(args.idle_timeout_secs);
-    let net = async {
-        let mut ladder = Ladder::default();
-        // Honour a pause (e.g. Retry-After of a ban) chosen before a restart.
-        if let Some(p) = conn_log.last_pause().filter(|_| !args.ignore_pending_pause) {
-            ladder.strikes = p.strikes;
-            let now = now_ns();
-            if p.not_before_ns > now {
-                let wait = Duration::from_nanos((p.not_before_ns - now) as u64);
-                warn!(
-                    wait_s = wait.as_secs_f64(),
-                    strikes = p.strikes,
-                    "pause from before restart still active, waiting"
+    let min_interval = Duration::from_secs(args.min_connect_interval_secs);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    // The network future borrows `tx`; it lives in this block so that `tx`
+    // can be dropped after it.
+    {
+        let net = async {
+            let mut stop = stop_rx.clone();
+            let mut ladder = Ladder::default();
+            // Honour a pause (e.g. Retry-After of a ban) chosen before a restart
+            // and the minimum interval since the last successful connect.
+            if !args.ignore_pending_pause {
+                let pending = conn_log.last_pause();
+                if let Some(p) = pending {
+                    ladder.strikes = p.strikes;
+                }
+                let wait = startup_wait(
+                    now_ns(),
+                    pending.map(|p| p.not_before_ns),
+                    conn_log.last_connected_ns(),
+                    min_interval,
                 );
-                let detail = format!("remaining pause from previous run, strikes={}", p.strikes);
-                conn_log.event(ConnEvent {
-                    event: "startup_wait",
-                    reason: "pending_pause",
-                    pause: Some(wait),
-                    strikes: Some(p.strikes),
-                    detail: &detail,
-                    ..Default::default()
-                });
-                tokio::time::sleep(wait).await;
+                if let Some((wait, why)) = wait {
+                    let strikes = pending.map_or(0, |p| p.strikes);
+                    warn!(
+                        wait_s = wait.as_secs_f64(),
+                        reason = why.as_str(),
+                        strikes,
+                        "waiting before the first connect"
+                    );
+                    let detail = match why {
+                        StartupWaitReason::PendingPause => {
+                            format!("remaining pause from previous run, strikes={strikes}")
+                        }
+                        StartupWaitReason::MinConnectInterval => format!(
+                            "last connect less than {}s ago",
+                            args.min_connect_interval_secs
+                        ),
+                    };
+                    conn_log.event(ConnEvent {
+                        event: "startup_wait",
+                        reason: why.as_str(),
+                        pause: Some(wait),
+                        strikes: Some(strikes),
+                        detail: &detail,
+                        ..Default::default()
+                    });
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = stopped(&mut stop) => return,
+                    }
+                }
             }
-        }
-        loop {
-            let end = run_connection(&args.url, &tls, idle, &tx, || {
+            loop {
+                let end = run_connection(&args.url, &tls, idle, &tx, &mut stop, || {
+                    conn_log.event(ConnEvent {
+                        event: "connected",
+                        reason: "-",
+                        http_status: Some(101),
+                        strikes: Some(ladder.strikes),
+                        detail: &args.url,
+                        ..Default::default()
+                    });
+                })
+                .await;
+                if *stop.borrow() {
+                    if let Some(c) = &end.client_close {
+                        let detail = format!(
+                            "sent close 1000, waited {} ms; {}",
+                            c.took.as_millis(),
+                            c.detail
+                        );
+                        conn_log.event(ConnEvent {
+                            event: "client_close",
+                            reason: c.reason,
+                            http_status: Some(101),
+                            session: Some(end.session),
+                            envelopes: Some(end.envelopes),
+                            detail: &detail,
+                            ..Default::default()
+                        });
+                    }
+                    return;
+                }
+                let (pause, rule) =
+                    ladder.next_pause(end.kind, end.retry_after, end.session, rand01());
+                warn!(
+                    reason = end.kind.as_str(), http = ?end.http_status, retry_after = ?end.retry_after_raw,
+                    session_s = end.session.as_secs_f64(), envelopes = end.envelopes,
+                    pause_s = pause.as_secs_f64(), rule = rule.as_str(), detail = %end.detail,
+                    "connection ended"
+                );
+                let detail = format!("rule={} {}", rule.as_str(), end.detail);
                 conn_log.event(ConnEvent {
-                    event: "connected",
-                    reason: "-",
-                    http_status: Some(101),
+                    event: "disconnected",
+                    reason: end.kind.as_str(),
+                    http_status: end.http_status,
+                    retry_after: end.retry_after_raw.as_deref(),
+                    pause: Some(pause),
+                    session: Some(end.session),
+                    envelopes: Some(end.envelopes),
                     strikes: Some(ladder.strikes),
-                    detail: &args.url,
-                    ..Default::default()
+                    detail: &detail,
                 });
-            })
-            .await;
-            let (pause, rule) = ladder.next_pause(end.kind, end.retry_after, end.session, rand01());
-            warn!(
-                reason = end.kind.as_str(), http = ?end.http_status, retry_after = ?end.retry_after_raw,
-                session_s = end.session.as_secs_f64(), envelopes = end.envelopes,
-                pause_s = pause.as_secs_f64(), rule = rule.as_str(), detail = %end.detail,
-                "connection ended"
-            );
-            let detail = format!("rule={} {}", rule.as_str(), end.detail);
-            conn_log.event(ConnEvent {
-                event: "disconnected",
-                reason: end.kind.as_str(),
-                http_status: end.http_status,
-                retry_after: end.retry_after_raw.as_deref(),
-                pause: Some(pause),
-                session: Some(end.session),
-                envelopes: Some(end.envelopes),
-                strikes: Some(ladder.strikes),
-                detail: &detail,
-            });
-            tokio::time::sleep(pause).await;
-        }
-    };
+                tokio::select! {
+                    _ = tokio::time::sleep(pause) => {}
+                    _ = stopped(&mut stop) => return,
+                }
+            }
+        };
+        tokio::pin!(net);
 
-    let sig = tokio::select! {
-        _ = net => unreachable!("network loop never returns"),
-        s = shutdown_signal() => s,
-    };
-    info!(
-        signal = sig,
-        "shutting down: draining queue, closing frame, fsync"
-    );
-    conn_log.event(ConnEvent {
-        event: "shutdown",
-        reason: sig,
-        ..Default::default()
-    });
+        let sig = tokio::select! {
+            _ = &mut net => unreachable!("network loop only returns after stop"),
+            s = shutdown_signal() => s,
+        };
+        info!(
+            signal = sig,
+            "shutting down: closing connection, draining queue, closing frame, fsync"
+        );
+        conn_log.event(ConnEvent {
+            event: "shutdown",
+            reason: sig,
+            ..Default::default()
+        });
+        // Let the network loop finish the WebSocket close handshake (<= 2 s for
+        // the server's reply + 0.5 s for the stream shutdown). The outer bound
+        // only guards against a bug; systemd gives us TimeoutStopSec=30.
+        let _ = stop_tx.send(true);
+        if tokio::time::timeout(Duration::from_secs(5), &mut net)
+            .await
+            .is_err()
+        {
+            warn!("network loop did not stop in 5 s, dropping the connection");
+        }
+    }
     // Dropping the sender lets the writer drain everything queued and commit.
     drop(tx);
     if writer.join().is_err() {

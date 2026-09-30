@@ -17,12 +17,17 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use futures::SinkExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::{rustls, TlsConnector};
 use tracing::{info, warn};
-use yawc::{frame::OpCode, CompressionLevel, MaybeTlsStream, Options, WebSocket, WebSocketError};
+use yawc::close::CloseCode;
+use yawc::{
+    frame::OpCode, CompressionLevel, Frame, MaybeTlsStream, Options, WebSocket, WebSocketError,
+};
 
 use crate::backoff::{parse_retry_after, EndKind};
 use crate::route::{route_opaque, route_text, Line};
@@ -30,6 +35,10 @@ use crate::route::{route_opaque, route_text, Line};
 pub const CONNECTIONS_FILE: &str = "connections.tsv";
 const HEAD_CAP: usize = 16 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// On shutdown: how long to wait for the server's Close after sending ours.
+pub const CLOSE_REPLY_WAIT: Duration = Duration::from_secs(2);
+/// On shutdown: bound on the final TLS close_notify / TCP FIN.
+const CLOSE_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 
 pub fn now_ns() -> u128 {
     SystemTime::now()
@@ -182,6 +191,18 @@ pub struct ConnEnd {
     pub session: Duration,
     pub envelopes: u64,
     pub detail: String,
+    /// Set when the connection was ended by us on shutdown (after upgrade).
+    pub client_close: Option<Box<CloseOutcome>>,
+}
+
+/// Result of the client-initiated close handshake on shutdown.
+#[derive(Debug, Clone)]
+pub struct CloseOutcome {
+    /// `server_replied`, `no_reply`, `stream_ended` or `send_failed`.
+    pub reason: &'static str,
+    /// From sending our Close to the end of the wait.
+    pub took: Duration,
+    pub detail: String,
 }
 
 impl ConnEnd {
@@ -194,6 +215,7 @@ impl ConnEnd {
             session: Duration::ZERO,
             envelopes: 0,
             detail,
+            client_close: None,
         }
     }
 }
@@ -273,6 +295,7 @@ async fn connect(url_str: &str, tls: &TlsConnector) -> std::result::Result<FeedW
                 session: Duration::ZERO,
                 envelopes: 0,
                 detail: format!("upgrade: {e}; {}", head.status_line),
+                client_close: None,
             })
         }
         Err(_) => Err(ConnEnd {
@@ -293,16 +316,124 @@ fn opcode_name(op: OpCode) -> &'static str {
     }
 }
 
-/// One connection: connect, stream frames into `tx` until it ends.
-/// `on_connected` is called right after a successful upgrade.
+/// Frame -> raw line. Also logs a server close frame; returns its summary.
+fn route_frame(frame: &Frame, recv_ns: u128) -> (Line, Option<String>) {
+    let op = frame.opcode();
+    match op {
+        OpCode::Text => match std::str::from_utf8(frame.payload()) {
+            Ok(s) => (route_text(recv_ns, s.to_owned()), None),
+            Err(_) => (
+                route_opaque(recv_ns, "text_invalid_utf8", frame.payload()),
+                None,
+            ),
+        },
+        other => {
+            let mut close = None;
+            if other == OpCode::Close {
+                let code = frame.close_code().map(u16::from);
+                let reason = frame
+                    .close_reason()
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+                    .to_string();
+                close = Some(format!("close frame code={code:?} reason={reason:?}"));
+            }
+            (
+                route_opaque(recv_ns, opcode_name(other), frame.payload()),
+                close,
+            )
+        }
+    }
+}
+
+/// Resolves once `stop` is true (or its sender is gone).
+pub async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|s| *s).await;
+}
+
+/// Client-initiated close on shutdown (task 008, item 3): send Close 1000,
+/// keep recording whatever still arrives until the server's Close or
+/// [`CLOSE_REPLY_WAIT`], then shut the stream down (TLS close_notify, FIN).
+/// Before 008 the socket was simply dropped on SIGTERM, without a Close.
+async fn close_gracefully(ws: &mut FeedWs, tx: &SyncSender<Line>) -> CloseOutcome {
+    let t0 = Instant::now();
+    let deadline = tokio::time::Instant::now() + CLOSE_REPLY_WAIT;
+    let sent = tokio::time::timeout_at(
+        deadline,
+        ws.send(Frame::close(CloseCode::Normal, b"recorder shutdown")),
+    )
+    .await;
+    let mut out = match sent {
+        Err(_) => CloseOutcome {
+            reason: "send_failed",
+            took: t0.elapsed(),
+            detail: "timeout sending close frame".into(),
+        },
+        Ok(Err(e)) => CloseOutcome {
+            reason: "send_failed",
+            took: t0.elapsed(),
+            detail: format!("sending close frame: {e}"),
+        },
+        Ok(Ok(())) => loop {
+            match tokio::time::timeout_at(deadline, ws.next_frame()).await {
+                Err(_) => {
+                    break CloseOutcome {
+                        reason: "no_reply",
+                        took: t0.elapsed(),
+                        detail: format!("no close frame from server within {CLOSE_REPLY_WAIT:?}"),
+                    }
+                }
+                Ok(Err(e)) => {
+                    break CloseOutcome {
+                        reason: "stream_ended",
+                        took: t0.elapsed(),
+                        detail: format!("stream ended before the server's close: {e}"),
+                    }
+                }
+                Ok(Ok(frame)) => {
+                    let (line, close) = route_frame(&frame, now_ns());
+                    // Nothing is dropped, also during the close handshake.
+                    let _ = tx.send(line);
+                    if let Some(c) = close {
+                        break CloseOutcome {
+                            reason: "server_replied",
+                            took: t0.elapsed(),
+                            detail: c,
+                        };
+                    }
+                }
+            }
+        },
+    };
+    match tokio::time::timeout(CLOSE_SHUTDOWN_WAIT, ws.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => out.detail = format!("{}; stream shutdown: {e}", out.detail),
+        Err(_) => out.detail = format!("{}; stream shutdown timed out", out.detail),
+    }
+    out
+}
+
+/// One connection: connect, stream frames into `tx` until it ends or `stop`
+/// becomes true. `on_connected` is called right after a successful upgrade.
+/// On stop after the upgrade the close handshake is done and reported in
+/// [`ConnEnd::client_close`].
 pub async fn run_connection(
     url: &str,
     tls: &TlsConnector,
     idle: Duration,
     tx: &SyncSender<Line>,
+    stop: &mut watch::Receiver<bool>,
     mut on_connected: impl FnMut(),
 ) -> ConnEnd {
-    let mut ws = match connect(url, tls).await {
+    let connected = tokio::select! {
+        biased;
+        _ = stopped(stop) => {
+            return ConnEnd::failed(EndKind::NetError, "stopped before upgrade".into());
+        }
+        r = connect(url, tls) => r,
+    };
+    let mut ws = match connected {
         Ok(ws) => ws,
         Err(end) => return end,
     };
@@ -321,10 +452,26 @@ pub async fn run_connection(
         session: started.elapsed(),
         envelopes,
         detail,
+        client_close: None,
     };
 
     loop {
-        let frame = match tokio::time::timeout(idle, ws.next_frame()).await {
+        let next = tokio::select! {
+            biased;
+            _ = stopped(stop) => None,
+            r = tokio::time::timeout(idle, ws.next_frame()) => Some(r),
+        };
+        let Some(next) = next else {
+            let outcome = close_gracefully(&mut ws, tx).await;
+            info!(
+                reason = outcome.reason, took_ms = outcome.took.as_millis() as u64,
+                detail = %outcome.detail, "client close handshake done"
+            );
+            let mut e = end(EndKind::ServerClosed, "client shutdown".into(), envelopes);
+            e.client_close = Some(Box::new(outcome));
+            return e;
+        };
+        let frame = match next {
             Err(_) => return end(EndKind::Idle, format!("no frame for {idle:?}"), envelopes),
             Ok(Err(e)) => {
                 let d = match &close_info {
@@ -335,28 +482,11 @@ pub async fn run_connection(
             }
             Ok(Ok(f)) => f,
         };
-        let recv_ns = now_ns();
-        let op = frame.opcode();
-        let line = match op {
-            OpCode::Text => match std::str::from_utf8(frame.payload()) {
-                Ok(s) => route_text(recv_ns, s.to_owned()),
-                Err(_) => route_opaque(recv_ns, "text_invalid_utf8", frame.payload()),
-            },
-            other => {
-                if other == OpCode::Close {
-                    let code = frame.close_code().map(u16::from);
-                    let reason = frame
-                        .close_reason()
-                        .ok()
-                        .flatten()
-                        .unwrap_or("")
-                        .to_string();
-                    close_info = Some(format!("close frame code={code:?} reason={reason:?}"));
-                    warn!(?code, reason, "server sent close frame");
-                }
-                route_opaque(recv_ns, opcode_name(other), frame.payload())
-            }
-        };
+        let (line, close) = route_frame(&frame, now_ns());
+        if let Some(c) = close {
+            warn!(detail = %c, "server sent close frame");
+            close_info = Some(c);
+        }
         let seq_last = line.seq_last;
         let sequenced = line.has_seq();
         if tx.send(line).is_err() {
@@ -455,17 +585,36 @@ impl ConnLog {
         }
     }
 
-    /// The pause chosen at the last `disconnected` event, if the log has one.
-    pub fn last_pause(&self) -> Option<PendingPause> {
+    /// Last 64 KiB of the log (the log grows by a few rows per connect).
+    fn tail(&self) -> Option<String> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(&self.path).ok()?;
         let len = f.metadata().ok()?.len();
         let from = len.saturating_sub(64 * 1024);
         f.seek(SeekFrom::Start(from)).ok()?;
-        let mut buf = String::new();
-        f.read_to_string(&mut buf).ok()?;
-        buf.lines().rev().find_map(parse_pause_row)
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        Some(String::from_utf8_lossy(&buf).into_owned())
     }
+
+    /// The pause chosen at the last `disconnected` event, if the log has one.
+    pub fn last_pause(&self) -> Option<PendingPause> {
+        self.tail()?.lines().rev().find_map(parse_pause_row)
+    }
+
+    /// Unix ns of the last `connected` event, if the log has one.
+    pub fn last_connected_ns(&self) -> Option<u128> {
+        self.tail()?.lines().rev().find_map(parse_connected_row)
+    }
+}
+
+/// Timestamp of a `connected` row. Works for both column layouts seen so far
+/// (with and without the `strikes` column): ts_unix_ns and event come first.
+pub fn parse_connected_row(line: &str) -> Option<u128> {
+    let mut c = line.split('\t');
+    let _ts = c.next()?;
+    let ns = c.next()?;
+    (c.next()? == "connected").then(|| ns.parse().ok())?
 }
 
 /// Parse a `disconnected` row into the pending pause it defines.
@@ -567,6 +716,36 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(CONNECTIONS_FILE)).unwrap();
         assert!(text.starts_with(CONNECTIONS_HEADER));
         assert!(text.lines().all(|l| l.split('\t').count() == 11), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn last_connected_from_both_log_layouts() {
+        // Rows copied from data/feed-test-002/connections.tsv (task 002): the
+        // first run wrote 10 columns, later runs 11 (with `strikes`).
+        let old = "2026-09-30T12:52:21.202Z\t1790772741202619000\tconnected\t-\t101\t-\t-\t-\t-\twss://feed.mainnet.chain.robinhood.com";
+        let new = "2026-09-30T13:57:32.226Z\t1790776652226292000\tconnected\t-\t101\t-\t-\t-\t-\t0\twss://feed.mainnet.chain.robinhood.com";
+        assert_eq!(parse_connected_row(old), Some(1790772741202619000));
+        assert_eq!(parse_connected_row(new), Some(1790776652226292000));
+        assert_eq!(parse_connected_row(CONNECTIONS_HEADER), None);
+        assert_eq!(
+            parse_connected_row("2026-09-30T14:03:00.329Z\t1790776980329123000\tshutdown\tSIGTERM"),
+            None
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "recorder-connlog2-{}-{}",
+            std::process::id(),
+            now_ns()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = ConnLog::new(&dir);
+        assert_eq!(log.last_connected_ns(), None);
+        std::fs::write(
+            dir.join(CONNECTIONS_FILE),
+            format!("{CONNECTIONS_HEADER}\n{old}\n{new}\n2026-09-30T14:03:00.329Z\t1790776980329123000\tshutdown\tSIGTERM\t-\t-\t-\t-\t-\t-\t-\n"),
+        )
+        .unwrap();
+        assert_eq!(log.last_connected_ns(), Some(1790776652226292000));
         std::fs::remove_dir_all(&dir).ok();
     }
 

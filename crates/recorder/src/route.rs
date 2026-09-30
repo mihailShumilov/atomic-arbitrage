@@ -2,11 +2,15 @@
 //!
 //! Nothing is dropped here:
 //! - text frames with `messages` -> seq_first/seq_last from the messages;
-//! - text frames without `messages` (e.g. only `confirmedSequenceNumber`) and
-//!   unparseable text -> stored verbatim with `seq_first = seq_last = 0`;
-//! - non-text frames (binary, ping, pong, close) and text with invalid UTF-8
+//! - valid JSON text without `messages` (e.g. only
+//!   `confirmedSequenceNumberMessage`) -> stored verbatim with
+//!   `seq_first = seq_last = 0`;
+//! - text that is not valid JSON (task 008, remark З3 of the 002 audit),
+//!   non-text frames (binary, ping, pong, close) and text with invalid UTF-8
 //!   -> a recorder-made JSON wrapper with the payload in base64, also seq 0:
-//!   `{"recorderFrame":{"opcode":"ping","payloadBase64":"..."}}`.
+//!   `{"recorderFrame":{"opcode":"ping","payloadBase64":"..."}}`
+//!   (`opcode` is `text` for unparseable text). The payload bytes survive
+//!   exactly, including any CR/LF/TAB that would clash with the line format.
 //!   The key `recorderFrame` never occurs in the feed, so a parser can tell
 //!   the two apart; the line format itself is unchanged.
 //!
@@ -69,9 +73,16 @@ pub fn intra_envelope_gaps(seqs: &[u64]) -> (Vec<Gap>, u32) {
     (gaps, disorder)
 }
 
-/// A text frame. `raw` is stored as is.
+/// A text frame. Valid JSON is stored as is; anything else goes into a
+/// base64 `recorderFrame` with `opcode: "text"`.
 pub fn route_text(recv_ns: u128, raw: String) -> Line {
-    let env: FeedEnvelope = match serde_json::from_str(&raw) {
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return route_opaque(recv_ns, "text", raw.as_bytes()),
+    };
+    // Valid JSON, but not an envelope we understand (e.g. `messages` of an
+    // unexpected shape): keep verbatim, unsequenced.
+    let env: FeedEnvelope = match serde_json::from_value(value) {
         Ok(e) => e,
         Err(_) => return Line::unsequenced(recv_ns, raw),
     };
@@ -166,12 +177,32 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_text_is_kept_verbatim() {
-        let l = route_text(7, "not json".to_string());
-        assert_eq!(
-            (l.seq_first, l.seq_last, l.raw.as_str()),
-            (0, 0, "not json")
-        );
+    fn unparseable_text_is_base64_wrapped() {
+        use base64::Engine;
+        let text = "not json\r\nsecond\tline";
+        let l = route_text(7, text.to_string());
+        assert_eq!((l.recv_ns, l.seq_first, l.seq_last), (7, 0, 0));
+        assert!(!l.has_seq());
+        let v: serde_json::Value = serde_json::from_str(&l.raw).unwrap();
+        assert_eq!(v["recorderFrame"]["opcode"], "text");
+        let b64 = v["recorderFrame"]["payloadBase64"].as_str().unwrap();
+        let back = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(back, text.as_bytes()); // byte-exact, CR/LF/TAB included
+        assert!(!l.raw.contains(['\n', '\r', '\t']));
+        // Truncated envelope (not valid JSON) is wrapped, too.
+        let cut = &envelope(&[5])[..40];
+        let l = route_text(8, cut.to_string());
+        assert!(l.raw.starts_with(r#"{"recorderFrame":{"opcode":"text""#));
+    }
+
+    #[test]
+    fn valid_json_of_unknown_shape_is_kept_verbatim() {
+        for raw in [r#"[1,2]"#, r#""s""#, r#"{"messages":"x"}"#, r#"{"a":1}"#] {
+            let l = route_text(7, raw.to_string());
+            assert_eq!((l.seq_first, l.seq_last, l.raw.as_str()), (0, 0, raw));
+        }
     }
 
     #[test]

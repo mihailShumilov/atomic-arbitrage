@@ -31,6 +31,12 @@ pub const STATE_FILE: &str = "last_seq.txt";
 pub const GAPS_FILE: &str = "gaps.tsv";
 pub const TORN_DIR: &str = "_torn";
 
+/// Longest the writer thread blocks on the channel between deadline checks.
+pub const POLL_STEP: Duration = Duration::from_millis(500);
+/// Headroom reserved for finish + fsync, so that a frame is on disk no later
+/// than `frame_max` after its first line.
+pub const COMMIT_GUARD: Duration = Duration::from_millis(200);
+
 // ------------------------------------------------------------- fs helpers ---
 
 /// fsync a directory so a rename/create inside it is durable. Best effort:
@@ -179,19 +185,172 @@ pub fn max_seq_in_file(path: &Path) -> Result<Option<u64>> {
     Ok(best)
 }
 
+/// One `gaps.tsv` row: `from \t to \t recv_ns` (recv_ns of the first line
+/// after the hole).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GapRow {
+    pub from: u64,
+    pub to: u64,
+    pub recv_ns: u128,
+}
+
+/// Ranges already listed in `gaps.tsv` (malformed rows are ignored).
+pub fn read_gap_ranges(out: &Path) -> Vec<(u64, u64)> {
+    let Ok(text) = fs::read_to_string(out.join(GAPS_FILE)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            let mut c = l.split('\t');
+            let from = c.next()?.trim().parse().ok()?;
+            let to = c.next()?.trim().parse().ok()?;
+            Some((from, to))
+        })
+        .collect()
+}
+
+/// Parts of `[from, to]` not covered by any of `listed`.
+fn uncovered(from: u64, to: u64, listed: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut iv: Vec<(u64, u64)> = listed
+        .iter()
+        .copied()
+        .filter(|&(f, t)| f <= t && t >= from && f <= to)
+        .collect();
+    iv.sort_unstable();
+    let mut out = Vec::new();
+    let mut cur = from;
+    for (f, t) in iv {
+        if f > cur {
+            out.push((cur, f - 1));
+        }
+        if t >= cur {
+            match t.checked_add(1) {
+                Some(n) => cur = n,
+                None => return out,
+            }
+        }
+        if cur > to {
+            return out;
+        }
+    }
+    if cur <= to {
+        out.push((cur, to));
+    }
+    out
+}
+
+/// Replays the writer's gap bookkeeping ([`FeedWriter::accept`]) over the
+/// lines of one hourly file, continuing from `last` (highest seq seen before
+/// this file). Holes found are appended to `holes`. Returns the highest seq in
+/// the file. An empty file is fine (cut back to zero after a crash).
+pub fn scan_seq_holes(
+    path: &Path,
+    last: &mut Option<u64>,
+    holes: &mut Vec<GapRow>,
+) -> Result<Option<u64>> {
+    let f = File::open(path)?;
+    if f.metadata()?.len() == 0 {
+        return Ok(None);
+    }
+    let dec = zstd::stream::read::Decoder::new(f)?;
+    let mut best: Option<u64> = None;
+    for line in BufReader::with_capacity(1 << 20, dec).split(b'\n') {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let mut cols = line.splitn(4, |&b| b == b'\t');
+        let num = |c: Option<&[u8]>| -> Option<u128> { std::str::from_utf8(c?).ok()?.parse().ok() };
+        let (Some(recv_ns), Some(first), Some(lastc)) =
+            (num(cols.next()), num(cols.next()), num(cols.next()))
+        else {
+            continue;
+        };
+        let (first, lastc) = (first as u64, lastc as u64);
+        if first == 0 && lastc == 0 {
+            continue;
+        }
+        // Single-message envelopes (all of them so far) need no JSON parse.
+        let (seq_max, intra) = if first == lastc {
+            (first, Vec::new())
+        } else {
+            let raw = cols.next().unwrap_or_default();
+            match serde_json::from_slice::<hood_core::FeedEnvelope>(raw) {
+                Ok(env) if !env.messages.is_empty() => {
+                    let seqs: Vec<u64> = env.messages.iter().map(|m| m.sequence_number).collect();
+                    let (g, _) = crate::route::intra_envelope_gaps(&seqs);
+                    (seqs.iter().copied().max().unwrap_or(lastc), g)
+                }
+                _ => (first.max(lastc), Vec::new()),
+            }
+        };
+        best = Some(best.map_or(seq_max, |b| b.max(seq_max)));
+        if last.is_some_and(|l| seq_max <= l) {
+            continue; // the writer skips such lines; they are never on disk
+        }
+        if let Some(g) = detect_gap(*last, first) {
+            holes.push(GapRow {
+                from: g.from,
+                to: g.to,
+                recv_ns,
+            });
+        }
+        for g in intra {
+            if last.is_none_or(|s| g.to > s) {
+                holes.push(GapRow {
+                    from: g.from,
+                    to: g.to,
+                    recv_ns,
+                });
+            }
+        }
+        *last = Some(last.map_or(seq_max, |s| s.max(seq_max)));
+    }
+    Ok(best)
+}
+
+/// Remark З1 of the 002 audit: the writer fsyncs data before appending the
+/// gap row, so a crash in between leaves a hole in the data that gaps.tsv
+/// does not know about. Holes found in `holes` but not covered by gaps.tsv
+/// are appended (fsync) and returned. Idempotent: a second call adds nothing.
+pub fn reconcile_gaps(out: &Path, holes: &[GapRow]) -> Result<Vec<GapRow>> {
+    let listed = read_gap_ranges(out);
+    let mut missing = Vec::new();
+    for h in holes {
+        for (from, to) in uncovered(h.from, h.to, &listed) {
+            missing.push(GapRow {
+                from,
+                to,
+                recv_ns: h.recv_ns,
+            });
+        }
+    }
+    if !missing.is_empty() {
+        let path = out.join(GAPS_FILE);
+        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        for g in &missing {
+            writeln!(f, "{}\t{}\t{}", g.from, g.to, g.recv_ns)?;
+        }
+        f.sync_data()?;
+        sync_dir(out);
+    }
+    Ok(missing)
+}
+
 #[derive(Debug, Default)]
 pub struct Recovery {
     pub repairs: Vec<TornRepair>,
+    /// Holes in the data that were missing from gaps.tsv and got appended.
+    pub reconciled: Vec<GapRow>,
     pub state_seq: Option<u64>,
     pub data_seq: Option<u64>,
     /// Where to resume gap detection from.
     pub resume_seq: Option<u64>,
 }
 
-/// Start-up recovery: repair torn tails of the newest two hourly files, then
-/// derive the resume point. Data wins over `last_seq.txt`: if the state lags
-/// (killed between fsync and state write) we would otherwise report a fake
-/// gap; if the state leads (must not happen) we would hide a real one.
+/// Start-up recovery: repair torn tails of the newest two hourly files,
+/// reconcile holes in those files (and at the seam with the file before
+/// them) with gaps.tsv, then derive the resume point. Data wins over
+/// `last_seq.txt`: if the state lags (killed between fsync and state write)
+/// we would otherwise report a fake gap; if the state leads (must not happen)
+/// we would hide a real one.
 pub fn recover(out: &Path) -> Result<Recovery> {
     let files = list_feed_files(out);
     let torn_dir = out.join(TORN_DIR);
@@ -209,11 +368,38 @@ pub fn recover(out: &Path) -> Result<Recovery> {
             rec.repairs.push(r);
         }
     }
-    for f in files.iter().rev().take(3) {
-        if let Some(s) = max_seq_in_file(f)? {
-            rec.data_seq = Some(s);
-            break;
+    // The two newest files (already repaired) are scanned in full; the file
+    // before them only provides the seq at the seam. It is not repaired, so
+    // a read error there is logged and the seam check skipped.
+    let n = files.len();
+    let recent = &files[n.saturating_sub(2)..];
+    let mut seam: Option<u64> = None;
+    if n >= 3 {
+        match max_seq_in_file(&files[n - 3]) {
+            Ok(s) => seam = s,
+            Err(e) => warn!(
+                file = %files[n - 3].display(), error = %e,
+                "cannot read the file before the newest two, seam not checked"
+            ),
         }
+    }
+    let mut last = seam;
+    let mut holes = Vec::new();
+    let mut recent_max: Option<u64> = None;
+    for f in recent {
+        if let Some(s) = scan_seq_holes(f, &mut last, &mut holes)? {
+            recent_max = Some(recent_max.map_or(s, |b| b.max(s)));
+        }
+    }
+    rec.data_seq = recent_max.or(seam);
+    rec.reconciled = reconcile_gaps(out, &holes)?;
+    for g in &rec.reconciled {
+        warn!(
+            from = g.from,
+            to = g.to,
+            recv_ns = g.recv_ns as u64,
+            "hole in data was missing from gaps.tsv, appended"
+        );
     }
     rec.resume_seq = match (rec.data_seq, rec.state_seq) {
         (Some(d), Some(s)) if d != s => {
@@ -348,7 +534,10 @@ impl FeedWriter {
     fn write_line(&mut self, l: &Line) -> Result<()> {
         let t: DateTime<Utc> = DateTime::from_timestamp_nanos(l.recv_ns as i64);
         self.ensure_hour(t)?;
-        // Feed JSON is compact; guard against stray newlines anyway.
+        // `raw` is always valid JSON here (route.rs wraps anything else in a
+        // base64 `recorderFrame`). In valid JSON a raw CR/LF can only be
+        // insignificant whitespace between tokens (control characters are
+        // not allowed inside strings), so removing it keeps the value intact.
         let raw = l.raw.replace(['\n', '\r'], "");
         let enc = self.encoder()?;
         writeln!(
@@ -402,10 +591,20 @@ impl FeedWriter {
         Ok(())
     }
 
-    /// True when the open frame is older than `frame_max`.
+    /// Time left until the open frame must be committed, measured at `now`
+    /// (None if no frame is open). The deadline is `frame_max - COMMIT_GUARD`
+    /// after the first line of the frame, so that finish + fsync also fit
+    /// into `frame_max` (remark З4 of the 002 audit).
+    pub fn frame_time_left(&self, now: Instant) -> Option<Duration> {
+        let opened = self.frame_opened?;
+        let budget = self.frame_max.saturating_sub(COMMIT_GUARD);
+        Some(budget.saturating_sub(now.saturating_duration_since(opened)))
+    }
+
+    /// True when the open frame has reached its deadline.
     pub fn frame_due(&self) -> bool {
-        self.frame_opened
-            .is_some_and(|t| t.elapsed() >= self.frame_max)
+        self.frame_time_left(Instant::now())
+            .is_some_and(|d| d.is_zero())
     }
 
     /// Close the open frame, fsync, then publish gaps and last_seq.
@@ -451,7 +650,12 @@ impl FeedWriter {
 /// disk or compression. Returns once the channel is closed and drained.
 pub fn run(rx: Receiver<Line>, mut w: FeedWriter) -> Result<WriterStats> {
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        // Never sleep past the frame deadline: the wait is clipped to the
+        // time left, so the frame is committed on time even in silence.
+        let wait = w
+            .frame_time_left(Instant::now())
+            .map_or(POLL_STEP, |left| left.min(POLL_STEP));
+        match rx.recv_timeout(wait) {
             Ok(l) => w.accept(&l)?,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -599,6 +803,249 @@ mod tests {
         assert_eq!(max_seq_in_file(&p).unwrap(), None);
         assert_eq!(rec.data_seq, Some(50));
         assert_eq!(rec.resume_seq, Some(50));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn env_line(recv: u128, seqs: &[u64]) -> String {
+        let m: Vec<String> = seqs
+            .iter()
+            .map(|s| format!(r#"{{"sequenceNumber":{s}}}"#))
+            .collect();
+        format!(
+            "{recv}\t{}\t{}\t{{\"version\":1,\"messages\":[{}]}}\n",
+            seqs[0],
+            seqs[seqs.len() - 1],
+            m.join(",")
+        )
+    }
+
+    fn gaps_rows(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join(GAPS_FILE))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn uncovered_ranges() {
+        assert_eq!(uncovered(10, 20, &[]), vec![(10, 20)]);
+        assert_eq!(uncovered(10, 20, &[(10, 20)]), vec![]);
+        assert_eq!(uncovered(10, 20, &[(5, 30)]), vec![]);
+        assert_eq!(uncovered(10, 20, &[(12, 14)]), vec![(10, 11), (15, 20)]);
+        assert_eq!(
+            uncovered(10, 20, &[(18, 25), (1, 10), (13, 13)]),
+            vec![(11, 12), (14, 17)]
+        );
+        assert_eq!(uncovered(10, 20, &[(21, 30), (1, 9)]), vec![(10, 20)]);
+        assert_eq!(uncovered(10, 20, &[(0, u64::MAX)]), vec![]);
+    }
+
+    /// Acceptance test for item 1 (З1): a hole in the data without a
+    /// gaps.tsv row (crash between data fsync and the gaps.tsv append) is
+    /// added exactly once; a second start adds nothing.
+    #[test]
+    fn recover_appends_missing_gap_row_once() {
+        let dir = tmpdir("reconcile");
+        let day = dir.join("2026/09/30");
+        fs::create_dir_all(&day).unwrap();
+        // Hour 11: 100..=102. Hour 12: 103, hole 104..=106, 107, 108, ping.
+        fs::write(
+            day.join("feed-20260930-11.tsv.zst"),
+            frame(
+                &[
+                    env_line(1, &[100]),
+                    env_line(2, &[101]),
+                    env_line(3, &[102]),
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        fs::write(
+            day.join("feed-20260930-12.tsv.zst"),
+            [
+                frame(
+                    &[
+                        env_line(4, &[103]),
+                        "5\t0\t0\t{\"recorderFrame\":{}}\n".into(),
+                    ]
+                    .concat(),
+                ),
+                frame(&[env_line(6, &[107]), env_line(7, &[108])].concat()),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        fs::write(dir.join(STATE_FILE), "108").unwrap();
+
+        let rec = recover(&dir).unwrap();
+        assert_eq!(
+            rec.reconciled,
+            vec![GapRow {
+                from: 104,
+                to: 106,
+                recv_ns: 6
+            }]
+        );
+        assert_eq!(gaps_rows(&dir), vec!["104\t106\t6"]);
+        assert_eq!(rec.resume_seq, Some(108));
+
+        let rec2 = recover(&dir).unwrap();
+        assert!(rec2.reconciled.is_empty());
+        assert_eq!(gaps_rows(&dir), vec!["104\t106\t6"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Holes already in gaps.tsv are left alone; the seam with the file
+    /// before the newest two and holes inside multi-message envelopes are
+    /// checked; a partially listed hole gets only its missing part.
+    #[test]
+    fn recover_reconciles_seam_intra_and_partial_holes() {
+        let dir = tmpdir("reconcile2");
+        let day = dir.join("2026/09/30");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("feed-20260930-10.tsv.zst"),
+            frame(&env_line(1, &[50])),
+        )
+        .unwrap();
+        // Seam hole 51..=99 (listed), then 100, 101.
+        fs::write(
+            day.join("feed-20260930-11.tsv.zst"),
+            frame(&[env_line(2, &[100]), env_line(3, &[101])].concat()),
+        )
+        .unwrap();
+        // 102..=109 missing, gaps.tsv lists only 102..=104. Then an envelope
+        // 110, 112 with an intra hole 111, a stale duplicate 105, then 113.
+        fs::write(
+            day.join("feed-20260930-12.tsv.zst"),
+            frame(
+                &[
+                    env_line(4, &[110, 112]),
+                    env_line(5, &[105]),
+                    env_line(6, &[113]),
+                ]
+                .concat(),
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join(GAPS_FILE), "51\t99\t2\n102\t104\t4\n").unwrap();
+        let rec = recover(&dir).unwrap();
+        assert_eq!(
+            rec.reconciled,
+            vec![
+                GapRow {
+                    from: 105,
+                    to: 109,
+                    recv_ns: 4
+                },
+                GapRow {
+                    from: 111,
+                    to: 111,
+                    recv_ns: 4
+                },
+            ]
+        );
+        assert_eq!(rec.data_seq, Some(113));
+        assert_eq!(
+            gaps_rows(&dir),
+            vec!["51\t99\t2", "102\t104\t4", "105\t109\t4", "111\t111\t4"]
+        );
+        assert!(recover(&dir).unwrap().reconciled.is_empty());
+
+        // Seam hole missing from gaps.tsv is found too.
+        fs::write(dir.join(GAPS_FILE), "").unwrap();
+        let rec = recover(&dir).unwrap();
+        assert_eq!(
+            rec.reconciled.first(),
+            Some(&GapRow {
+                from: 51,
+                to: 99,
+                recv_ns: 2
+            })
+        );
+        assert_eq!(rec.reconciled.len(), 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live seam (end of data -> first seq of the new session) is still
+    /// written by `accept`, and recover does not duplicate it afterwards.
+    #[test]
+    fn live_gap_is_written_once_by_accept_not_by_recover() {
+        let dir = tmpdir("reconcile3");
+        let t0: u128 = 1_790_769_600 * 1_000_000_000; // 2026-09-30T12:00Z
+        let mut w = FeedWriter::new(dir.clone(), 3, Duration::from_secs(60), None);
+        w.accept(&line(t0, 100)).unwrap();
+        w.commit().unwrap();
+        let rec = recover(&dir).unwrap();
+        assert!(rec.reconciled.is_empty());
+        let mut w = FeedWriter::new(dir.clone(), 3, Duration::from_secs(60), rec.resume_seq);
+        w.accept(&line(t0 + 10, 150)).unwrap();
+        w.commit().unwrap();
+        assert_eq!(gaps_rows(&dir), vec![format!("101\t149\t{}", t0 + 10)]);
+        assert!(recover(&dir).unwrap().reconciled.is_empty());
+        assert_eq!(gaps_rows(&dir).len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Item 5 (З4), pure boundary: the deadline is frame_max - COMMIT_GUARD
+    /// after the first line of the frame.
+    #[test]
+    fn frame_deadline_boundary() {
+        let dir = tmpdir("deadline");
+        let t0: u128 = 1_790_769_600 * 1_000_000_000;
+        let mut w = FeedWriter::new(dir.clone(), 3, Duration::from_secs(60), None);
+        assert_eq!(w.frame_time_left(Instant::now()), None);
+        w.accept(&line(t0, 1)).unwrap();
+        let opened = w.frame_opened.unwrap();
+        let budget = Duration::from_secs(60) - COMMIT_GUARD;
+        assert_eq!(w.frame_time_left(opened), Some(budget));
+        let just_before = opened + budget - Duration::from_millis(1);
+        assert_eq!(
+            w.frame_time_left(just_before),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(w.frame_time_left(opened + budget), Some(Duration::ZERO));
+        assert_eq!(
+            w.frame_time_left(opened + Duration::from_secs(61)),
+            Some(Duration::ZERO)
+        );
+        // The writer thread never blocks past the deadline.
+        let wait = w
+            .frame_time_left(just_before)
+            .map_or(POLL_STEP, |l| l.min(POLL_STEP));
+        assert!(wait <= Duration::from_millis(1));
+        w.commit().unwrap();
+        assert_eq!(w.frame_time_left(Instant::now()), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Item 5 (З4), timing: with no further input the frame is on disk
+    /// (last_seq.txt written after fsync) no later than frame_max after the
+    /// first line, and not much earlier than frame_max - COMMIT_GUARD.
+    #[test]
+    fn frame_committed_within_frame_max_in_silence() {
+        let dir = tmpdir("deadline2");
+        let frame_max = Duration::from_millis(1500);
+        let w = FeedWriter::new(dir.clone(), 3, frame_max, None);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Line>(16);
+        let h = std::thread::spawn(move || run(rx, w).unwrap());
+        let t0: u128 = 1_790_769_600 * 1_000_000_000;
+        let sent = Instant::now();
+        tx.send(line(t0, 42)).unwrap();
+        while read_state(&dir).is_none() {
+            assert!(sent.elapsed() < Duration::from_secs(5), "never committed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let took = sent.elapsed();
+        assert!(took <= frame_max, "committed after {took:?}");
+        assert!(
+            took + Duration::from_millis(50) >= frame_max - COMMIT_GUARD,
+            "committed too early: {took:?}"
+        );
+        drop(tx);
+        h.join().unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 
