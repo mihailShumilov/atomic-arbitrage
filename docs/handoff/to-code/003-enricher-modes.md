@@ -1,5 +1,5 @@
 # 003 — enricher: режим logs, режим gaps, атомарная запись, обработка 429
-status: ready
+status: done
 phase: 1a
 depends-on: 001
 executor: indexer-engineer

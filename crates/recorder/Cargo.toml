@@ -19,3 +19,9 @@ chrono.workspace = true
 yawc.workspace = true
 tokio-rustls.workspace = true
 rustls-native-certs.workspace = true
+# Both already in Cargo.lock via yawc/rustls (no new crates downloaded).
+# base64: non-text frames are stored base64-encoded (task 002, item 5).
+base64 = "0.22"
+# url: parse the feed URL for the manual TCP/TLS connect that keeps the
+# HTTP response head (Retry-After), see src/net.rs.
+url = "2"

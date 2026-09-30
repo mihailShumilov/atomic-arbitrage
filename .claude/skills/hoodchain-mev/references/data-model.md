@@ -5,7 +5,20 @@
 ## Слои
 
 1. **Сырой фид**: `data/feed/YYYY/MM/DD/feed-YYYYMMDD-HH.tsv.zst`. Строка: `recv_unix_ns \t seq_first \t seq_last \t <JSON конверта как есть>`. Неизменяем. После перезапуска recorder дописывает новый zstd-фрейм в тот же часовой файл: читать с поддержкой нескольких фреймов (`zstd -dc` умеет; в Python `stream_reader(..., read_across_frames=True)`).
+   - С задачи 002, 2026-09-30, recorder закрывает zstd-фрейм не реже раза в 60 с, поэтому фреймов в часовом файле много.
+   - Строки с `seq_first = seq_last = 0` — обычное дело, и при разборе их нужно пропускать или разбирать отдельно:
+     - конверты без `messages`, например `{"version":1,"confirmedSequenceNumberMessage":{"sequenceNumber":N}}`;
+     - нетекстовые фреймы (ping и др.) в обёртке recorder: `{"recorderFrame":{"opcode":"ping","payloadBase64":"…"}}`. Ключа `recorderFrame` в фиде не бывает;
+     - непарсящийся текст — как есть.
+   - Рядом с сырьём лежат:
+     - `gaps.tsv`: `from \t to \t recv_ns`;
+     - `last_seq.txt`: последний seq, уже записанный на диск (fsync);
+     - `connections.tsv`: события соединения и паузы, первая строка — заголовок;
+     - `_torn/`: оборванные хвосты после аварийного завершения. Это не сырьё для загрузки, только для разбора.
 2. **Сырые блоки**: `data/blocks/blocks-<from>-<to>.jsonl.zst` — `{"number", "block"(full txs), "receipts"}`. Неизменяем.
+   - Рядом `data/blocks/filled.tsv`: `from \t to \t file_name \t filled_unix_s`, одна строка на готовый файл режима `blocks`. Строка дописывается только после fsync и rename файла, так что состояние не опережает данные. По нему `enricher --gaps` пропускает уже закрытые диапазоны.
+   - Файлы пишутся атомарно: `*.partial` → fsync → rename. Файл `*.partial` всегда неполный, его нельзя загружать; при следующем запуске enricher его удаляет.
+2a. **Сырые логи** (задача 003): `data/logs/logs-<from>-<to>.jsonl.zst`, получены через `eth_getLogs` с фильтром по topic0. Строка 1 — `{"meta":{"format":"hood-logs-v1","mode":"logs","topic0_any_of":[…],"not_full_blocks":true,…}}`. Далее по строке на каждый блок диапазона, по порядку, пустые тоже: `{"number":N,"logs":[<объекты eth_getLogs как есть>]}`. **Откатившихся транзакций здесь нет** (у них нет логов), нет газа и статуса. Это не замена `blocks`. Неизменяем.
 3. **ClickHouse `hood.*`**: `blocks`, `txs`, `logs` — прямая загрузка сырья; `swaps`, `tokens`, `wallets`, `funding_edges`, `labels` — производные, пересобираемые из сырья.
 
 ## Соглашения

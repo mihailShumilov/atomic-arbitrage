@@ -1,5 +1,5 @@
 # 002 — recorder: надёжная запись (восстановление исправлений + паузы на 403/429)
-status: ready
+status: done
 phase: 1a
 depends-on: 001
 executor: indexer-engineer

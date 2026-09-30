@@ -2,16 +2,19 @@
 name = "enricher"
 version = "0.1.0"
 edition.workspace = true
-rust-version.workspace = true
+# 1.89: std::fs::File::try_lock (out-dir lock that the OS releases even on kill -9).
+rust-version = "1.89"
 publish.workspace = true
 
 [dependencies]
 hood-core.workspace = true
+decoders = { path = "../decoders" }
 anyhow.workspace = true
 clap.workspace = true
 futures.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# raw_value: exact per-method response byte counts for the size statistics.
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

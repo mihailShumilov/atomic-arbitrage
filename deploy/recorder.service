@@ -1,0 +1,49 @@
+# hoodchain-mev: sequencer feed recorder (phase 1a).
+# Install: see deploy/README.md. Paths below assume the layout from the README;
+# adjust User/paths if you use a different one.
+
+[Unit]
+Description=hoodchain-mev sequencer feed recorder
+Documentation=file:///opt/hoodchain-mev/deploy/README.md
+Wants=network-online.target
+After=network-online.target time-sync.target
+# Never give up restarting (default rate limit would stop the unit after 5
+# fast failures). Reconnect pacing is done inside the recorder.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hood
+Group=hood
+WorkingDirectory=/opt/hoodchain-mev
+Environment=RUST_LOG=info
+# Exactly one feed connection per IP from this unit. Do not run a second
+# recorder against the same IP (limit is 2, the 3rd gets 429).
+ExecStart=/opt/hoodchain-mev/bin/recorder --out-dir /srv/hood/data/feed
+
+Restart=always
+RestartSec=30
+# SIGTERM: drain queue, close the zstd frame, fsync, write last_seq.txt.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+# Logs go to journald: journalctl -u recorder -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=recorder
+
+# Hardening: the recorder only needs network and its output directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/hood/data/feed
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

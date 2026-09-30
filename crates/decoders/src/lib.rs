@@ -36,6 +36,11 @@ pub const TOPIC_SWAP_V4: B256 = v4::Swap::SIGNATURE_HASH;
 pub const TOPIC_INITIALIZE_V4: B256 = v4::Initialize::SIGNATURE_HASH;
 pub const TOPIC_TRANSFER: B256 = erc20::Transfer::SIGNATURE_HASH;
 
+/// Every topic0 the decoders in this crate understand. The enricher's `logs`
+/// mode uses this as its default `eth_getLogs` filter, so adding a decoder
+/// here automatically widens what gets fetched.
+pub const ALL_TOPIC0: [B256; 4] = [TOPIC_SWAP_V3, TOPIC_SWAP_V4, TOPIC_INITIALIZE_V4, TOPIC_TRANSFER];
+
 /// Raw log as it comes from receipts.
 pub struct RawLog<'a> {
     pub address: Address,
