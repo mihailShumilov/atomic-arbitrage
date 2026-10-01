@@ -51,6 +51,25 @@
 - `feed_recv_ns` есть только у блоков, пришедших через recorder; у дозалитых из RPC — NULL. Любой анализ задержек фильтрует по NOT NULL.
 - Метки (`labels`) всегда с `source` (какая эвристика) и `confidence`. Ручные метки — `source='manual'`.
 
+## L1-сообщения фида
+
+Каждое сообщение фида — один L2-блок (`sequenceNumber` = номер блока). Вид — `header.kind`. Отложенные сообщения (из L1 inbox, kind ≠ 3) идут по одному на блок; у них `header.requestId` — сквозной номер отложенного сообщения, `delayedMessagesRead` растёт на 1, `header.blockNumber`/`header.timestamp` — L1-блок и время попадания в inbox (на 400–780 с раньше блока, не время блока). Источник и проверка — `chain-facts.md`, «L1-сообщения фида» (задача 014: Nitro v3.11.4 + 2 ч сырья + 16 вызовов RPC, 2026-10-01).
+
+Во всех блоках tx с индексом 0 — `0x6a` StartBlock (`from`/`to` = `0x…0a4b05`, селектор `0x6bf6a42d`); в таблице она не повторяется. `miner` блока = `header.sender`, `nonce` блока = `delayedMessagesRead`.
+
+| kind | Смысл (Nitro) | Частота, 01.10 09:57–12:00Z | tx в L2-блоке после StartBlock | Что брать декодерам |
+|---|---|---|---|---|
+| 3 | L2Message: пачка tx секвенсора; `header.sender` = `0xa4b0…73657175656e636572` | 72 846 из 73 112 | пользовательские tx (`0x0`, `0x1`, `0x2`, `0x4`, …) | всё как обычно: `txs`, `logs`, `swaps`; блок без kind-логики |
+| 9 | SubmitRetryable: L1 → L2 вызов с ETH; `header.sender` = alias(L1-отправитель) | 49 (~22/ч) | `0x69` SubmitRetryable (`to` = `0x…6e`, `value` = 0, суммы в `depositValue`/`retryValue`/`retryTo`/`beneficiary`/`refundTo`, логи `TicketCreated` + `RedeemScheduled`); затем `0x68` RetryTx — авто-redeem: `from` = alias, `to` = `retryTo`, `value` = `retryValue`, `ticketId` = hash `0x69`, логи вызова (например, mint токена шлюзом) | `funding_edges`: `0x68` со `status=1` и `value` > 0 → ETH с L1 на `retryTo`, источник — L1-адрес = unalias(`0x69.from`). Через шлюз токенов ETH уходит контракту, конечный получатель — из логов (`Transfer`/`DepositFinalized`), это токен, а не ETH. Неудачный `0x68` (`status=0`): ETH остаётся в эскроу тикета, позже возможен ручной redeem (новый `0x68` в другом блоке) или возврат на `beneficiary` при отмене/истечении — предполагается по документации Arbitrum, по коду и данным не сверено, в 2 проверенных через RPC блоках kind 9 авто-redeem успешен |
+| 12 | EthDeposit: депозит ETH через `Inbox.depositEth`; payload = 20 Б `to` + 32 Б `value`; `header.sender` = alias(L1 `msg.sender`) | 22 (3 и 18 за полные часы) | ровно одна `0x64` ArbitrumDepositTx: `from` = `header.sender`, `to` = получатель, `value` = сумма, `requestId`; чек `status=1`, `gasUsed=0`, **логов нет** | `funding_edges`: вход денег на кошелёк `to`, сумма `value`, источник — L1-адрес = unalias(`from`) (для EOA совпадает с `to`). Брать только из tx `0x64` блока (или из payload фида), в `logs` этого нет. Отфильтрованный депозит уходит на `FilteredFundsRecipient` (по коду; не наблюдали) — сверять `status` |
+| 13 | BatchPostingReport: отчёт о L1-пакете для цены L1-газа; `header.sender` = batch poster `0xdaa5…87f4` | 195 (~93/ч) | `0x6a` с селектором `0x9998269e` (`batchPostingReportV2`), `gasUsed` 0, логов 0 | ничего для торговли; не считать «пустой блок» активностью. Для учёта L1-цены — по желанию |
+| 7 | L2FundedByL1: tx от L1-адреса, оплаченная с L1 | 0 | по коду: `0x64` депозит на alias + `0x65`/`0x66` | как 12 (вход ETH) + сама tx; не наблюдали |
+| 6, 8, 10, 11 | EndOfBlock, RollupEvent, BatchForGasEstimation, Initialize | 0 | по коду: tx нет (6, 8), ошибка (10), genesis (11) | ничего |
+
+Для графа финансирования (`funding_edges`): вход денег с L1 — это `0x64` (kind 12, kind 7) и `0x68` с `value` > 0 (kind 9). Они не видны в `logs` и не видны по `tx.from` как подпись пользователя: `from` — alias L1-адреса, unalias = вычесть `0x1111000000000000000000000000000000001111` mod 2^160. Мосты, которые платят на L2 из своего пула, создают обычный L2-перевод; это другой источник ребра (метка моста), не L1-сообщение.
+
+Не видны ни в `value`, ни в логах (data-auditor 014, З3): возврат излишка `maxSubmissionFee` на `feeRefundAddr` у kind 9 (`tx_processor.go` L376-382) и перенаправление средств по onchain-фильтру (`0x64`/`0x69` → FilteredFundsRecipient). Суммы обычно малые; декодеру входов учесть или явно пометить как неучтённое.
+
 ## Чего нет в данных (и как это учитывать)
 
 - Внутренние переводы ETH между контрактами: нужны трассировки. Без них граф финансирования неполный — в отчётах указывать.
