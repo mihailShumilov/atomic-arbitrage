@@ -1,0 +1,11 @@
+# hoodchain-mev: daily feed audit at 00:10 UTC (previous UTC day).
+[Unit]
+Description=hoodchain-mev daily feed audit at 00:10 UTC
+
+[Timer]
+OnCalendar=*-*-* 00:10:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

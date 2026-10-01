@@ -1,0 +1,43 @@
+# hoodchain-mev: fill feed gaps (gaps.tsv) from RPC. TEMPLATE, DISABLED:
+# enable enricher-gaps.timer only after the RPC provider is chosen (decision
+# 0002) and /etc/hoodchain/enricher.env holds RPC_URL. Without that file the
+# unit fails on purpose (it would otherwise fall back to the public RPC).
+#
+# Budget: --max-calls is mandatory and is the hard per-run cap of JSON-RPC
+# calls (retries included; 2 calls per block). 4000 calls = 2000 blocks per
+# run; with the hourly timer at most 96 000 calls/day. The run stops with an
+# error when the cap is hit; progress is kept in filled.tsv and the next run
+# continues. Change the numbers with a drop-in
+# (systemctl edit enricher-gaps.service), not here, and record the
+# provider cost in docs/costs.md.
+[Unit]
+Description=hoodchain-mev gap backfill from RPC (enricher --gaps)
+Documentation=file:///opt/hoodchain-mev/deploy/README.md
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=hood
+Group=hood
+# Required: no leading "-". Holds RPC_URL=<provider endpoint> (secret).
+EnvironmentFile=/etc/hoodchain/enricher.env
+Environment=RUST_LOG=info
+ExecStartPre=/bin/sh -c 'case "$RPC_URL" in ""|*YOUR-PROVIDER*) echo "RPC_URL not set in /etc/hoodchain/enricher.env" >&2; exit 1;; esac'
+ExecStart=/opt/hoodchain-mev/bin/enricher --gaps /srv/hood/data/feed/gaps.tsv --out-dir /srv/hood/data/blocks --max-calls 4000 --rps 2 --batch 10 --concurrency 1
+TimeoutStartSec=55min
+Nice=5
+SyslogIdentifier=enricher-gaps
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/hood/data/feed
+ReadWritePaths=/srv/hood/data/blocks
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

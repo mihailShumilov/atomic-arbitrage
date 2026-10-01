@@ -1,0 +1,31 @@
+# hoodchain-mev: off-host backup of raw data (rclone). DISABLED by default:
+# enable backup.timer only after Mihail has chosen and paid for the storage
+# and /etc/hoodchain/backup.env + rclone.conf exist. See deploy/README.md.
+[Unit]
+Description=hoodchain-mev raw data backup (rclone)
+Documentation=file:///opt/hoodchain-mev/deploy/README.md
+Wants=network-online.target
+After=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=hood
+Group=hood
+ExecStart=/opt/hoodchain-mev/deploy/backup.sh
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=idle
+SyslogIdentifier=backup
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/hood/data
+ReadWritePaths=/var/lib/hoodchain
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

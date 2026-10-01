@@ -1,0 +1,13 @@
+# hoodchain-mev: hourly gap backfill. DISABLED by default (bootstrap.sh never
+# enables it). Enable after the RPC provider is chosen (0002):
+#   systemctl enable --now enricher-gaps.timer
+[Unit]
+Description=hoodchain-mev hourly gap backfill
+
+[Timer]
+OnCalendar=*-*-* *:40:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

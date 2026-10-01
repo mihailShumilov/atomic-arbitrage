@@ -1,0 +1,18 @@
+# /etc/hoodchain/rclone.conf — SECRET, never commit. Owner root:hood, mode 0640.
+# Create interactively on the server: rclone config --config /etc/hoodchain/rclone.conf
+# Examples (fill in, then delete the unused one):
+#
+# [hoodbox]                     # Hetzner Storage Box over SFTP (port 23)
+# type = sftp
+# host = uXXXXXX.your-storagebox.de
+# user = uXXXXXX
+# port = 23
+# key_file = /etc/hoodchain/storagebox_ed25519
+# shell_type = unix
+#
+# [s3store]                     # any S3-compatible storage
+# type = s3
+# provider = Other
+# endpoint = https://<endpoint>
+# access_key_id = <key>
+# secret_access_key = <secret>

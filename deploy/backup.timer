@@ -1,0 +1,12 @@
+# hoodchain-mev: hourly backup. DISABLED by default (bootstrap.sh never
+# enables it): systemctl enable --now backup.timer once storage is set up.
+[Unit]
+Description=hoodchain-mev hourly raw data backup
+
+[Timer]
+OnCalendar=*-*-* *:20:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+# hoodchain-mev: run the healthcheck every 5 minutes.
+[Unit]
+Description=hoodchain-mev healthcheck every 5 min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

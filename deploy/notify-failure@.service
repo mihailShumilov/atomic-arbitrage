@@ -1,0 +1,14 @@
+# hoodchain-mev: notification when a hood unit fails (OnFailure= hook).
+[Unit]
+Description=hoodchain-mev failure notification for %i
+
+[Service]
+Type=oneshot
+User=hood
+Group=hood
+ExecStart=/opt/hoodchain-mev/deploy/notify.sh alert "юнит %i завершился с ошибкой" "journalctl -u %i -n 100"
+SyslogIdentifier=notify-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true

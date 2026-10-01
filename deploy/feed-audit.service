@@ -1,0 +1,33 @@
+# hoodchain-mev: daily audit of the previous UTC day of raw feed, offline
+# (--rpc-sample 0, no RPC). Report: /srv/hood/reports/feed-audit-YYYYMMDD.txt.
+[Unit]
+Description=hoodchain-mev daily feed audit
+Documentation=file:///opt/hoodchain-mev/deploy/README.md
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=hood
+Group=hood
+Environment=AUDIT_RPC_SAMPLE=0
+ExecStart=/opt/hoodchain-mev/deploy/feed-audit-daily.sh
+# 3 = audit FAIL with the alert already sent; anything else non-zero (script
+# error, notifier down) goes to OnFailure.
+SuccessExitStatus=3
+# A full day is ~2.2 GB of zstd to stream through zstd -dc + Python.
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
+SyslogIdentifier=feed-audit
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/hood/data
+ReadWritePaths=/srv/hood/reports
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

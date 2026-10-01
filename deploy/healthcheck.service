@@ -1,0 +1,29 @@
+# hoodchain-mev: healthcheck (recorder, feed age, disk, ban, gaps, backfill,
+# clock, backup). Started by healthcheck.timer. See deploy/README.md.
+[Unit]
+Description=hoodchain-mev healthcheck
+Documentation=file:///opt/hoodchain-mev/deploy/README.md
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=hood
+Group=hood
+# Thresholds (not secret). Telegram credentials are read by notify.sh from
+# /etc/hoodchain/notify.env, never from the unit or the repository.
+Environment=HC_CONFIG=/etc/hoodchain/healthcheck.env
+ExecStart=/opt/hoodchain-mev/deploy/healthcheck.sh
+TimeoutStartSec=120
+SyslogIdentifier=healthcheck
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/srv/hood/data
+ReadWritePaths=/var/lib/hoodchain
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
