@@ -861,6 +861,9 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "anyhow",
+ "serde",
+ "serde_json",
+ "zstd",
 ]
 
 [[package]]

@@ -68,7 +68,24 @@
 
 Для графа финансирования (`funding_edges`): вход денег с L1 — это `0x64` (kind 12, kind 7) и `0x68` с `value` > 0 (kind 9). Они не видны в `logs` и не видны по `tx.from` как подпись пользователя: `from` — alias L1-адреса, unalias = вычесть `0x1111000000000000000000000000000000001111` mod 2^160. Мосты, которые платят на L2 из своего пула, создают обычный L2-перевод; это другой источник ребра (метка моста), не L1-сообщение.
 
-Не видны ни в `value`, ни в логах (data-auditor 014, З3): возврат излишка `maxSubmissionFee` на `feeRefundAddr` у kind 9 (`tx_processor.go` L376-382) и перенаправление средств по onchain-фильтру (`0x64`/`0x69` → FilteredFundsRecipient). Суммы обычно малые; декодеру входов учесть или явно пометить как неучтённое.
+Не видны ни в `value`, ни в логах (data-auditor 014, З3): возврат излишка `maxSubmissionFee` на `feeRefundAddr` у kind 9 (`tx_processor.go` L376-382) и перенаправление средств по onchain-фильтру (`0x64`/`0x69` → FilteredFundsRecipient). Суммы обычно малые. Декодер входов (задача 017) не делает из них строки, а считает как «не учтено» (см. ниже).
+
+**Декодер входов с L1 (задача 017, `crates/decoders/src/l1_inflows.rs`, миграция `sql/002_funding_edges_l1.sql`).** Вход — строка `blocks-*.jsonl.zst`. Ключ — тип tx, а не `header.kind`: поэтому учитываются и ручные redeem `0x68` в обычных блоках, а kind 7 — по `0x64`. Строки `funding_edges`:
+- `l1_eth`: `0x64` со `status=1` (to, value, `l1_request_id`) и `0x68` со `status=1`, `value` > 0, без `DepositFinalized` от `tx.to` (`retryTo`, value, `ticket_id`). `from_addr` = unalias(`tx.from`) — это **L1-адрес** (Ethereum), а не L2-аккаунт; для EOA он совпадает с адресом на L2.
+- `l1_token`: `0x68` со `status=1`, в логах которого `DepositFinalized` испущен самим `tx.to` (шлюзом). `to_addr`/`value_wei` (сырые единицы токена) берутся из события, `from_addr` = `DepositFinalized.from` (депозитор на L1), `token` — эмиттер совпадающего `Transfer(шлюз|0x0 → to, amount)`. ETH-строки для шлюза нет. `gateway_status` — статус шлюза в реестре, который передаётся декодеру. Встроены только `verified` из `contracts.md` (сейчас L2 WETH gateway → L2 WETH). `none` = шлюза нет в реестре; такие строки по умолчанию отбрасывать.
+- `0x69` строк не даёт никогда, иначе был бы двойной счёт с `0x68`.
+- «Не учтено» — запись `UnaccountedFlow` и счётчик, в `funding_edges` не попадает:
+  - `submit_fee_refund` — возврат этапа `0x69` на `FeeRefundAddr`, ровно `depositValue − retryValue − maxRefund` (по коду Nitro, сверено на 6 блоках, см. `chain-facts.md`);
+  - `submit_no_redeem_upper_bound` — `0x69` без своего `0x68` в блоке, верхняя граница `depositValue − retryValue`;
+  - `redeem_refund_upper_bound` — возвраты этапа `0x68` на `refundTo`, верхняя граница `maxRefund`;
+  - `deposit_not_succeeded` — `0x64` со `status≠1` (onchain-фильтр → FilteredFundsRecipient; по коду, не наблюдали);
+  - `submit_not_succeeded` — `0x69` со `status≠1`;
+  - `retry_failed` — `0x68` со `status=0` и `value` > 0 (деньги вернулись в эскроу);
+  - `gateway_eth_unexplained` — `tx.value` шлюзовой `0x68` ≠ сумме токенов;
+  - `retry_no_to`.
+
+  Отмену и истечение тикета (эскроу → `beneficiary`) декодер не видит совсем: для этого нужна трассировка или событие ArbRetryableTx `Canceled`.
+- Ограничение ключа `ORDER BY (to_addr, block_number, tx_index)`: два `DepositFinalized` одному получателю в одной tx схлопнутся в ReplacingMergeTree (не наблюдали).
 
 ## Чего нет в данных (и как это учитывать)
 

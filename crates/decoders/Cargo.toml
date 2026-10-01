@@ -9,3 +9,8 @@ publish.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+zstd.workspace = true

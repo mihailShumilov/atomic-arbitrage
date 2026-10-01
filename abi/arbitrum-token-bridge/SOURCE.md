@@ -9,7 +9,7 @@ OffchainLabs/token-bridge-contracts, branch `main`, commit `0746a71321cdb2d6df6b
 - `contracts/tokenbridge/libraries/aeWETH.sol` — `deposit`, `withdraw`, `depositTo`, `withdrawTo`, `bridgeMint`/`bridgeBurn` (OZ ERC20 `_mint`/`_burn`)
 - `contracts/tokenbridge/arbitrum/IArbToken.sol` — `l1Address`
 
-Applies to (registry: `.claude/skills/hoodchain-mev/references/contracts.md`, status `observed`):
+Applies to (registry: `.claude/skills/hoodchain-mev/references/contracts.md`, status: L2 WETH gateway and L2 WETH `verified` since 2026-10-01 (proxies verified on Blockscout), router and L1 WETH gateway `observed`):
 - L2 WETH gateway `0x1d187c3e2da52d72bc9c41e3aba0fdfa6a7bf055` (proxy, impl `0x0354a93fe0db94bb72ec053f43301746fc806edf` on 2026-10-01)
 - L2 WETH `0x0bd7d308f8e1639fab988df18a8011f41eacad73` (proxy, impl `0xc6b81b429797e0f555440b70cd99e032d7ae947e` on 2026-10-01)
 

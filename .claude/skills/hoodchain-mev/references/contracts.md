@@ -24,6 +24,8 @@
 | Uniswap v4 `Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)` | `0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f` |
 | Uniswap v4 `Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)` | `0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438` |
 | ERC-20 `Transfer(address,address,uint256)` | `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef` |
+| Arbitrum token bridge `DepositFinalized(address,address,address,uint256)` | `0xc7f2e9c55c40a50fbc217dfc70cd39a222940dfa62145aa0ca49eb9535d4fcb2` (задача 017; источник — `abi/arbitrum-token-bridge/SOURCE.md`) |
+| Arbitrum token bridge `WithdrawalInitiated(address,address,address,uint256,uint256,uint256)` | `0x3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73` (задача 017; в цепи не наблюдали) |
 
 ## Адреса
 
@@ -48,6 +50,6 @@
 
 ## Наблюдения, требующие объяснения
 
-- 2026-10-01 (задача 016): topic0 token bridge **вне тестов `crates/decoders`** (keccak сигнатуры, ABI — `abi/arbitrum-token-bridge/`): `DepositFinalized(address,address,address,uint256)` = `0xc7f2e9c55c40a50fbc217dfc70cd39a222940dfa62145aa0ca49eb9535d4fcb2` (совпал с логом в 77312169), `WithdrawalInitiated(address,address,address,uint256,uint256,uint256)` = `0x3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73` (в цепи не наблюдали). Перед использованием в декодере — добавить в тест.
+- 2026-10-01 (задача 016; **закрыто задачей 017**: оба topic0 добавлены в `topics_are_canonical`): topic0 token bridge **вне тестов `crates/decoders`** (keccak сигнатуры, ABI — `abi/arbitrum-token-bridge/`): `DepositFinalized(address,address,address,uint256)` = `0xc7f2e9c55c40a50fbc217dfc70cd39a222940dfa62145aa0ca49eb9535d4fcb2` (совпал с логом в 77312169), `WithdrawalInitiated(address,address,address,uint256,uint256,uint256)` = `0x3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73` (в цепи не наблюдали). Перед использованием в декодере — добавить в тест.
 - 2026-10-01 (задача 016): у WETH на L2 (aeWETH по исходникам Arbitrum; что развёрнутая реализация совпадает с исходником — предполагается, Blockscout не открылся) **нет событий WETH9 `Deposit`/`Withdrawal`**: wrap/unwrap = `Transfer` с/на нулевой адрес. Mint `Transfer(0 → L2-шлюз WETH)` + `Transfer(шлюз → получатель)` в одной tx — это депозит WETH с L1, а не эмиссия. `name()` = `WETH` (не «Wrapped Ether», как у WETH на Arbitrum One) — по docs и цепи это канонический адрес; двойников с тем же `name`/`symbol` не искали (Blockscout недоступен).
 - 2026-09-28: за 300 блоков v3 `Swap` испустили 82 разных контракта. Это ожидаемо для Pons v1 (отдельный v3-пул на каждый токен), но какие из них Pons, а какие нет — определить через фабрику после её верификации.
