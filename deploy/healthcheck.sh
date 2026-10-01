@@ -17,8 +17,13 @@
 #   backfill   gaps older than HC_BACKFILL_MAX_LAG_H not covered by filled.tsv
 #   clock      chrony not synchronised or |offset| > HC_CLOCK_MAX_OFFSET_S
 #   backup     last successful backup older than HC_BACKUP_MAX_AGE_H (0 = off)
+#   raid       an md array in HC_MDSTAT (/proc/mdstat) is degraded ([U_], [_U])
+#              or inactive. Skipped when the file is missing or has no arrays
 # Events (one notification per new batch, no "recovered"):
 #   gaps       new rows in gaps.tsv since the last run (count, blocks, minutes)
+#   raid_sync  INFO once when a resync/recovery/reshape starts on an array
+#              (percent, ETA); nothing while it runs or when it ends (mdadm
+#              RebuildFinished and the `raid` recovery cover the end)
 #
 # Read-only on the data. No network except the optional HC_HEARTBEAT_URL ping
 # and whatever the notifier does. Never touches the feed.
@@ -48,6 +53,8 @@ fi
 : "${HC_CHECK_CLOCK:=1}"
 : "${HC_CLOCK_MAX_OFFSET_S:=0.5}"
 : "${HC_BACKUP_MAX_AGE_H:=0}"      # 0 = off (backup not enabled yet)
+: "${HC_CHECK_RAID:=1}"
+: "${HC_MDSTAT:=/proc/mdstat}"     # tests: a fake mdstat file
 : "${HC_HEARTBEAT_URL:=}"
 : "${HC_NOW:=}"                    # tests only: fixed "now" (unix seconds)
 
@@ -159,8 +166,15 @@ if (( newest == 0 )); then
 else
     feed_age=$((now_s - newest))
     if [[ $feed_src == last_seq.txt ]]; then
-        feed_msg="last_seq.txt не менялся ${feed_age} с, last_seq=${last_seq:-?}"
-        if (( hour_newest > 0 && now_s - hour_newest < HC_FEED_MAX_AGE_S )); then
+        if (( feed_age < HC_FEED_MAX_AGE_S )); then
+            feed_msg="last_seq.txt обновлялся ${feed_age} с назад, last_seq=${last_seq:-?}"
+        else
+            feed_msg="last_seq.txt не менялся ${feed_age} с, last_seq=${last_seq:-?}"
+        fi
+        # The ping-only hint belongs to the alert only: while blocks arrive the
+        # hour file is always fresh too, so in the "recovered" text it was a
+        # false "no blocks" (task 014, item 3).
+        if (( feed_age >= HC_FEED_MAX_AGE_S && hour_newest > 0 && now_s - hour_newest < HC_FEED_MAX_AGE_S )); then
             feed_msg+=". Файл часа при этом обновлялся $((now_s - hour_newest)) с назад: соединение, похоже, живо, но блоков нет (только ping?)"
         fi
     else
@@ -305,6 +319,77 @@ if (( HC_BACKUP_MAX_AGE_H > 0 )); then
             "journalctl -u backup -n 100; systemctl list-timers backup.timer"
     fi
 fi
+
+# ------------------------------------------------------------------- raid ---
+# /proc/mdstat: "mdN : active raid1 ..." then "[2/2] [UU]" and, while it runs,
+# "resync = 81.7% (...) finish=56.3min" or "resync=DELAYED". A "_" in the
+# member map means a missing/failed member. mdadm --monitor (mdadm-event.sh)
+# reports the events; this check repeats a degradation until it is fixed and
+# says "восстановлено" when the map is full again.
+raid_sync_txt=""
+if [[ $HC_CHECK_RAID == 1 && -r $HC_MDSTAT ]]; then
+    raid_out=$(awk '
+        /^md[^ ]* : / { dev = $1; if ($3 == "inactive") print "BAD", dev, "inactive"; next }
+        /^unused devices/ { dev = ""; next }
+        dev == "" { next }
+        match($0, /\[[0-9]+\/[0-9]+\] \[[U_]+\]/) {
+            st = substr($0, RSTART, RLENGTH); n_arr++
+            if (st ~ /_/) print "BAD", dev, st
+            next
+        }
+        match($0, /(resync|recovery|reshape|check) *= *[0-9.]+%/) {
+            s = substr($0, RSTART, RLENGTH); gsub(/ /, "", s); split(s, a, "=")
+            fin = "-"
+            if (match($0, /finish=[0-9.]+min/)) fin = substr($0, RSTART + 7, RLENGTH - 10)
+            print "SYNC", dev, a[1], a[2], fin
+            next
+        }
+        match($0, /(resync|recovery|reshape|check) *= *[A-Z]+/) {
+            s = substr($0, RSTART, RLENGTH); gsub(/ /, "", s); split(s, a, "=")
+            print "SYNC", dev, a[1], a[2], "-"
+        }
+        END { print "ARRAYS", n_arr + 0 }' "$HC_MDSTAT")
+    n_arrays=$(awk '$1 == "ARRAYS" { print $2 }' <<< "$raid_out")
+    if (( n_arrays > 0 )); then
+        raid_bad=$(awk '$1 == "BAD" { $1 = ""; sub(/^ /, ""); printf "%s%s", sep, $0; sep = ", " }' <<< "$raid_out")
+        if [[ -n $raid_bad ]]; then
+            raise raid "RAID деградирован: $raid_bad" \
+                "$(awk -v list=" $(awk '$1 == "BAD" { print $2 }' <<< "$raid_out" | paste -sd ' ') " '
+                    /^md[^ ]* : / { on = index(list, " " $1 " ") > 0 }
+                    /^unused devices/ { on = 0 }
+                    on && NF { sub(/^[[:space:]]+/, ""); print }' "$HC_MDSTAT" | head -n 20)"$'\n'"cat /proc/mdstat; mdadm --detail /dev/<md>. Сервер не перезагружать и recorder не трогать; массив сейчас без избыточности, сырьё фида без бэкапа невосполнимо. Замена диска — через Hetzner Robot (решение Михаила)."
+        else
+            resolved raid "все массивы в /proc/mdstat полные ($n_arrays шт.)"
+        fi
+        # Human-readable list of running/pending syncs, "check" included in
+        # the summary but never notified (mdcheck runs it monthly).
+        raid_sync_txt=$(awk '$1 == "SYNC" {
+            what = ($4 ~ /%$/) ? $4 : "ожидает (" $4 ")"
+            eta = ($5 != "-") ? sprintf(", осталось ~%d мин", int($5) + ($5 > int($5))) : ""
+            printf "%s%s %s %s%s", sep, $2, $3, what, eta; sep = "; " }' <<< "$raid_out")
+        sync_keys=$(awk '$1 == "SYNC" && $3 != "check" { print $2 ":" $3 }' <<< "$raid_out" | sort -u)
+        keys_file="$HC_STATE_DIR/raid_sync.keys"
+        old_keys=""
+        [[ -r $keys_file ]] && old_keys=$(sort -u "$keys_file")
+        new_keys=$(comm -13 <(printf '%s\n' "$old_keys" | sed '/^$/d') <(printf '%s\n' "$sync_keys" | sed '/^$/d'))
+        if [[ -n $new_keys ]]; then
+            if notify info "RAID: идёт синхронизация: $raid_sync_txt" \
+                "Новая: $(paste -sd ' ' <<< "$new_keys"). Действий не нужно, если это начальная сборка, ежемесячная проверка или замена диска; сервер не перезагружать до конца. cat /proc/mdstat"; then
+                printf '%s\n' "$sync_keys" > "$keys_file"
+                log "raid: sync notified: $(paste -sd ' ' <<< "$new_keys")"
+            else
+                log "notify failed for raid sync, will retry next run"
+                rc=1
+            fi
+        elif [[ $sync_keys != "$old_keys" ]]; then
+            # Some syncs ended: forget them silently (no "finished" spam).
+            printf '%s\n' "$sync_keys" > "$keys_file"
+        fi
+    else
+        summary+=("raid=none")
+    fi
+fi
+[[ -n $raid_sync_txt ]] && summary+=("raid_sync=${raid_sync_txt// /_}")
 
 log "healthcheck: unit=$unit_state feed_age_s=$feed_age feed_src=$feed_src disk_pct=${disk_pct:-?} ${summary[*]}"
 

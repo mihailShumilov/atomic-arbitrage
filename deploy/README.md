@@ -11,11 +11,12 @@
 
 | Файл | Куда ставится | Что делает |
 |---|---|---|
-| `bootstrap.sh` | запускается из `/opt/hoodchain-mev/src` | идемпотентная подготовка чистой Ubuntu 24.04 или 26.04: пакеты, пользователь `hood`, каталоги, chrony, ufw, лимиты journald, скрипты, юниты. Повторный прогон печатает `done: 0 change(s)` |
+| `bootstrap.sh` | запускается из `/opt/hoodchain-mev/src` | идемпотентная подготовка чистой Ubuntu 24.04 или 26.04: пакеты, пользователь `hood`, каталоги, chrony, ufw, лимиты journald, скрипты, юниты, `PROGRAM` для mdadm (если mdadm стоит), часовой пояс `Etc/UTC`. Повторный прогон печатает `done: 0 change(s)` |
 | `build-on-server.sh` | там же | сборка `recorder` и `enricher` на сервере от пользователя `hoodbuild` (`cargo build --release --locked`), установка в `/opt/hoodchain-mev/bin`, прошлые бинарники остаются как `*.prev`. Recorder не перезапускает |
 | `recorder.service` | `/etc/systemd/system/` | сам recorder (задача 008: `RestartSec=120`, Close при остановке; задача 009: досылка по `Arbitrum-Requested-Sequence-Number`, Close и при idle-таймауте; задача 012: Close при ошибке записи, `--block-idle-timeout-secs 30`, пауза 120 с от конца прошлой сессии — флагов в юните не требует) |
 | `healthcheck.sh`, `healthcheck.service`, `healthcheck.timer` | `/opt/hoodchain-mev/deploy/`, юниты | проверки раз в 5 мин, см. «Мониторинг» |
 | `notify.sh`, `notify-failure@.service` | то же | отправка уведомлений: journald всегда, Telegram — если задан в `/etc/hoodchain/notify.env`. `notify-failure@` вызывается через `OnFailure=` у служебных юнитов |
+| `mdadm-event.sh`, `mdadm-hood.conf` | `/opt/hoodchain-mev/deploy/`, `/etc/mdadm/mdadm.conf.d/hood.conf` | события `mdadm --monitor` (отказ диска RAID, деградация, конец синхронизации) → `notify.sh`, см. «Мониторинг → RAID» |
 | `feed-audit-daily.sh`, `feed-audit.service`, `feed-audit.timer` | то же; скрипт аудита копируется в `/opt/hoodchain-mev/deploy/feed_audit.py` | в 00:10 UTC проверка прошлых суток через `feed-audit`, без RPC (`--rpc-sample 0`), с `--frame-secs` = `AUDIT_FRAME_SECS` (60, как у recorder). Отчёт кладётся в `/srv/hood/reports/feed-audit-YYYYMMDD.txt` |
 | `backup.sh`, `backup.service`, `backup.timer` | то же | бэкап сырья через rclone. **Выключен**, пока хранилище не выбрано |
 | `enricher-gaps.service`, `enricher-gaps.timer` | юниты | дозаливка дыр через `enricher --gaps` с обязательным `--max-calls`. **Выключен**, пока не выбран провайдер RPC (0002) |
@@ -136,7 +137,7 @@ srv# journalctl -u recorder -f
 | Ключ | Условие | Порог (`/etc/hoodchain/healthcheck.env`) |
 |---|---|---|
 | `unit` | `systemctl is-active recorder` ≠ `active` (в том числе пауза `RestartSec` после падения) | — |
-| `feed` | mtime `last_seq.txt` старше порога, то есть новые блоки не доходят до диска (recorder переписывает файл только при росте seq, на каждом закрытии фрейма, не реже раза в 60 с). Файлы текущего и прошлого часа берутся, **только если `last_seq.txt` ещё нет** (первые минуты на пустой папке): ping без блоков тоже пишутся в часовой файл, поэтому его свежесть ничего не говорит о блоках (задача 012, З1 из отзыва 011). Если файл часа свежий, а `last_seq.txt` старый, в тексте алерта будет подсказка «только ping?». Источник виден в итоговой строке: `feed_src=last_seq.txt` / `hour_file`. Пока активен `ban`, отдельно не шлётся | `HC_FEED_MAX_AGE_S=300` |
+| `feed` | mtime `last_seq.txt` старше порога, то есть новые блоки не доходят до диска (recorder переписывает файл только при росте seq, на каждом закрытии фрейма, не реже раза в 60 с). Файлы текущего и прошлого часа берутся, **только если `last_seq.txt` ещё нет** (первые минуты на пустой папке): ping без блоков тоже пишутся в часовой файл, поэтому его свежесть ничего не говорит о блоках (задача 012, З1 из отзыва 011). Если файл часа свежий, а `last_seq.txt` старый, в тексте алерта будет подсказка «только ping?». В «восстановлено» её нет (задача 014: пока блоки идут, файл часа свежий всегда, и подсказка там была ложной). Источник виден в итоговой строке: `feed_src=last_seq.txt` / `hour_file`. Пока активен `ban`, отдельно не шлётся | `HC_FEED_MAX_AGE_S=300` |
 | `ban` | последняя строка `connected`/`disconnected`/`startup_wait` в `connections.tsv` — отказ 4xx (403, 429) или `startup_wait pending_pause` от 600 с. Строки `backlog`, `client_close`, `shutdown`, `writer_error`, `torn_repair`, `gap_reconciled` не учитываются; `startup_wait min_connect_interval`, `disconnected idle_timeout` и `disconnected block_idle` баном не считаются | `HC_BAN_MIN_PAUSE_S=600` |
 | `reconnects` | больше N строк `connected` за последний час (риск бана). Ловит и цикл переподключений по `block_idle`/`idle_timeout` | `HC_MAX_CONNECTS_PER_HOUR=6` |
 | `disk` | заполнение файловой системы `/srv/hood/data` | `HC_DISK_MAX_PCT=80` |
@@ -144,11 +145,43 @@ srv# journalctl -u recorder -f
 | `backfill` | в `gaps.tsv` есть дыры старше N часов, не покрытые `blocks/filled.tsv` (отставание дозаливки) | `HC_BACKFILL_MAX_LAG_H=24` |
 | `clock` | chrony не синхронизирован или смещение больше порога | `HC_CLOCK_MAX_OFFSET_S=0.5` |
 | `backup` | `last_ok` бэкапа старше N часов; выключено, пока бэкап не включён | `HC_BACKUP_MAX_AGE_H=0` → поставить 3 |
+| `raid` | в `/proc/mdstat` массив с `_` в карте дисков (`[U_]`, `[_U]`) или `inactive`. Текст — строки этих массивов из `/proc/mdstat`. «Восстановлено» — когда карта снова полная (`[UU]`). Нет `/proc/mdstat` или массивов — проверка пропускается (`raid=none`) | `HC_CHECK_RAID=1`, `HC_MDSTAT=/proc/mdstat` |
+| `raid_sync` (событие) | на массиве начался resync/recovery/reshape: одно INFO с процентом и оставшимся временем (`finish=`), пока идёт — тишина, конец не шлётся (его сообщает mdadm `RebuildFinished`, а для деградации — «восстановлено» по `raid`). Ежемесячный `check` (mdcheck) не шлётся, виден в итоговой строке `raid_sync=…` | — |
 | `gaps` (событие) | новые строки в `gaps.tsv`: число, сумма блоков и минут, самая длинная. От ~5 мин (2979 блоков) — ALERT, короче — INFO. «Восстановлено» для дыры — это уход условия `backfill` | `HC_GAP_ALERT_BLOCKS=2979` |
 
 Кроме того:
 - `feed-audit` в 00:10 UTC: при FAIL — ALERT, при PASS — короткая сводка INFO. Это ежедневный сигнал «жив», отключается `AUDIT_NOTIFY_PASS=0` в drop-in юнита;
 - любой служебный юнит (healthcheck, feed-audit, backup, enricher-gaps), завершившийся с ошибкой, присылает «юнит … завершился с ошибкой» через `notify-failure@`. Не ошибка: код 3 у feed-audit (FAIL уже отправлен) и код 75 у enricher-gaps (исчерпан `--max-calls`, `SuccessExitStatus=75`); отставание дозаливки ловит `backfill`.
+
+### RAID (задача 014)
+
+На `hood-rec` 4 массива RAID1 (md0 swap, md1 `/boot`, md2 `/`, md3 `/home`). В `mdadm.conf` стоит `MAILADDR root`, но почтового агента нет, так что письма mdadm никуда не уходят. Поэтому события идут двумя путями:
+
+- **`mdadm --monitor`** (`mdmonitor.service`; в Ubuntu 26.04 он `static`, его поднимает udev-правило массива, «включать» нечего) при каждом событии вызывает `PROGRAM` из `/etc/mdadm/mdadm.conf.d/hood.conf`, то есть `mdadm-event.sh СОБЫТИЕ /dev/md/N [диск]`:
+
+  | Событие mdadm | Уведомление |
+  |---|---|
+  | `Fail`, `FailSpare`, `DegradedArray`, `DeviceDisappeared`, `SpareActive` | ALERT, со строками массива из `/proc/mdstat` |
+  | `RebuildFinished`, `TestMessage` | INFO |
+  | `RebuildStarted`, `Rebuild20/40/60/80`, `NewArray`, `MoveSpare`, `SparesMissing` | только журнал (`journalctl -t hood-mdadm`), без уведомления |
+
+  `DegradedArray` повторяет и ежедневный `mdmonitor-oneshot.timer`. mdadm читает `PROGRAM` только при старте, поэтому bootstrap перезапускает `mdmonitor.service`, когда меняется `hood.conf`. Это перезапуск только опрашивающего процесса `mdadm --monitor`: массивы, идущий resync и recorder он не затрагивает.
+- **healthcheck `raid`** раз в 5 мин читает `/proc/mdstat`. Он повторяет алерт, если первое уведомление не ушло, и присылает «восстановлено».
+
+Проверка цепочки mdadm → notify.sh (по одному INFO на массив, на `hood-rec` их 4, в журнал и в Telegram, если он настроен):
+
+```bash
+srv# mdadm --monitor --scan --oneshot --test            # TestMessage для каждого массива из mdadm.conf
+srv# journalctl -t hood-notify -n 4 -o cat              # [INFO] …: RAID: тестовое сообщение mdadm для /dev/md/N
+```
+
+`MAILADDR root` остаётся, поэтому mdadm может написать в stderr, что не смог отправить письмо (почтового агента нет). На уведомления это не влияет.
+
+Что делать при ALERT: не перезагружать сервер и не трогать recorder; `cat /proc/mdstat`, `mdadm --detail /dev/mdN`, `journalctl -u mdmonitor`, `journalctl -k`. Замена диска — заявка в Hetzner Robot (решение Михаила). Пока массив без второго диска, сырьё фида лежит в одном экземпляре.
+
+### Часовой пояс
+
+С задачи 014 сервер в `Etc/UTC` (bootstrap ставит его сам). Recorder пишет метки в UTC/нс, скрипты используют `date -u`, таймеры набора заданы с `UTC`. Смена пояса меняет только вид времени в `journalctl` и `systemctl list-timers` и ничего не перезапускает.
 
 Чего этот мониторинг **не** ловит:
 - залипание «соединение живо, но только ping» (З1 из отзыва 011) теперь закрыто с двух сторон (задача 012): recorder сам переподключается через 30 с без блоков (`block_idle`), а `feed` смотрит на `last_seq.txt`. Остаётся слепое пятно короче порога: залипания до 5 мин алерта не дают, они видны как `block_idle` в `connections.tsv` и как дыра, если бэклога не хватило;
@@ -179,6 +212,19 @@ srv# journalctl -u recorder -f
 - после паузы новый процесс просит у фида `last_seq + 1` (заголовок `Arbitrum-Requested-Sequence-Number`, задача 009; в `connections.tsv` — `connected … requested=<N> mode=header`, затем строка `backlog`). Фид досылает бэклог примерно за последние 60–70 с (два замера 005 и один 009, глубина может меняться). Простой ~120 с длиннее бэклога, поэтому **каждый рестарт даёт одну строку в `gaps.tsv` на ~50–60 с** (~500–600 блоков; в 009: простой 121 с → дыра 578 блоков вместо ~1200). healthcheck пришлёт INFO «новые дыры в фиде», дозаливка — через enricher-gaps.
 
 Обновляйте бинарник пачкой изменений, а не по одному: цена каждого рестарта — около минуты дыры.
+
+### Обновление только скриптов `deploy/` (без рестарта recorder)
+
+Если менялись только скрипты и конфиги `deploy/` (healthcheck, notify, mdadm), а `recorder.service` и бинарник те же:
+
+```bash
+mac$ rsync -a --delete --include .env.example --exclude target --exclude data --exclude .env --exclude '.env*' --exclude .idea --exclude '*.zip' ./ root@<IP>:/opt/hoodchain-mev/src/
+srv# chown -R hoodbuild:hoodbuild /opt/hoodchain-mev/src   # rsync с Mac ставит владельцем uid Mac
+srv# bash /opt/hoodchain-mev/src/deploy/bootstrap.sh         # ставит изменённые файлы
+srv# systemctl show recorder -p NRestarts -p ActiveEnterTimestamp -p MainPID   # должно совпасть с тем, что было до
+```
+
+bootstrap кладёт файл, только если он отличается (`cmp`). `daemon-reload` он делает, только если изменился какой-то юнит, и даже тогда ничего не перезапускает. recorder он никогда не стартует и не перезапускает. healthcheck подхватит новый скрипт на следующем запуске таймера.
 
 Откат бинарника. `cp` поверх работающего бинарника падает с `Text file busy`, поэтому только через временный файл и `mv`:
 
@@ -281,13 +327,16 @@ docker run --rm --network none -e LANG=C.UTF-8 -v "$PWD/deploy":/mnt:ro koalaman
   $(cd deploy && ls *.sh test/*.sh | sed "s#^#/mnt/#")
 for f in deploy/*.sh deploy/test/*.sh; do bash -n "$f"; done
 
-# офлайн-тесты healthcheck и notify (подставные данные, без сети); повторить с ubuntu:26.04
+# офлайн-тесты healthcheck, notify и mdadm-event (подставные данные и /proc/mdstat, без сети); повторить с ubuntu:26.04
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-healthcheck.sh
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-notify.sh
+docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-mdadm-event.sh
 
-# bootstrap дважды под настоящим systemd, verify юнитов, тест бэкапа, chrony и ufw
+# bootstrap дважды под настоящим systemd, verify юнитов, тест бэкапа, chrony, ufw,
+# часового пояса и PROGRAM для mdadm
 bash deploy/test/run-systemd-container.sh                  # ubuntu:24.04; --build — проверить и сборку
 bash deploy/test/run-systemd-container.sh --ubuntu 26.04   # как на сервере hood-rec
+docker rmi hood-deploy-test-systemd:24.04 hood-deploy-test-systemd:26.04   # образы стенда после проверки
 ```
 
 ### Ubuntu 26.04: что отличается (проверено 2026-10-01 в контейнере ubuntu:26.04 и осмотром `hood-rec`)
@@ -296,4 +345,5 @@ bash deploy/test/run-systemd-container.sh --ubuntu 26.04   # как на сер�
 - `sudo` — sudo-rs. Набор `sudo` не использует (всё под root, пользователи — через `runuser`).
 - systemd 259, chrony 4.8, ufw 0.36.2 (iptables-nft), needrestart 3.11, Python 3.14, rustup 1.27.1 в архиве. Формат `chronyc -n tracking` прежний, `hood.conf` для needrestart разбирается, recorder исключён.
 - ssh запускается через `ssh.socket`; `sshd -T` возвращает порт, bootstrap берёт его оттуда. После правки `/etc/ssh/sshd_config.d/*.conf`: `sshd -t`, затем `systemctl reload ssh`.
+- mdadm 4.5: `mdmonitor.service` — `static`, запускается udev-правилом (`SYSTEMD_WANTS+="mdmonitor.service"`), `ExecStart=/usr/sbin/mdadm --monitor --scan`; плюс `mdmonitor-oneshot.timer` (ежедневно). `PROGRAM` и `MAILADDR` по замыслу пакета задаются в `mdadm.conf`; файлы `/etc/mdadm/mdadm.conf.d/*.conf` mdadm читает (проверено 2026-10-01 в контейнере: без `MAILADDR` mdadm пишет «No mail address or alert command - not monitoring», с `hood.conf` — нет; файл без `.conf` не читается).
 - В Docker `chrony.service` на 26.04 пропускается (`ConditionVirtualization=!container`). Тестовый стенд снимает это условие только внутри контейнера, на сервере chrony работает штатно.

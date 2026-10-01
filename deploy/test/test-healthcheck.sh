@@ -42,7 +42,7 @@ export PATH="$T/bin:$PATH" NLOG
 
 export HC_CONFIG=/nonexistent HC_FEED_DIR=$T/feed HC_BLOCKS_DIR=$T/blocks HC_DATA_DIR=$T \
     HC_STATE_DIR=$T/state HC_NOTIFY=$T/bin/fake-notify HC_BACKUP_MARKER=$T/backup/last_ok \
-    HC_BACKUP_MAX_AGE_H=0
+    HC_BACKUP_MAX_AGE_H=0 HC_MDSTAT=$T/no-mdstat
 
 now=$(date +%s)
 ns() { echo "$(( $1 ))000000000"; }
@@ -261,6 +261,14 @@ fi
 run; expect 0 "hour file fresh, last_seq.txt old: no repeat"
 fresh
 run; expect 1 "last_seq.txt fresh again: recovered" '^ok\|восстановлено: фид молчит'
+# Task 014 item 3: the hour file is still fresh here (as always while blocks
+# arrive), and the "recovered" text used to carry the ping-only hint.
+rec_body=$(tail -n 1 "$NLOG.body")
+if [[ $rec_body != *'только ping'* && $rec_body != *'блоков нет'* && $rec_body == *'last_seq.txt обновлялся'* ]]; then
+    echo "PASS  recovered text: no ping-only hint, says last_seq.txt was updated"; pass=$((pass + 1))
+else
+    echo "FAIL  recovered text: $rec_body"; fail=$((fail + 1))
+fi
 # No last_seq.txt (first minutes after the very first start): hour file used.
 mv "$T/feed/last_seq.txt" "$T/last_seq.saved"
 run; expect 0 "no last_seq.txt, hour file fresh: healthy (fallback)"
@@ -347,6 +355,119 @@ run; expect 0 "reconnected but the error is younger than the window: still raise
 export HC_WRITER_ERROR_WINDOW_S=30
 run; expect 1 "writer rows older than the window: recovered" '^ok\|восстановлено: recorder: ошибка записи'
 run; expect 0 "writer: nothing after recovery"
+
+# ------------------------------------------------------------- 16. raid ---
+# Task 014: /proc/mdstat check. Snapshots in the layout of hood-rec (4 x RAID1,
+# read 2026-10-01 ~12:53Z): healthy, initial resync with md2 DELAYED,
+# degraded with a failed member, recovery, monthly check.
+md_healthy() {
+    cat > "$T/mdstat" <<'EOF2'
+Personalities : [raid1] 
+md3 : active raid1 sda4[0] sdb4[1]
+      1760449344 blocks super 1.2 [2/2] [UU]
+      bitmap: 5/14 pages [20KB], 65536KB chunk
+
+md2 : active raid1 sda3[0] sdb3[1]
+      2111699968 blocks super 1.2 [2/2] [UU]
+      bitmap: 16/16 pages [64KB], 65536KB chunk
+
+md1 : active raid1 sda2[0] sdb2[1]
+      1046528 blocks super 1.2 [2/2] [UU]
+      
+md0 : active raid1 sda1[0] sdb1[1]
+      33520640 blocks super 1.2 [2/2] [UU]
+      
+unused devices: <none>
+EOF2
+}
+
+md_set() { # ARRAY NEW_STATUS_LINE (e.g. "[2/1] [U_]") [EXTRA_LINE]
+    awk -v a="$1" -v st="$2" -v ex="${3:-}" '
+        $1 == a && $2 == ":" { cur = 1; print; next }
+        cur && /blocks/ { sub(/\[[0-9]+\/[0-9]+\] \[[U_]+\]/, st); print; if (ex != "") print "      " ex; cur = 0; next }
+        { print }' "$T/mdstat" > "$T/mdstat.new" && mv "$T/mdstat.new" "$T/mdstat"
+}
+raid_summary() { grep -o 'raid=[^ ]*' "$T/last.out" | tail -n 1; }
+# chk DESC EXPR: EXPR is eval'ed here, so single quotes in callers are intended.
+chk() {
+    if eval "$2"; then echo "PASS  $1"; pass=$((pass + 1))
+    else echo "FAIL  $1: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1)); fi
+}
+export HC_MDSTAT=$T/mdstat
+md_healthy
+run; expect 0 "raid: 4 healthy arrays: silent"
+# shellcheck disable=SC2016  # eval in chk
+chk "raid=ok in summary" '[[ $(raid_summary) == raid=ok ]]'
+
+# Exactly what hood-rec showed at deploy time.
+md_set md3 "[2/2] [UU]" "[================>....]  resync = 81.7% (1439867648/1760449344) finish=56.3min speed=94890K/sec"
+md_set md2 "[2/2] [UU]" "	resync=DELAYED"
+run; expect 1 "raid: initial resync md3 81.7% + md2 DELAYED: one INFO" \
+    '^info\|RAID: идёт синхронизация: md3 resync 81.7%, осталось ~57 мин; md2 resync ожидает \(DELAYED\)$'
+run; expect 0 "raid: resync still running: no repeat"
+sed -i 's/resync = 81.7% (1439867648\/1760449344) finish=56.3min/resync = 99.1% (1744567648\/1760449344) finish=2.8min/' "$T/mdstat"
+run; expect 0 "raid: resync progress 99.1%: no repeat"
+md_healthy; md_set md2 "[2/2] [UU]" "[>....................]  resync =  0.4% (8446799/2111699968) finish=370.1min speed=94700K/sec"
+run; expect 0 "raid: md3 done, md2 DELAYED -> running: no new notification"
+# shellcheck disable=SC2016  # eval in chk
+chk "raid_sync in summary" 'grep -q raid_sync=md2_resync_0.4% "$T/last.out"'
+md_healthy
+run; expect 0 "raid: all syncs finished: silent (mdadm RebuildFinished reports the end)"
+
+# Degraded: sdb3 failed in md2.
+md_healthy; md_set md2 "[2/1] [U_]"; sed -i 's/sdb3\[1\]/sdb3[1](F)/' "$T/mdstat"
+run; expect 1 "raid: md2 [U_]: one ALERT" '^alert\|RAID деградирован: md2 \[2/1\] \[U_\]$'
+# The body is multi-line (mdstat excerpt + hint): look at the last 6 lines.
+if tail -n 6 "$NLOG.body" | grep -q 'md2 : active raid1 sda3\[0\] sdb3\[1\](F)' &&
+    tail -n 6 "$NLOG.body" | grep -q '\[2/1\] \[U_\]' && tail -n 1 "$NLOG.body" | grep -q 'не перезагружать'; then
+    echo "PASS  raid alert body: mdstat lines and the do-not-reboot hint"; pass=$((pass + 1))
+else
+    echo "FAIL  raid alert body: $(tail -n 6 "$NLOG.body")"; fail=$((fail + 1))
+fi
+run; expect 0 "raid: still degraded: no repeat"
+# shellcheck disable=SC2016  # eval in chk
+chk "raid=BAD in summary" '[[ $(raid_summary) == raid=BAD ]]'
+# New disk added, recovery onto it: still degraded, one INFO for the recovery.
+md_healthy; md_set md2 "[2/1] [U_]" "[==>..................]  recovery = 12.6% (266083712/2111699968) finish=320.4min speed=96000K/sec"
+run; expect 1 "raid: recovery started on degraded md2: one INFO, no second ALERT" '^info\|RAID: идёт синхронизация: md2 recovery 12.6%, осталось ~321 мин$'
+run; expect 0 "raid: recovery running: no repeat"
+md_healthy
+run; expect 1 "raid: md2 [UU] again: recovered" '^ok\|восстановлено: RAID деградирован: md2'
+run; expect 0 "raid: nothing after recovery"
+
+# The other member missing, plus an inactive stray array.
+md_healthy; md_set md0 "[2/1] [_U]"
+printf 'md127 : inactive sdc1[0](S)\n      1046528 blocks super 1.2\n\n' >> "$T/mdstat"
+run; expect 1 "raid: md0 [_U] + md127 inactive: one ALERT listing both" '^alert\|RAID деградирован: md0 \[2/1\] \[_U\], md127 inactive$'
+md_healthy
+run; expect 1 "raid: healthy again: recovered" '^ok\|восстановлено: RAID деградирован: md0'
+
+# Monthly mdcheck: shown in the summary, never notified.
+md_set md3 "[2/2] [UU]" "[====>................]  check = 22.3% (392580000/1760449344) finish=240.0min speed=95000K/sec"
+run; expect 0 "raid: check 22.3%: no notification"
+# shellcheck disable=SC2016  # eval in chk
+chk "check in summary" 'grep -q raid_sync=md3_check_22.3% "$T/last.out"'
+md_healthy
+
+# Notifier down when a resync starts: retried, delivered once.
+md_set md1 "[2/2] [UU]" "[=>...................]  resync =  5.0% (52326/1046528) finish=0.3min speed=52000K/sec"
+export FAKE_NOTIFY_FAIL=1
+run; expect 0 "raid: resync INFO with notifier down: nothing delivered"
+export FAKE_NOTIFY_FAIL=0
+run; expect 1 "raid: notifier back: resync INFO delivered once" '^info\|RAID: идёт синхронизация: md1 resync 5.0%, осталось ~1 мин$'
+run; expect 0 "raid: no repeat after delivery"
+md_healthy
+run; expect 0 "raid: md1 done: silent"
+
+# No arrays / no file: check skipped.
+printf 'Personalities : \nunused devices: <none>\n' > "$T/mdstat"
+run; expect 0 "raid: mdstat without arrays: silent"
+# shellcheck disable=SC2016  # eval in chk
+chk "raid=none without arrays" '[[ $(raid_summary) == raid=none ]]'
+export HC_MDSTAT=$T/no-mdstat
+run; expect 0 "raid: no mdstat file: silent"
+# shellcheck disable=SC2016  # eval in chk
+chk "no raid key without /proc/mdstat" '[[ -z $(raid_summary) ]]'
 
 # ------------------------------------------------- 10. everything at once ---
 run; expect 0 "final: healthy, silent"

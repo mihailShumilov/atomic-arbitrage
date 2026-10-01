@@ -1,11 +1,13 @@
 # Test image only: ubuntu (24.04 by default, 26.04 with --build-arg
 # UBUNTU=26.04) with systemd as PID 1, used to run deploy/bootstrap.sh and
 # systemd-analyze verify locally (deploy/test/run-systemd-container.sh).
+# mdadm is preinstalled (as on hood-rec) so that bootstrap's mdadm branch runs;
+# there are no md arrays in the container.
 ARG UBUNTU=24.04
 FROM ubuntu:${UBUNTU}
 ENV DEBIAN_FRONTEND=noninteractive container=docker
 RUN apt-get update -q \
- && apt-get install -y -q --no-install-recommends systemd systemd-sysv dbus ca-certificates \
+ && apt-get install -y -q --no-install-recommends systemd systemd-sysv dbus ca-certificates mdadm \
  && rm -rf /var/lib/apt/lists/* \
  && systemctl mask getty.target console-getty.service systemd-firstboot.service
 STOPSIGNAL SIGRTMIN+3

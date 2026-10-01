@@ -6,7 +6,7 @@
 #   bash deploy/bootstrap.sh [--with-docker] [--ssh-port N]... [--no-firewall]
 #
 # Run from the source checkout (default /opt/hoodchain-mev/src). It installs:
-#   packages   chrony ufw zstd python3 curl ca-certificates rclone
+#   packages   chrony ufw zstd python3 curl ca-certificates rclone tzdata
 #              (+ docker.io docker-compose-v2 with --with-docker)
 #   user       hood (system, no login, home /opt/hoodchain-mev)
 #   dirs       /opt/hoodchain-mev/{bin,deploy}, /srv/hood/data/{feed,blocks,logs},
@@ -16,6 +16,10 @@
 #              backup(+timer), enricher-gaps(+timer), notify-failure@
 #   config     journald limits, needrestart exclusion for recorder,
 #              /etc/hoodchain/*.example (real secrets are created by hand)
+#   mdadm      if installed: PROGRAM mdadm-event.sh in
+#              /etc/mdadm/mdadm.conf.d/hood.conf, mdmonitor restarted only
+#              when that file changes (arrays and resync are not touched)
+#   timezone   Etc/UTC (display only: data and timers are UTC anyway)
 #   chrony     enabled, sync checked (warning only)
 #   ufw        deny incoming except ssh (rate-limited), allow outgoing
 #
@@ -69,8 +73,8 @@ die() { say "ERROR: $*"; exit 1; }
     warn "tested on Ubuntu 24.04 and 26.04 only, this is ${PRETTY_NAME:-unknown}"
 
 # ------------------------------------------------------------- packages ---
-pkgs=(chrony ufw zstd python3 curl ca-certificates rclone)
-(( firewall )) || pkgs=(chrony zstd python3 curl ca-certificates rclone)
+pkgs=(chrony ufw zstd python3 curl ca-certificates rclone tzdata)
+(( firewall )) || pkgs=(chrony zstd python3 curl ca-certificates rclone tzdata)
 (( with_docker )) && pkgs+=(docker.io docker-compose-v2)
 missing=()
 for p in "${pkgs[@]}"; do
@@ -139,7 +143,7 @@ install_file() {
     changed "file $dst"
 }
 
-for s in healthcheck.sh notify.sh feed-audit-daily.sh backup.sh build-on-server.sh; do
+for s in healthcheck.sh notify.sh mdadm-event.sh feed-audit-daily.sh backup.sh build-on-server.sh; do
     install_file "$DEPLOY_SRC/$s" "$PREFIX/deploy/$s" 755
 done
 install_file "$AUDIT_SRC" "$PREFIX/deploy/feed_audit.py" 755
@@ -166,6 +170,50 @@ if (( FILE_CHANGED )); then
     systemctl restart systemd-journald || warn "could not restart systemd-journald"
 fi
 install_file "$DEPLOY_SRC/needrestart-hood.conf" /etc/needrestart/conf.d/hood.conf 644
+
+# ----------------------------------------------------------------- mdadm ---
+# Software RAID (hood-rec: 4 x RAID1): mdadm --monitor hands every event to
+# mdadm-event.sh -> notify.sh (MAILADDR root goes nowhere: no MTA). The
+# monitor reads PROGRAM only at start, so it is restarted when the drop-in
+# changes. That restarts only the mdadm --monitor poller; arrays, a running
+# resync and the recorder are not affected. mdmonitor.service is static
+# (pulled in by the udev rule of each array), it cannot be "enabled".
+if command -v mdadm > /dev/null 2>&1 && [[ -d /etc/mdadm ]]; then
+    install_file "$DEPLOY_SRC/mdadm-hood.conf" /etc/mdadm/mdadm.conf.d/hood.conf 644
+    if (( FILE_CHANGED )) && systemctl is-active --quiet mdmonitor.service; then
+        if systemctl restart mdmonitor.service; then
+            say "mdmonitor.service restarted (PROGRAM from the new drop-in)"
+        else
+            warn "could not restart mdmonitor.service (systemctl status mdmonitor)"
+        fi
+    fi
+    if grep -q '^md[^ ]* : active' /proc/mdstat 2> /dev/null && ! systemctl is-active --quiet mdmonitor.service; then
+        if systemctl start mdmonitor.service 2> /dev/null && systemctl is-active --quiet mdmonitor.service; then
+            changed "mdmonitor.service started"
+        else
+            warn "md arrays present but mdmonitor.service is not running (systemctl status mdmonitor)"
+        fi
+    fi
+    say "mdadm: PROGRAM $(awk '$1 == "PROGRAM" { print $2 }' /etc/mdadm/mdadm.conf.d/hood.conf), mdmonitor $(systemctl is-active mdmonitor.service 2> /dev/null || true)"
+else
+    say "mdadm: not installed, skipped"
+fi
+
+# -------------------------------------------------------------- timezone ---
+# Etc/UTC so that journalctl and list-timers show the same time as the data.
+# The recorder writes UTC/ns timestamps, the scripts use date -u and our
+# timers say "UTC" explicitly: only the displayed local time changes, nothing
+# is restarted.
+tz=$(timedatectl show -p Timezone --value 2> /dev/null || true)
+if [[ $tz != Etc/UTC ]]; then
+    if timedatectl set-timezone Etc/UTC 2> /dev/null; then
+        changed "timezone ${tz:-unknown} -> Etc/UTC"
+    else
+        warn "could not set timezone Etc/UTC (timedatectl status)"
+    fi
+else
+    say "timezone: Etc/UTC"
+fi
 
 # ---------------------------------------------------------------- chrony ---
 if [[ $(systemctl is-enabled chrony 2>/dev/null) != enabled ]]; then

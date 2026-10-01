@@ -86,6 +86,32 @@ c2=$(boot); expect_changes 0 "$c2" "bootstrap run 2"
 mod=$(x 'find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /tmp -o -path /var/log -o -path /var/lib/systemd -o -path /var/cache \) -prune -o -newer /tmp/m -print 2>/dev/null')
 ok "run 2 modified no files" "run 2 modified: $mod" test -z "$mod"
 
+# Task 014: timezone and mdadm steps of bootstrap.
+tz=$(x 'timedatectl show -p Timezone --value' || true)
+ok "timezone after bootstrap: $tz" "timezone after bootstrap: $tz" test "$tz" = Etc/UTC
+x 'timedatectl set-timezone Europe/Berlin'
+c=$(boot); expect_changes 1 "$c" "bootstrap with timezone Europe/Berlin"
+tz=$(x 'timedatectl show -p Timezone --value' || true)
+ok "timezone back to Etc/UTC: $tz" "timezone not reset: $tz" test "$tz" = Etc/UTC
+c=$(boot); expect_changes 0 "$c" "bootstrap after the timezone fix"
+ok "mdadm drop-in /etc/mdadm/mdadm.conf.d/hood.conf installed" "mdadm drop-in missing" \
+    x 'grep -qx "PROGRAM /opt/hoodchain-mev/deploy/mdadm-event.sh" /etc/mdadm/mdadm.conf.d/hood.conf'
+# mdadm says "No mail address or alert command - not monitoring" when it has
+# neither MAILADDR nor PROGRAM. Without MAILADDR (temporarily), the message
+# must appear without the drop-in and disappear with it: mdadm reads PROGRAM
+# from mdadm.conf.d. No arrays in the container, so nothing else happens.
+# shellcheck disable=SC2016  # expands inside the container
+ok "mdadm reads PROGRAM from mdadm.conf.d (control: message without the drop-in)" "mdadm ignores the drop-in" \
+    x 'cp -p /etc/mdadm/mdadm.conf /tmp/mdadm.conf.saved && sed -i "/^MAILADDR/d" /etc/mdadm/mdadm.conf
+       with=$(mdadm --monitor --scan --oneshot 2>&1)
+       mv /etc/mdadm/mdadm.conf.d/hood.conf /tmp/hood.conf.saved
+       without=$(mdadm --monitor --scan --oneshot 2>&1)
+       mv /tmp/hood.conf.saved /etc/mdadm/mdadm.conf.d/hood.conf && mv /tmp/mdadm.conf.saved /etc/mdadm/mdadm.conf
+       ! grep -q "not monitoring" <<< "$with" && grep -q "not monitoring" <<< "$without"'
+ok "mdadm-event.sh TestMessage reaches journald through notify.sh" "mdadm-event.sh -> journald" \
+    x '/opt/hoodchain-mev/deploy/mdadm-event.sh TestMessage /dev/md/0 && sleep 1 &&
+       journalctl -t hood-notify -o cat --no-pager | grep -q "^\[INFO\] hood-test: RAID: тестовое сообщение mdadm для /dev/md/0"'
+
 if (( build )); then
     x 'bash /opt/hoodchain-mev/src/deploy/build-on-server.sh' | grep '^\[build\]'
     c3=$(boot); expect_changes 2 "$c3" "bootstrap run 3 (enables 2 timers)"
