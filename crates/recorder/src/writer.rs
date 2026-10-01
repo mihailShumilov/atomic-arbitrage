@@ -535,10 +535,12 @@ impl FeedWriter {
         let t: DateTime<Utc> = DateTime::from_timestamp_nanos(l.recv_ns as i64);
         self.ensure_hour(t)?;
         // `raw` is always valid JSON here (route.rs wraps anything else in a
-        // base64 `recorderFrame`). In valid JSON a raw CR/LF can only be
+        // base64 `recorderFrame`). In valid JSON a raw CR/LF/TAB can only be
         // insignificant whitespace between tokens (control characters are
-        // not allowed inside strings), so removing it keeps the value intact.
-        let raw = l.raw.replace(['\n', '\r'], "");
+        // not allowed inside strings, RFC 8259 section 7), so removing it
+        // keeps the value intact. TAB since task 009 (remark Р2 of the 008
+        // audit): otherwise a line could get more than 4 TSV fields.
+        let raw = l.raw.replace(['\n', '\r', '\t'], "");
         let enc = self.encoder()?;
         writeln!(
             enc,
@@ -712,6 +714,7 @@ mod tests {
             seq_max: seq,
             intra_gaps: vec![],
             intra_disorder: 0,
+            kind3_ts: None,
             raw: format!(r#"{{"version":1,"messages":[{{"sequenceNumber":{seq}}}]}}"#),
         }
     }
@@ -1046,6 +1049,35 @@ mod tests {
         );
         drop(tx);
         h.join().unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 009 item 4 (Р2): insignificant CR/LF/TAB in valid JSON are
+    /// removed, so every line has exactly 4 TSV fields and the JSON value is
+    /// unchanged.
+    #[test]
+    fn whitespace_in_valid_json_is_removed_value_kept() {
+        let dir = tmpdir("tabs");
+        let t0: u128 = 1_790_769_600 * 1_000_000_000;
+        let raw = "{\"version\":1,\t\"messages\":[\r\n\t{\"sequenceNumber\":5,\"s\":\"a b\"}\n]}";
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let mut w = FeedWriter::new(dir.clone(), 3, Duration::from_secs(60), None);
+        w.accept(&Line {
+            raw: raw.into(),
+            ..line(t0, 5)
+        })
+        .unwrap();
+        w.commit().unwrap();
+        let text = decode_all_frames(&list_feed_files(&dir)[0]);
+        let row = text.lines().next().unwrap();
+        let cols: Vec<&str> = row.split('\t').collect();
+        assert_eq!(cols.len(), 4, "{row:?}");
+        assert_eq!(
+            cols[3],
+            "{\"version\":1,\"messages\":[{\"sequenceNumber\":5,\"s\":\"a b\"}]}"
+        );
+        let after: serde_json::Value = serde_json::from_str(cols[3]).unwrap();
+        assert_eq!(before, after);
         fs::remove_dir_all(&dir).ok();
     }
 

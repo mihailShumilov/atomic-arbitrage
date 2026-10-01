@@ -33,6 +33,10 @@ pub struct Line {
     pub intra_gaps: Vec<Gap>,
     /// Consecutive messages in the envelope that went backwards or repeated.
     pub intra_disorder: u32,
+    /// Newest `header.timestamp` (unix s) among kind-3 (sequencer) messages,
+    /// if any. Only used for the backlog statistics of task 009; delayed
+    /// messages (kind 9/13) carry an L1 inbox time hundreds of seconds old.
+    pub kind3_ts: Option<u64>,
     pub raw: String,
 }
 
@@ -49,9 +53,23 @@ impl Line {
             seq_max: 0,
             intra_gaps: Vec::new(),
             intra_disorder: 0,
+            kind3_ts: None,
             raw,
         }
     }
+}
+
+/// Newest kind-3 `header.timestamp` in an envelope value
+/// (`messages[].message.message.header.{kind,timestamp}`).
+fn newest_kind3_ts(v: &serde_json::Value) -> Option<u64> {
+    v.get("messages")?
+        .as_array()?
+        .iter()
+        .filter_map(|m| {
+            let h = m.get("message")?.get("message")?.get("header")?;
+            (h.get("kind")?.as_u64()? == 3).then(|| h.get("timestamp")?.as_u64())?
+        })
+        .max()
 }
 
 /// Holes and disorder inside one envelope. Every pair `(a, b)` of consecutive
@@ -80,6 +98,7 @@ pub fn route_text(recv_ns: u128, raw: String) -> Line {
         Ok(v) => v,
         Err(_) => return route_opaque(recv_ns, "text", raw.as_bytes()),
     };
+    let kind3_ts = newest_kind3_ts(&value);
     // Valid JSON, but not an envelope we understand (e.g. `messages` of an
     // unexpected shape): keep verbatim, unsequenced.
     let env: FeedEnvelope = match serde_json::from_value(value) {
@@ -99,6 +118,7 @@ pub fn route_text(recv_ns: u128, raw: String) -> Line {
         seq_max,
         intra_gaps,
         intra_disorder,
+        kind3_ts,
         raw,
     }
 }
@@ -140,6 +160,17 @@ mod tests {
         );
         assert!(l.intra_gaps.is_empty());
         assert_eq!(l.intra_disorder, 0);
+    }
+
+    #[test]
+    fn kind3_timestamp_is_extracted() {
+        // msg() is kind 3 with timestamp 1790594344.
+        let l = route_text(1, envelope(&[5, 6]));
+        assert_eq!(l.kind3_ts, Some(1_790_594_344));
+        // A delayed message (kind 13) alone gives no timestamp.
+        let delayed = envelope(&[7]).replace("\"kind\":3", "\"kind\":13");
+        assert_eq!(route_text(1, delayed).kind3_ts, None);
+        assert_eq!(route_opaque(1, "ping", b"").kind3_ts, None);
     }
 
     #[test]

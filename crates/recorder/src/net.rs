@@ -26,18 +26,21 @@ use tokio_rustls::{rustls, TlsConnector};
 use tracing::{info, warn};
 use yawc::close::CloseCode;
 use yawc::{
-    frame::OpCode, CompressionLevel, Frame, MaybeTlsStream, Options, WebSocket, WebSocketError,
+    frame::OpCode, CompressionLevel, Frame, HttpRequest, MaybeTlsStream, Options, WebSocket,
+    WebSocketError,
 };
 
 use crate::backoff::{parse_retry_after, EndKind};
+use crate::resume::Backlog;
 use crate::route::{route_opaque, route_text, Line};
 
 pub const CONNECTIONS_FILE: &str = "connections.tsv";
 const HEAD_CAP: usize = 16 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// On shutdown: how long to wait for the server's Close after sending ours.
+/// Client-initiated close (shutdown, idle timeout, writer gone): how long to
+/// wait for the server's Close after sending ours.
 pub const CLOSE_REPLY_WAIT: Duration = Duration::from_secs(2);
-/// On shutdown: bound on the final TLS close_notify / TCP FIN.
+/// Client-initiated close: bound on the final TLS close_notify / TCP FIN.
 const CLOSE_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 
 pub fn now_ns() -> u128 {
@@ -191,11 +194,14 @@ pub struct ConnEnd {
     pub session: Duration,
     pub envelopes: u64,
     pub detail: String,
-    /// Set when the connection was ended by us on shutdown (after upgrade).
+    /// Set when the connection was ended by us after the upgrade (shutdown,
+    /// idle timeout, writer gone): outcome of our Close handshake.
     pub client_close: Option<Box<CloseOutcome>>,
+    /// Statistics of the first burst; None if the upgrade failed.
+    pub backlog: Option<Box<Backlog>>,
 }
 
-/// Result of the client-initiated close handshake on shutdown.
+/// Result of a client-initiated close handshake.
 #[derive(Debug, Clone)]
 pub struct CloseOutcome {
     /// `server_replied`, `no_reply`, `stream_ended` or `send_failed`.
@@ -216,6 +222,7 @@ impl ConnEnd {
             envelopes: 0,
             detail,
             client_close: None,
+            backlog: None,
         }
     }
 }
@@ -238,8 +245,25 @@ fn classify_upgrade_error(e: &WebSocketError, head: &HttpHead) -> EndKind {
 
 type FeedWs = WebSocket<HeadTap<MaybeTlsStream<TcpStream>>>;
 
+/// Handshake request: with `requested`, the two headers the Nitro feed client
+/// sends (task 005: `broadcastclient.go` v3.11.4 L231-L234); without it, no
+/// extra headers (the behaviour of tasks 001-008).
+fn handshake_request(requested: Option<u64>) -> yawc::HttpRequestBuilder {
+    let b = HttpRequest::builder();
+    match requested {
+        Some(n) => b
+            .header("Arbitrum-Feed-Client-Version", "2")
+            .header("Arbitrum-Requested-Sequence-Number", n.to_string()),
+        None => b,
+    }
+}
+
 /// Connect and upgrade. On failure returns a classified [`ConnEnd`].
-async fn connect(url_str: &str, tls: &TlsConnector) -> std::result::Result<FeedWs, ConnEnd> {
+async fn connect(
+    url_str: &str,
+    tls: &TlsConnector,
+    requested: Option<u64>,
+) -> std::result::Result<FeedWs, ConnEnd> {
     let url: url::Url = url_str
         .parse()
         .map_err(|e| ConnEnd::failed(EndKind::NetError, format!("bad url: {e}")))?;
@@ -272,7 +296,11 @@ async fn connect(url_str: &str, tls: &TlsConnector) -> std::result::Result<FeedW
     };
     // Server negotiates no_context_takeover both ways; deflate is mandatory.
     let opts = Options::default().with_compression_level(CompressionLevel::fast());
-    let hs = tokio::time::timeout(CONNECT_TIMEOUT, WebSocket::handshake(url, tap, opts)).await;
+    let hs = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        WebSocket::handshake_with_request(url, tap, opts, handshake_request(requested)),
+    )
+    .await;
     let captured = head_buf.lock().map(|h| h.clone()).unwrap_or_default();
     let head = parse_http_head(&captured);
     match hs {
@@ -296,6 +324,7 @@ async fn connect(url_str: &str, tls: &TlsConnector) -> std::result::Result<FeedW
                 envelopes: 0,
                 detail: format!("upgrade: {e}; {}", head.status_line),
                 client_close: None,
+                backlog: None,
             })
         }
         Err(_) => Err(ConnEnd {
@@ -352,16 +381,64 @@ pub async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|s| *s).await;
 }
 
-/// Client-initiated close on shutdown (task 008, item 3): send Close 1000,
-/// keep recording whatever still arrives until the server's Close or
+/// Where received frames go: the writer channel, plus the bookkeeping the
+/// network side needs for the next handshake (task 009): the highest seq
+/// handed to the writer (`last_seq`, survives reconnects inside the process)
+/// and the burst statistics of the current connection.
+pub struct Sink<'a> {
+    tx: &'a SyncSender<Line>,
+    last_seq: &'a mut Option<u64>,
+    backlog: Backlog,
+    envelopes: u64,
+    /// Set when the burst ended; the caller logs it once.
+    backlog_ready: bool,
+}
+
+impl<'a> Sink<'a> {
+    pub fn new(tx: &'a SyncSender<Line>, last_seq: &'a mut Option<u64>, backlog: Backlog) -> Self {
+        Self {
+            tx,
+            last_seq,
+            backlog,
+            envelopes: 0,
+            backlog_ready: false,
+        }
+    }
+
+    /// Hand one line to the writer. Err if the writer is gone.
+    fn push(&mut self, line: Line) -> std::result::Result<(), ()> {
+        if line.has_seq() {
+            // Same rule as FeedWriter::accept: a frame whose seqs are all
+            // <= last_seq is skipped there (dup_skipped).
+            let stale = self.last_seq.is_some_and(|l| line.seq_max <= l);
+            if self.backlog.observe(
+                line.recv_ns,
+                line.seq_first,
+                line.seq_max,
+                line.kind3_ts,
+                stale,
+            ) {
+                self.backlog_ready = true;
+            }
+            self.envelopes += 1;
+            *self.last_seq = Some(self.last_seq.map_or(line.seq_max, |s| s.max(line.seq_max)));
+        }
+        self.tx.send(line).map_err(|_| ())
+    }
+}
+
+/// Client-initiated close (task 008 item 3 for shutdown; task 009 item 6 for
+/// idle timeout and a lost writer): send Close 1000 with `reason`, keep
+/// recording whatever still arrives until the server's Close or
 /// [`CLOSE_REPLY_WAIT`], then shut the stream down (TLS close_notify, FIN).
-/// Before 008 the socket was simply dropped on SIGTERM, without a Close.
-async fn close_gracefully(ws: &mut FeedWs, tx: &SyncSender<Line>) -> CloseOutcome {
+/// Before 008 the socket was dropped on SIGTERM, before 009 on idle timeout,
+/// both without a Close.
+async fn close_gracefully(ws: &mut FeedWs, sink: &mut Sink<'_>, reason: &str) -> CloseOutcome {
     let t0 = Instant::now();
     let deadline = tokio::time::Instant::now() + CLOSE_REPLY_WAIT;
     let sent = tokio::time::timeout_at(
         deadline,
-        ws.send(Frame::close(CloseCode::Normal, b"recorder shutdown")),
+        ws.send(Frame::close(CloseCode::Normal, reason.as_bytes())),
     )
     .await;
     let mut out = match sent {
@@ -394,7 +471,8 @@ async fn close_gracefully(ws: &mut FeedWs, tx: &SyncSender<Line>) -> CloseOutcom
                 Ok(Ok(frame)) => {
                     let (line, close) = route_frame(&frame, now_ns());
                     // Nothing is dropped, also during the close handshake.
-                    let _ = tx.send(line);
+                    // If the writer is gone there is nowhere to put it.
+                    let _ = sink.push(line);
                     if let Some(c) = close {
                         break CloseOutcome {
                             reason: "server_replied",
@@ -406,6 +484,7 @@ async fn close_gracefully(ws: &mut FeedWs, tx: &SyncSender<Line>) -> CloseOutcom
             }
         },
     };
+    out.detail = format!("close 1000 {reason:?}: {}", out.detail);
     match tokio::time::timeout(CLOSE_SHUTDOWN_WAIT, ws.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => out.detail = format!("{}; stream shutdown: {e}", out.detail),
@@ -414,45 +493,59 @@ async fn close_gracefully(ws: &mut FeedWs, tx: &SyncSender<Line>) -> CloseOutcom
     out
 }
 
-/// One connection: connect, stream frames into `tx` until it ends or `stop`
-/// becomes true. `on_connected` is called right after a successful upgrade.
-/// On stop after the upgrade the close handshake is done and reported in
-/// [`ConnEnd::client_close`].
+/// Report the end of the first burst once (also if it ended during the
+/// close handshake).
+fn flush_backlog(sink: &mut Sink<'_>, on_backlog: &mut impl FnMut(&Backlog)) {
+    if sink.backlog_ready {
+        sink.backlog_ready = false;
+        on_backlog(&sink.backlog);
+    }
+}
+
+/// One connection: connect (with the resume header if `requested` is set),
+/// stream frames into the sink until it ends or `stop` becomes true.
+/// `on_connected` is called right after a successful upgrade, `on_backlog`
+/// once when the first burst ends (see `resume.rs`). Whenever we end the
+/// connection ourselves after the upgrade (stop, idle timeout, writer gone)
+/// the close handshake is done and reported in [`ConnEnd::client_close`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_connection(
     url: &str,
     tls: &TlsConnector,
     idle: Duration,
-    tx: &SyncSender<Line>,
+    requested: Option<u64>,
+    sink: &mut Sink<'_>,
     stop: &mut watch::Receiver<bool>,
     mut on_connected: impl FnMut(),
+    mut on_backlog: impl FnMut(&Backlog),
 ) -> ConnEnd {
     let connected = tokio::select! {
         biased;
         _ = stopped(stop) => {
             return ConnEnd::failed(EndKind::NetError, "stopped before upgrade".into());
         }
-        r = connect(url, tls) => r,
+        r = connect(url, tls, requested) => r,
     };
     let mut ws = match connected {
         Ok(ws) => ws,
         Err(end) => return end,
     };
-    info!(url, "connected");
+    info!(url, requested = ?requested, "connected");
     on_connected();
     let started = Instant::now();
-    let mut envelopes: u64 = 0;
     let mut last_log = Instant::now();
     let mut close_info: Option<String> = None;
 
-    let end = |kind: EndKind, detail: String, envelopes: u64| ConnEnd {
+    let end = |kind: EndKind, detail: String, sink: &Sink<'_>| ConnEnd {
         kind,
         http_status: Some(101),
         retry_after_raw: None,
         retry_after: None,
         session: started.elapsed(),
-        envelopes,
+        envelopes: sink.envelopes,
         detail,
         client_close: None,
+        backlog: Some(Box::new(sink.backlog.clone())),
     };
 
     loop {
@@ -462,23 +555,36 @@ pub async fn run_connection(
             r = tokio::time::timeout(idle, ws.next_frame()) => Some(r),
         };
         let Some(next) = next else {
-            let outcome = close_gracefully(&mut ws, tx).await;
+            let outcome = close_gracefully(&mut ws, sink, "recorder shutdown").await;
+            flush_backlog(sink, &mut on_backlog);
             info!(
                 reason = outcome.reason, took_ms = outcome.took.as_millis() as u64,
                 detail = %outcome.detail, "client close handshake done"
             );
-            let mut e = end(EndKind::ServerClosed, "client shutdown".into(), envelopes);
+            let mut e = end(EndKind::ServerClosed, "client shutdown".into(), sink);
             e.client_close = Some(Box::new(outcome));
             return e;
         };
         let frame = match next {
-            Err(_) => return end(EndKind::Idle, format!("no frame for {idle:?}"), envelopes),
+            Err(_) => {
+                // Task 009 item 6: close politely instead of dropping TCP.
+                warn!(idle = ?idle, "no frame within idle timeout, closing");
+                let outcome = close_gracefully(&mut ws, sink, "idle timeout").await;
+                flush_backlog(sink, &mut on_backlog);
+                info!(
+                    reason = outcome.reason, took_ms = outcome.took.as_millis() as u64,
+                    detail = %outcome.detail, "client close handshake done"
+                );
+                let mut e = end(EndKind::Idle, format!("no frame for {idle:?}"), sink);
+                e.client_close = Some(Box::new(outcome));
+                return e;
+            }
             Ok(Err(e)) => {
                 let d = match &close_info {
                     Some(c) => format!("{c}; then {e}"),
                     None => e.to_string(),
                 };
-                return end(EndKind::ServerClosed, d, envelopes);
+                return end(EndKind::ServerClosed, d, sink);
             }
             Ok(Ok(f)) => f,
         };
@@ -488,15 +594,16 @@ pub async fn run_connection(
             close_info = Some(c);
         }
         let seq_last = line.seq_last;
-        let sequenced = line.has_seq();
-        if tx.send(line).is_err() {
-            return end(EndKind::NetError, "writer gone".into(), envelopes);
+        if sink.push(line).is_err() {
+            let outcome = close_gracefully(&mut ws, sink, "recorder writer gone").await;
+            flush_backlog(sink, &mut on_backlog);
+            let mut e = end(EndKind::NetError, "writer gone".into(), sink);
+            e.client_close = Some(Box::new(outcome));
+            return e;
         }
-        if sequenced {
-            envelopes += 1;
-        }
+        flush_backlog(sink, &mut on_backlog);
         if last_log.elapsed() >= Duration::from_secs(60) {
-            info!(envelopes, last_seq = seq_last, "alive");
+            info!(envelopes = sink.envelopes, last_seq = seq_last, "alive");
             last_log = Instant::now();
         }
     }

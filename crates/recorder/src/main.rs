@@ -9,13 +9,17 @@
 //! `{"recorderFrame":...}`) have `seq_first = seq_last = 0`.
 //!
 //! Start-up: repair torn zstd tails, add holes missing from gaps.tsv, wait
-//! out a pending pause / the minimum connect interval. Shutdown (SIGINT,
-//! SIGTERM): WebSocket Close 1000, wait <= 2 s for the reply, drain, commit.
+//! out a pending pause / the minimum connect interval. Every connection asks
+//! the feed to resume at `last_seq + 1` (`Arbitrum-Requested-Sequence-Number`,
+//! task 009; `last_seq` from memory, at start-up from the data), unless there
+//! is no data yet or `--no-requested-seq` is given. Whenever the recorder ends
+//! a connection itself (SIGINT/SIGTERM, idle timeout): WebSocket Close 1000,
+//! wait <= 2 s for the reply, then drop TCP; on shutdown drain and commit.
 //!
 //! Side files in <out>:
 //!   gaps.tsv         `from \t to \t recv_ns` of missing L2 blocks (for RPC backfill)
 //!   last_seq.txt     highest seq that is fsynced to disk (atomic replace)
-//!   connections.tsv  connect/disconnect/startup/shutdown events and chosen pauses
+//!   connections.tsv  connect/backlog/disconnect/startup/shutdown events and chosen pauses
 //!   _torn/           torn zstd tails cut off after a crash (kept for analysis)
 //!
 //! Deliberately NOT done here: decoding l2Msg, signature checks, anything
@@ -23,6 +27,7 @@
 
 mod backoff;
 mod net;
+mod resume;
 mod route;
 mod writer;
 
@@ -37,7 +42,8 @@ use hood_core::FEED_URL;
 use tracing::{error, info, warn};
 
 use crate::backoff::{startup_wait, Ladder, StartupWaitReason};
-use crate::net::{now_ns, run_connection, stopped, tls_connector, ConnEvent, ConnLog};
+use crate::net::{now_ns, run_connection, stopped, tls_connector, ConnEvent, ConnLog, Sink};
+use crate::resume::{requested_seq, Backlog};
 use crate::route::Line;
 use crate::writer::FeedWriter;
 
@@ -70,6 +76,11 @@ struct Args {
     /// after kill -9; the cause is unknown, so restarts are spaced out.
     #[arg(long, default_value_t = 120)]
     min_connect_interval_secs: u64,
+    /// Do not send `Arbitrum-Feed-Client-Version` /
+    /// `Arbitrum-Requested-Sequence-Number` on connect: the stream then
+    /// starts at the tip, as before task 009.
+    #[arg(long)]
+    no_requested_seq: bool,
 }
 
 /// Cheap jitter source in [0, 1) without an RNG dependency.
@@ -220,35 +231,75 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // Highest seq handed to the writer; at start-up the highest seq
+            // in the data (recover), not last_seq.txt (task 009, item 1).
+            let mut last_seq = rec.data_seq;
             loop {
-                let end = run_connection(&args.url, &tls, idle, &tx, &mut stop, || {
+                let before = last_seq;
+                let (requested, mode) = requested_seq(before, !args.no_requested_seq);
+                let mut sink = Sink::new(&tx, &mut last_seq, Backlog::new(requested, before));
+                let strikes = ladder.strikes;
+                let log_backlog = |b: &Backlog, reason: &str| {
+                    info!(detail = %b.detail(), "backlog");
                     conn_log.event(ConnEvent {
-                        event: "connected",
-                        reason: "-",
+                        event: "backlog",
+                        reason,
                         http_status: Some(101),
-                        strikes: Some(ladder.strikes),
-                        detail: &args.url,
+                        session: Some(b.live_after),
+                        envelopes: Some(b.blocks),
+                        detail: &b.detail(),
                         ..Default::default()
                     });
-                })
-                .await;
-                if *stop.borrow() {
-                    if let Some(c) = &end.client_close {
+                };
+                let end = run_connection(
+                    &args.url,
+                    &tls,
+                    idle,
+                    requested,
+                    &mut sink,
+                    &mut stop,
+                    || {
                         let detail = format!(
-                            "sent close 1000, waited {} ms; {}",
-                            c.took.as_millis(),
-                            c.detail
+                            "{} requested={} mode={}",
+                            args.url,
+                            requested.map_or_else(|| "-".to_string(), |n| n.to_string()),
+                            mode.as_str()
                         );
                         conn_log.event(ConnEvent {
-                            event: "client_close",
-                            reason: c.reason,
+                            event: "connected",
+                            reason: "-",
                             http_status: Some(101),
-                            session: Some(end.session),
-                            envelopes: Some(end.envelopes),
+                            strikes: Some(strikes),
                             detail: &detail,
                             ..Default::default()
                         });
+                    },
+                    |b| log_backlog(b, "done"),
+                )
+                .await;
+                // Backlog still running when the connection ended: log what we have.
+                if let Some(b) = &end.backlog {
+                    if !b.done && b.first_seq.is_some() {
+                        log_backlog(b, "session_ended");
                     }
+                }
+                if let Some(c) = &end.client_close {
+                    let detail = format!(
+                        "sent close 1000, waited {} ms; {}",
+                        c.took.as_millis(),
+                        c.detail
+                    );
+                    conn_log.event(ConnEvent {
+                        event: "client_close",
+                        reason: c.reason,
+                        http_status: Some(101),
+                        session: Some(end.session),
+                        envelopes: Some(end.envelopes),
+                        detail: &detail,
+                        ..Default::default()
+                    });
+                }
+                if *stop.borrow() {
                     return;
                 }
                 let (pause, rule) =

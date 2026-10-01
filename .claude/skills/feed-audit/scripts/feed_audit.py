@@ -7,13 +7,16 @@ line, so a full day of feed is fine.
 Checks:
   - zstd integrity per frame: every complete frame decompresses (checksum);
     bytes after the last complete frame are allowed only as the open frame of
-    the current UTC hour (<= 1 frame, recorder still writing). A torn tail in
-    a closed hour is a FAIL;
+    the current UTC hour (<= 1 frame, recorder still writing), or of the
+    previous hour while the recorder may not have closed it yet (audit runs
+    before HH:00 + --frame-secs + 60 s and the current hour's file has no
+    complete frame). A torn tail in a closed hour is a FAIL;
   - 4 TSV columns; seq_first/seq_last columns agree with the JSON;
   - seq-0 lines are classified: recorderFrame:<opcode>,
     confirmedSequenceNumberMessage, other (only "other" is a WARN);
   - sequence numbers strictly +1 in file order, no duplicates;
-  - every missing range is listed in <feed-root>/gaps.tsv;
+  - every missing range is covered by <feed-root>/gaps.tsv (adjacent and
+    overlapping rows are merged first);
   - recv_unix_ns non-decreasing; last_seq.txt == last recorded seq;
   - optional: --rpc-sample N blocks compared with eth_getBlockByNumber
     (blockHash; l1BlockNumber vs feed header.blockNumber, see chain-facts.md:
@@ -70,6 +73,41 @@ def read_gaps(path):
                 if len(p) >= 2 and p[0].strip().isdigit():
                     gaps.append((int(p[0]), int(p[1])))
     return gaps
+
+
+def merge_ranges(ranges):
+    """Merge adjacent and overlapping (from, to) ranges (inclusive ends).
+
+    Remark Р1 of the 008 audit: the recorder's start-up reconciliation may
+    list one hole as several adjacent rows; a hole is covered if the merged
+    ranges cover it."""
+    out = []
+    for f, t in sorted(r for r in ranges if r[0] <= r[1]):
+        if out and f <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], t))
+        else:
+            out.append((f, t))
+    return out
+
+
+def hour_start(hour):
+    """datetime (UTC, naive) of 'YYYYMMDD-HH'."""
+    return datetime.datetime.strptime(hour, "%Y%m%d-%H")
+
+
+def hour_file(path, hour):
+    """Path of the hourly file for `hour` next to `path` (same feed root)."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(path)))))
+    return os.path.join(root, hour[0:4], hour[4:6], hour[6:8], "feed-%s.tsv.zst" % hour)
+
+
+def has_complete_frame(path):
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return False
+    return split_frames(data)[0] > 0
 
 
 def read_connected(path):
@@ -249,7 +287,11 @@ def main():
     ap.add_argument("--session-gap-s", type=float, default=30.0,
                     help="a pause between neighbouring lines longer than this starts a new session (default 30)")
     ap.add_argument("--current-hour", default=None,
-                    help="YYYYMMDD-HH treated as the open hour (default: now, UTC)")
+                    help="YYYYMMDD-HH treated as the open hour (default: hour of --now)")
+    ap.add_argument("--now", default=None,
+                    help="audit time, YYYY-MM-DDTHH:MM:SSZ (default: real UTC time); for tests and old records")
+    ap.add_argument("--frame-secs", type=float, default=60.0,
+                    help="recorder --frame-secs (default 60): bounds how long the previous hour's frame may stay open")
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     a = ap.parse_args()
 
@@ -263,7 +305,21 @@ def main():
     if not files:
         print("no feed-*.tsv.zst files among the inputs", file=sys.stderr)
         return 2
-    current_hour = a.current_hour or datetime.datetime.utcnow().strftime("%Y%m%d-%H")
+    if a.now:
+        try:
+            now = datetime.datetime.strptime(a.now, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            print("--now must look like 2026-10-01T12:00:30Z", file=sys.stderr)
+            return 2
+    else:
+        now = datetime.datetime.utcnow()
+    current_hour = a.current_hour or now.strftime("%Y%m%d-%H")
+    prev_hour = (hour_start(current_hour) - datetime.timedelta(hours=1)).strftime("%Y%m%d-%H")
+    # Remark Р3 of the 008 audit: the recorder closes the previous hour's last
+    # frame at the first line of the new hour or, in silence, at its frame
+    # deadline (<= frame_secs). Until then that tail is an open frame.
+    grace_until = hour_start(current_hour) + datetime.timedelta(seconds=a.frame_secs + 60)
+    prev_grace = now < grace_until
 
     fails = []
     warns = []
@@ -284,6 +340,7 @@ def main():
     zst_bytes = 0
     frames_total = 0
     open_tails = []
+    prev_open_tails = []
     # seq -> (blockHash, header.blockNumber, kind, running max header.blockNumber)
     blocks = {}
     l1_max = None
@@ -306,6 +363,9 @@ def main():
         if tail_bytes:
             if tail == "incomplete" and hour_of(path) == current_hour:
                 open_tails.append((path, tail_bytes))
+            elif (tail == "incomplete" and hour_of(path) == prev_hour and prev_grace
+                  and not has_complete_frame(hour_file(path, current_hour))):
+                prev_open_tails.append((path, tail_bytes))
             elif tail == "incomplete":
                 fails.append("torn zstd tail in closed hour: %s (%d bytes after %d complete frames)" % (path, tail_bytes, frames))
             else:
@@ -388,6 +448,8 @@ def main():
     if not blocks:
         for p, b in open_tails:
             print("open frame of current hour %s: %s, %d bytes (not audited)" % (current_hour, p, b), file=sys.stderr)
+        for p, b in prev_open_tails:
+            print("possibly open frame of previous hour %s: %s, %d bytes (not audited)" % (prev_hour, p, b), file=sys.stderr)
         for f in fails:
             print("FAIL  " + f, file=sys.stderr)
         print("no blocks found", file=sys.stderr)
@@ -414,8 +476,9 @@ def main():
     gaps_file = []
     if a.feed_root:
         gaps_file = read_gaps(os.path.join(a.feed_root, "gaps.tsv"))
+        merged = merge_ranges(gaps_file)
         for g in gaps:
-            if not any(f <= g[0] and g[1] <= t for f, t in gaps_file):
+            if not any(f <= g[0] and g[1] <= t for f, t in merged):
                 fails.append("gap %d..%d is not listed in gaps.tsv" % g)
         ls_path = os.path.join(a.feed_root, "last_seq.txt")
         if os.path.exists(ls_path):
@@ -468,7 +531,9 @@ def main():
         "files": len(files),
         "ignored_inputs": len(ignored),
         "zstd_frames": frames_total,
-        "open_tail": ["%s: %d bytes (open frame of current hour %s, not audited)" % (p, b, current_hour) for p, b in open_tails],
+        "open_tail": ["%s: %d bytes (open frame of current hour %s, not audited)" % (p, b, current_hour) for p, b in open_tails]
+        + ["%s: %d bytes (previous hour %s, frame may still be open: audit before %sZ and no complete frame in hour %s yet; not audited)"
+           % (p, b, prev_hour, grace_until.strftime("%Y-%m-%dT%H:%M:%S"), current_hour) for p, b in prev_open_tails],
         "lines": lines,
         "envelopes": envelopes,
         "seq0_lines": dict(sorted(seq0.items())),
