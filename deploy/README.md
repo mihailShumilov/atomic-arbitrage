@@ -54,11 +54,11 @@
 mac$ ssh root@<IP> 'cat /etc/os-release | head -2; nproc; free -g; df -h /; ip -4 addr show scope global'
 #     Ubuntu 24.04/26.04? Есть ли публичный IPv4 на интерфейсе (не 10.x/172.16-31.x/192.168.x — иначе NAT)?
 mac$ cd ~/sites/my/crypto/atomic-arbitrage
-mac$ rsync -a --delete --exclude target --exclude data --exclude .env --exclude '.env*' \
+mac$ rsync -a --delete --include .env.example --exclude target --exclude data --exclude .env --exclude '.env*' \
        --exclude .idea --exclude '*.zip' ./ root@<IP>:/opt/hoodchain-mev/src/
 ```
 
-`git clone` на сервере тоже подходит, но тогда серверу нужен deploy-ключ к приватному репозиторию. rsync проще и не оставляет на сервере ключей к GitHub. `.env` и `data/` не копируются.
+`git clone` на сервере тоже подходит, но тогда серверу нужен deploy-ключ к приватному репозиторию. rsync проще и не оставляет на сервере ключей к GitHub. `.env` и `data/` не копируются. `--include .env.example` стоит перед исключениями намеренно: шаблон `.env.example` отслеживается git, и без него `--delete` убрал бы его на сервере, а `BUILD_INFO` показал бы `-dirty`.
 
 ### 2. Bootstrap
 
@@ -165,7 +165,7 @@ ls /var/lib/hoodchain/health/               # активные алерты (*.a
 ## Обновление бинарника без лишней дыры
 
 ```bash
-mac$ rsync -a --delete --exclude target --exclude data --exclude .env --exclude '.env*' --exclude .idea --exclude '*.zip' ./ root@<IP>:/opt/hoodchain-mev/src/
+mac$ rsync -a --delete --include .env.example --exclude target --exclude data --exclude .env --exclude '.env*' --exclude .idea --exclude '*.zip' ./ root@<IP>:/opt/hoodchain-mev/src/
 srv# bash /opt/hoodchain-mev/src/deploy/build-on-server.sh   # запись идёт, бинарник подменяется rename
 srv# bash /opt/hoodchain-mev/src/deploy/bootstrap.sh         # если менялись deploy/ или юниты (идемпотентно)
 srv# systemctl restart recorder                              # SIGTERM → Close 1000 → fsync → старт нового
