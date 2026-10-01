@@ -7,7 +7,7 @@
 #
 # Run from the source checkout (default /opt/hoodchain-mev/src). It installs:
 #   packages   chrony ufw zstd python3 curl ca-certificates rclone tzdata
-#              (+ docker.io docker-compose-v2 with --with-docker)
+#              smartmontools (+ docker.io docker-compose-v2 with --with-docker)
 #   user       hood (system, no login, home /opt/hoodchain-mev)
 #   dirs       /opt/hoodchain-mev/{bin,deploy}, /srv/hood/data/{feed,blocks,logs},
 #              /srv/hood/reports, /etc/hoodchain, /var/lib/hoodchain/{health,backup}
@@ -19,6 +19,10 @@
 #   mdadm      if installed: PROGRAM mdadm-event.sh in
 #              /etc/mdadm/mdadm.conf.d/hood.conf, mdmonitor restarted only
 #              when that file changes (arrays and resync are not touched)
+#   smartd     /etc/hoodchain/smartd.conf (both disks, daily short and weekly
+#              long self-test, warnings -> smartd-event.sh -> notify.sh) via a
+#              drop-in for smartmontools.service; smartd restarted only when
+#              one of the two files changes, enabled and started if it is not
 #   timezone   Etc/UTC (display only: data and timers are UTC anyway)
 #   chrony     enabled, sync checked (warning only)
 #   ufw        deny incoming except ssh (rate-limited), allow outgoing
@@ -50,7 +54,7 @@ while [[ $# -gt 0 ]]; do
         --ssh-port)
             [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "--ssh-port needs a number" >&2; exit 2; }
             ssh_ports+=("$2"); shift ;;
-        -h|--help) sed -n '2,30p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '2,35p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -73,8 +77,8 @@ die() { say "ERROR: $*"; exit 1; }
     warn "tested on Ubuntu 24.04 and 26.04 only, this is ${PRETTY_NAME:-unknown}"
 
 # ------------------------------------------------------------- packages ---
-pkgs=(chrony ufw zstd python3 curl ca-certificates rclone tzdata)
-(( firewall )) || pkgs=(chrony zstd python3 curl ca-certificates rclone tzdata)
+pkgs=(chrony ufw zstd python3 curl ca-certificates rclone tzdata smartmontools)
+(( firewall )) || pkgs=(chrony zstd python3 curl ca-certificates rclone tzdata smartmontools)
 (( with_docker )) && pkgs+=(docker.io docker-compose-v2)
 missing=()
 for p in "${pkgs[@]}"; do
@@ -143,9 +147,10 @@ install_file() {
     changed "file $dst"
 }
 
-for s in healthcheck.sh notify.sh mdadm-event.sh feed-audit-daily.sh backup.sh build-on-server.sh; do
+for s in healthcheck.sh notify.sh mdadm-event.sh smartd-event.sh feed-audit-daily.sh backup.sh build-on-server.sh; do
     install_file "$DEPLOY_SRC/$s" "$PREFIX/deploy/$s" 755
 done
+install_file "$DEPLOY_SRC/smartd-test.conf" "$PREFIX/deploy/smartd-test.conf" 644
 install_file "$AUDIT_SRC" "$PREFIX/deploy/feed_audit.py" 755
 install_file "$DEPLOY_SRC/README.md" "$PREFIX/deploy/README.md" 644
 for e in "$DEPLOY_SRC"/etc/*.example; do
@@ -197,6 +202,53 @@ if command -v mdadm > /dev/null 2>&1 && [[ -d /etc/mdadm ]]; then
     say "mdadm: PROGRAM $(awk '$1 == "PROGRAM" { print $2 }' /etc/mdadm/mdadm.conf.d/hood.conf), mdmonitor $(systemctl is-active mdmonitor.service 2> /dev/null || true)"
 else
     say "mdadm: not installed, skipped"
+fi
+
+# ---------------------------------------------------------------- smartd ---
+# SMART (task 015): smartd watches both disks and hands warnings to
+# smartd-event.sh -> notify.sh (no MTA, -m <nomailer>). Our config lives in
+# /etc/hoodchain/smartd.conf; the packaged /etc/smartd.conf (dpkg conffile)
+# stays as shipped, a drop-in points ExecStart at ours. A changed drop-in
+# needs daemon-reload: that re-reads unit files only, no unit of the kit
+# changes and nothing else is restarted (the apt install of smartmontools
+# runs one itself). smartd is restarted only when the config or the drop-in
+# changed. In a VM/container the unit is skipped (ConditionVirtualization=no).
+SMARTD_UNIT=smartmontools.service
+if [[ -x /usr/sbin/smartd ]]; then
+    smart_changed=0
+    install_file "$DEPLOY_SRC/smartd-hood.conf" "$ETC/smartd.conf" 644
+    (( FILE_CHANGED )) && smart_changed=1
+    install_file "$DEPLOY_SRC/smartd-hood.service.conf" "$UNIT_DIR/$SMARTD_UNIT.d/hood.conf" 644
+    if (( FILE_CHANGED )); then
+        smart_changed=1
+        systemctl daemon-reload
+        say "systemd: daemon-reload for the $SMARTD_UNIT drop-in (no unit of the kit changed)"
+    fi
+    if (( smart_changed )) && systemctl is-active --quiet "$SMARTD_UNIT"; then
+        if systemctl restart "$SMARTD_UNIT"; then
+            say "$SMARTD_UNIT restarted (config /etc/hoodchain/smartd.conf)"
+        else
+            warn "could not restart $SMARTD_UNIT (systemctl status $SMARTD_UNIT)"
+        fi
+    fi
+    if [[ $(systemctl is-enabled "$SMARTD_UNIT" 2> /dev/null) != enabled ]]; then
+        if systemctl enable "$SMARTD_UNIT" > /dev/null 2>&1; then
+            changed "$SMARTD_UNIT enabled"
+        else
+            warn "could not enable $SMARTD_UNIT"
+        fi
+    fi
+    if ! systemctl is-active --quiet "$SMARTD_UNIT"; then
+        systemctl start "$SMARTD_UNIT" 2> /dev/null || true
+        if systemctl is-active --quiet "$SMARTD_UNIT"; then
+            changed "$SMARTD_UNIT started"
+        else
+            warn "smartd is not running (systemctl status $SMARTD_UNIT; journalctl -u $SMARTD_UNIT); healthcheck reports it"
+        fi
+    fi
+    say "smartd: $(systemctl is-active "$SMARTD_UNIT" 2> /dev/null || true), config $(systemctl show -p ExecStart --value "$SMARTD_UNIT" 2> /dev/null | grep -o -- '-c [^ ;]*' | head -n 1)"
+else
+    say "smartd: not installed, skipped"
 fi
 
 # -------------------------------------------------------------- timezone ---

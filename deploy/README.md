@@ -11,12 +11,13 @@
 
 | Файл | Куда ставится | Что делает |
 |---|---|---|
-| `bootstrap.sh` | запускается из `/opt/hoodchain-mev/src` | идемпотентная подготовка чистой Ubuntu 24.04 или 26.04: пакеты, пользователь `hood`, каталоги, chrony, ufw, лимиты journald, скрипты, юниты, `PROGRAM` для mdadm (если mdadm стоит), часовой пояс `Etc/UTC`. Повторный прогон печатает `done: 0 change(s)` |
+| `bootstrap.sh` | запускается из `/opt/hoodchain-mev/src` | идемпотентная подготовка чистой Ubuntu 24.04 или 26.04: пакеты, пользователь `hood`, каталоги, chrony, ufw, лимиты journald, скрипты, юниты, `PROGRAM` для mdadm (если mdadm стоит), smartd с нашим конфигом, часовой пояс `Etc/UTC`. Повторный прогон печатает `done: 0 change(s)` |
 | `build-on-server.sh` | там же | сборка `recorder` и `enricher` на сервере от пользователя `hoodbuild` (`cargo build --release --locked`), установка в `/opt/hoodchain-mev/bin`, прошлые бинарники остаются как `*.prev`. Recorder не перезапускает |
 | `recorder.service` | `/etc/systemd/system/` | сам recorder (задача 008: `RestartSec=120`, Close при остановке; задача 009: досылка по `Arbitrum-Requested-Sequence-Number`, Close и при idle-таймауте; задача 012: Close при ошибке записи, `--block-idle-timeout-secs 30`, пауза 120 с от конца прошлой сессии — флагов в юните не требует) |
 | `healthcheck.sh`, `healthcheck.service`, `healthcheck.timer` | `/opt/hoodchain-mev/deploy/`, юниты | проверки раз в 5 мин, см. «Мониторинг» |
 | `notify.sh`, `notify-failure@.service` | то же | отправка уведомлений: journald всегда, Telegram — если задан в `/etc/hoodchain/notify.env`. `notify-failure@` вызывается через `OnFailure=` у служебных юнитов |
 | `mdadm-event.sh`, `mdadm-hood.conf` | `/opt/hoodchain-mev/deploy/`, `/etc/mdadm/mdadm.conf.d/hood.conf` | события `mdadm --monitor` (отказ диска RAID, деградация, конец синхронизации) → `notify.sh`, см. «Мониторинг → RAID» |
+| `smartd-event.sh`, `smartd-hood.conf`, `smartd-hood.service.conf`, `smartd-test.conf` | `/opt/hoodchain-mev/deploy/`, `/etc/hoodchain/smartd.conf`, `/etc/systemd/system/smartmontools.service.d/hood.conf`, `/opt/hoodchain-mev/deploy/smartd-test.conf` | SMART дисков: smartd (пакет `smartmontools`) по нашему конфигу, предупреждения → `smartd-event.sh` → `notify.sh`, см. «Мониторинг → SMART» |
 | `feed-audit-daily.sh`, `feed-audit.service`, `feed-audit.timer` | то же; скрипт аудита копируется в `/opt/hoodchain-mev/deploy/feed_audit.py` | в 00:10 UTC проверка прошлых суток через `feed-audit`, без RPC (`--rpc-sample 0`), с `--frame-secs` = `AUDIT_FRAME_SECS` (60, как у recorder). Отчёт кладётся в `/srv/hood/reports/feed-audit-YYYYMMDD.txt` |
 | `backup.sh`, `backup.service`, `backup.timer` | то же | бэкап сырья через rclone. **Выключен**, пока хранилище не выбрано |
 | `enricher-gaps.service`, `enricher-gaps.timer` | юниты | дозаливка дыр через `enricher --gaps` с обязательным `--max-calls`. **Выключен**, пока не выбран провайдер RPC (0002) |
@@ -145,8 +146,9 @@ srv# journalctl -u recorder -f
 | `backfill` | в `gaps.tsv` есть дыры старше N часов, не покрытые `blocks/filled.tsv` (отставание дозаливки) | `HC_BACKFILL_MAX_LAG_H=24` |
 | `clock` | chrony не синхронизирован или смещение больше порога | `HC_CLOCK_MAX_OFFSET_S=0.5` |
 | `backup` | `last_ok` бэкапа старше N часов; выключено, пока бэкап не включён | `HC_BACKUP_MAX_AGE_H=0` → поставить 3 |
-| `raid` | в `/proc/mdstat` массив с `_` в карте дисков (`[U_]`, `[_U]`) или `inactive`. Текст — строки этих массивов из `/proc/mdstat`. «Восстановлено» — когда карта снова полная (`[UU]`). Нет `/proc/mdstat` или массивов — проверка пропускается (`raid=none`) | `HC_CHECK_RAID=1`, `HC_MDSTAT=/proc/mdstat` |
+| `raid` | в `/proc/mdstat` массив с `_` в карте дисков (`[U_]`, `[_U]`) или `inactive` (в том числе когда активных массивов нет вовсе, задача 015). Текст — строки этих массивов из `/proc/mdstat`. «Восстановлено» — когда карта снова полная (`[UU]`). Нет `/proc/mdstat` или массивов — проверка пропускается (`raid=none`) | `HC_CHECK_RAID=1`, `HC_MDSTAT=/proc/mdstat` |
 | `raid_sync` (событие) | на массиве начался resync/recovery/reshape: одно INFO с процентом и оставшимся временем (`finish=`), пока идёт — тишина, конец не шлётся (его сообщает mdadm `RebuildFinished`, а для деградации — «восстановлено» по `raid`). Ежемесячный `check` (mdcheck) не шлётся, виден в итоговой строке `raid_sync=…` | — |
+| `smartd` | установлен `smartmontools`, а `systemctl is-active smartmontools.service` ≠ `active`. Сами SMART-предупреждения шлёт smartd (см. «SMART»), healthcheck только следит, что он работает | `HC_CHECK_SMARTD=auto` (`0` — выкл.), `HC_SMARTD_UNIT` |
 | `gaps` (событие) | новые строки в `gaps.tsv`: число, сумма блоков и минут, самая длинная. От ~5 мин (2979 блоков) — ALERT, короче — INFO. «Восстановлено» для дыры — это уход условия `backfill` | `HC_GAP_ALERT_BLOCKS=2979` |
 
 Кроме того:
@@ -168,6 +170,8 @@ srv# journalctl -u recorder -f
   `DegradedArray` повторяет и ежедневный `mdmonitor-oneshot.timer`. mdadm читает `PROGRAM` только при старте, поэтому bootstrap перезапускает `mdmonitor.service`, когда меняется `hood.conf`. Это перезапуск только опрашивающего процесса `mdadm --monitor`: массивы, идущий resync и recorder он не затрагивает.
 - **healthcheck `raid`** раз в 5 мин читает `/proc/mdstat`. Он повторяет алерт, если первое уведомление не ушло, и присылает «восстановлено».
 
+**Повторные ALERT при деградации — это нормально (замечание З4 ревью 014).** Пока массив деградирован, `mdmonitor-oneshot.timer` (на `hood-rec` раз в сутки, около 09:05 UTC) запускает `mdadm --monitor --scan --oneshot`, а тот через `PROGRAM` снова присылает ALERT «RAID деградирован: /dev/mdN». Это ежедневное напоминание, а не новый отказ. От healthcheck в это время приходит только одно ALERT `raid` в начале и одно «восстановлено» в конце. Напоминания прекратятся, когда массив снова станет полным (`[UU]`). Если заменённый диск ещё синхронизируется, напоминание может прийти и во время recovery.
+
 Проверка цепочки mdadm → notify.sh (по одному INFO на массив, на `hood-rec` их 4, в журнал и в Telegram, если он настроен):
 
 ```bash
@@ -178,6 +182,32 @@ srv# journalctl -t hood-notify -n 4 -o cat              # [INFO] …: RAID: те
 `MAILADDR root` остаётся, поэтому mdadm может написать в stderr, что не смог отправить письмо (почтового агента нет). На уведомления это не влияет.
 
 Что делать при ALERT: не перезагружать сервер и не трогать recorder; `cat /proc/mdstat`, `mdadm --detail /dev/mdN`, `journalctl -u mdmonitor`, `journalctl -k`. Замена диска — заявка в Hetzner Robot (решение Михаила). Пока массив без второго диска, сырьё фида лежит в одном экземпляре.
+
+### SMART (задача 015)
+
+RAID-алерт приходит, когда диск уже выпал. SMART показывает диск, который начинает портиться: растут переназначенные или ожидающие сектора, падают самотесты.
+
+- Пакет `smartmontools` ставит bootstrap. Демон — `smartmontools.service` (алиас `smartd.service`). Свой конфиг лежит в `/etc/hoodchain/smartd.conf` (из `deploy/smartd-hood.conf`). Drop-in `smartmontools.service.d/hood.conf` добавляет к штатному `ExecStart` ключ `-c`. Пакетный `/etc/smartd.conf` — conffile dpkg, его не трогаем, чтобы обновления пакета не спрашивали про конфиг.
+- Конфиг — одна строка `DEVICESCAN` для всех дисков (на `hood-rec` это 2 × Seagate ST4000NM0245, SATA):
+  - `-a` — статус здоровья, пороги и изменения атрибутов, журналы ошибок и самотестов, ожидающие (197) и неисправимые (198) сектора;
+  - `-R 5!` — любой рост `Reallocated_Sector_Ct` даёт предупреждение;
+  - `-W 0,50,55` — запись в журнал от 50 °C, предупреждение от 55 °C;
+  - самотесты: короткий каждый день в 05:00 UTC, длинный в субботу в 01:00 UTC, второй диск на 8 ч позже (`:008`), чтобы длинный тест не шёл на обоих дисках сразу. Длинный тест 4-ТБ диска идёт несколько часов (точное время — `smartctl -c`, «Extended self-test routine recommended polling time»). Ежемесячный mdcheck (Hetzner: 26-е число, 04:59 UTC) может совпасть с субботним тестом. Это только замедлит оба процесса;
+  - `-m <nomailer> -M exec smartd-event.sh` — почты нет, предупреждение уходит в `notify.sh`; `-M diminishing` — повтор через 1, 2, 4, 8… суток, пока проблема держится.
+- `smartd-event.sh` по `SMARTD_FAILTYPE`: `EmailTest` → INFO, всё остальное → ALERT: `Health`, `Usage` (в том числе рост переназначенных секторов), `CurrentPendingSector`, `OfflineUncorrectableSector`, `SelfTest`, `ErrorCount`, `Temperature`, `FailedOpenDevice`, `FailedReadSmart*`. В тексте — сообщение smartd, модель диска, номер повтора, `smartctl -x /dev/sdX`. Скрипт ничего не пишет в stdout/stderr (smartd записал бы это в журнал как ошибку) и всегда завершается с кодом 0. Если уведомление не ушло, это видно в `journalctl -t hood-smartd`.
+- bootstrap перезапускает smartd, только если изменился конфиг или drop-in. После правки drop-in делается `daemon-reload` (перечитать файлы юнитов). Он ничего не перезапускает, юниты набора не меняются. Recorder, RAID и mdmonitor это не затрагивает. В VM и в контейнере юнит пропускается (`ConditionVirtualization=no`). Тогда healthcheck присылает ALERT `smartd`.
+- **Не запускайте длинный тест руками (`smartctl -t long`), пока в `/proc/mdstat` идёт resync или recovery**: тест и синхронизация замедлят друг друга. Короткий тест (`-t short`, ~2 мин) безвреден. smartd не начинает тесты при первом опросе после старта, и перезапуск тестов не запускает.
+
+Проверка цепочки smartd → notify.sh (по одному INFO на диск, на `hood-rec` их 2):
+
+```bash
+srv# smartd -q onecheck -s - -c /opt/hoodchain-mev/deploy/smartd-test.conf   # -M test для каждого диска, работающий демон не трогается
+srv# journalctl -t hood-notify -n 2 -o cat     # [INFO] …: SMART: тестовое сообщение smartd для /dev/sdX [SAT]
+srv# smartctl -H /dev/sda; smartctl -H /dev/sdb   # PASSED
+srv# smartd -q showtests -s - -c /etc/hoodchain/smartd.conf | grep 'will do test 1 of type'   # расписание самотестов
+```
+
+Что делать при ALERT SMART: сервер не перезагружать, recorder не трогать. Посмотреть `smartctl -x /dev/sdX` и `cat /proc/mdstat`. Одиночный рост переназначенных секторов — повод следить. Рост ожидающих или неисправимых секторов, проваленный самотест или `Health` — повод заменить диск, пока RAID1 ещё полный. Замена — заявка в Hetzner Robot с выводом `smartctl -x` (решение Михаила).
 
 ### Часовой пояс
 
@@ -215,7 +245,7 @@ srv# journalctl -u recorder -f
 
 ### Обновление только скриптов `deploy/` (без рестарта recorder)
 
-Если менялись только скрипты и конфиги `deploy/` (healthcheck, notify, mdadm), а `recorder.service` и бинарник те же:
+Если менялись только скрипты и конфиги `deploy/` (healthcheck, notify, mdadm, smartd), а `recorder.service` и бинарник те же:
 
 ```bash
 mac$ rsync -a --delete --include .env.example --exclude target --exclude data --exclude .env --exclude '.env*' --exclude .idea --exclude '*.zip' ./ root@<IP>:/opt/hoodchain-mev/src/
@@ -224,7 +254,7 @@ srv# bash /opt/hoodchain-mev/src/deploy/bootstrap.sh         # ставит из
 srv# systemctl show recorder -p NRestarts -p ActiveEnterTimestamp -p MainPID   # должно совпасть с тем, что было до
 ```
 
-bootstrap кладёт файл, только если он отличается (`cmp`). `daemon-reload` он делает, только если изменился какой-то юнит, и даже тогда ничего не перезапускает. recorder он никогда не стартует и не перезапускает. healthcheck подхватит новый скрипт на следующем запуске таймера.
+bootstrap кладёт файл, только если он отличается (`cmp`). `daemon-reload` он делает, только если изменился какой-то юнит или drop-in smartd, и даже тогда ничего не перезапускает. Отдельно перезапускаются только `mdmonitor` и smartd, когда меняются их конфиги. recorder он никогда не стартует и не перезапускает. healthcheck подхватит новый скрипт на следующем запуске таймера.
 
 Откат бинарника. `cp` поверх работающего бинарника падает с `Text file busy`, поэтому только через временный файл и `mv`:
 
@@ -327,13 +357,14 @@ docker run --rm --network none -e LANG=C.UTF-8 -v "$PWD/deploy":/mnt:ro koalaman
   $(cd deploy && ls *.sh test/*.sh | sed "s#^#/mnt/#")
 for f in deploy/*.sh deploy/test/*.sh; do bash -n "$f"; done
 
-# офлайн-тесты healthcheck, notify и mdadm-event (подставные данные и /proc/mdstat, без сети); повторить с ubuntu:26.04
+# офлайн-тесты healthcheck, notify, mdadm-event и smartd-event (подставные данные, /proc/mdstat и окружение smartd, без сети); повторить с ubuntu:26.04
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-healthcheck.sh
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-notify.sh
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-mdadm-event.sh
+docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-smartd-event.sh
 
 # bootstrap дважды под настоящим systemd, verify юнитов, тест бэкапа, chrony, ufw,
-# часового пояса и PROGRAM для mdadm
+# часового пояса, PROGRAM для mdadm, smartd (конфиг, drop-in, smartd_warning.sh -> notify.sh -> journald)
 bash deploy/test/run-systemd-container.sh                  # ubuntu:24.04; --build — проверить и сборку
 bash deploy/test/run-systemd-container.sh --ubuntu 26.04   # как на сервере hood-rec
 docker rmi hood-deploy-test-systemd:24.04 hood-deploy-test-systemd:26.04   # образы стенда после проверки
@@ -346,4 +377,5 @@ docker rmi hood-deploy-test-systemd:24.04 hood-deploy-test-systemd:26.04   # о�
 - systemd 259, chrony 4.8, ufw 0.36.2 (iptables-nft), needrestart 3.11, Python 3.14, rustup 1.27.1 в архиве. Формат `chronyc -n tracking` прежний, `hood.conf` для needrestart разбирается, recorder исключён.
 - ssh запускается через `ssh.socket`; `sshd -T` возвращает порт, bootstrap берёт его оттуда. После правки `/etc/ssh/sshd_config.d/*.conf`: `sshd -t`, затем `systemctl reload ssh`.
 - mdadm 4.5: `mdmonitor.service` — `static`, запускается udev-правилом (`SYSTEMD_WANTS+="mdmonitor.service"`), `ExecStart=/usr/sbin/mdadm --monitor --scan`; плюс `mdmonitor-oneshot.timer` (ежедневно). `PROGRAM` и `MAILADDR` по замыслу пакета задаются в `mdadm.conf`; файлы `/etc/mdadm/mdadm.conf.d/*.conf` mdadm читает (проверено 2026-10-01 в контейнере: без `MAILADDR` mdadm пишет «No mail address or alert command - not monitoring», с `hood.conf` — нет; файл без `.conf` не читается).
+- smartmontools 7.5 (24.04: 7.4): юнит `smartmontools.service` (алиас `smartd.service`), `Type=notify`, `ExecStart=/usr/sbin/smartd -n $smartd_opts`, `ConditionVirtualization=no`. Пакет при установке включает и запускает его со штатным `/etc/smartd.conf`. Предупреждения smartd идут через `/usr/share/smartmontools/smartd_warning.sh`: при `-m <nomailer>` он делает `exec` нашего скрипта со stdin `/dev/null` и `PATH=/usr/local/bin:/usr/bin:/bin`, вывод скрипта smartd пишет в журнал как ошибку (проверено 2026-10-01 в контейнерах 24.04 и 26.04 и по исходникам smartmontools 7.5).
 - В Docker `chrony.service` на 26.04 пропускается (`ConditionVirtualization=!container`). Тестовый стенд снимает это условие только внутри контейнера, на сервере chrony работает штатно.

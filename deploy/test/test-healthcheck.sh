@@ -18,7 +18,12 @@ NLOG=$T/notify.log
 # ------------------------------------------------------------------ shims ---
 cat > "$T/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
-s=${FAKE_UNIT_STATE:-active}; echo "$s"; [[ $s == active ]]
+# smartd unit (task 015) has its own state; everything else is the recorder.
+case " $* " in
+    *smartmontools*) s=${FAKE_SMARTD_STATE:-active} ;;
+    *) s=${FAKE_UNIT_STATE:-active} ;;
+esac
+echo "$s"; [[ $s == active ]]
 EOF
 cat > "$T/bin/chronyc" <<'EOF'
 #!/usr/bin/env bash
@@ -42,7 +47,7 @@ export PATH="$T/bin:$PATH" NLOG
 
 export HC_CONFIG=/nonexistent HC_FEED_DIR=$T/feed HC_BLOCKS_DIR=$T/blocks HC_DATA_DIR=$T \
     HC_STATE_DIR=$T/state HC_NOTIFY=$T/bin/fake-notify HC_BACKUP_MARKER=$T/backup/last_ok \
-    HC_BACKUP_MAX_AGE_H=0 HC_MDSTAT=$T/no-mdstat
+    HC_BACKUP_MAX_AGE_H=0 HC_MDSTAT=$T/no-mdstat HC_SMARTD_BIN=$T/no-smartd
 
 now=$(date +%s)
 ns() { echo "$(( $1 ))000000000"; }
@@ -459,6 +464,16 @@ run; expect 0 "raid: no repeat after delivery"
 md_healthy
 run; expect 0 "raid: md1 done: silent"
 
+# Task 015 (review 014, Z3): only inactive arrays, no active one. Before the
+# fix n_arr stayed 0 and the check said raid=none silently.
+printf 'Personalities : [raid1]\nmd127 : inactive sdb3[1](S)\n      2111699968 blocks super 1.2\n\nunused devices: <none>\n' > "$T/mdstat"
+run; expect 1 "raid: only an inactive array: one ALERT" '^alert\|RAID деградирован: md127 inactive$'
+# shellcheck disable=SC2016  # eval in chk
+chk "raid=BAD with only inactive arrays" '[[ $(raid_summary) == raid=BAD ]]'
+run; expect 0 "raid: only inactive: no repeat"
+md_healthy
+run; expect 1 "raid: active arrays back: recovered" '^ok\|восстановлено: RAID деградирован: md127 inactive'
+
 # No arrays / no file: check skipped.
 printf 'Personalities : \nunused devices: <none>\n' > "$T/mdstat"
 run; expect 0 "raid: mdstat without arrays: silent"
@@ -468,6 +483,42 @@ export HC_MDSTAT=$T/no-mdstat
 run; expect 0 "raid: no mdstat file: silent"
 # shellcheck disable=SC2016  # eval in chk
 chk "no raid key without /proc/mdstat" '[[ -z $(raid_summary) ]]'
+
+# ----------------------------------------------------------- 17. smartd ---
+# Task 015: healthcheck only checks that smartd runs; SMART warnings come
+# from smartd itself (test-smartd-event.sh).
+smartd_summary() { grep -o 'smartd=[^ ]*' "$T/last.out" | tail -n 1; }
+run; expect 0 "smartd: smartmontools not installed (auto): silent"
+# shellcheck disable=SC2016  # eval in chk
+chk "smartd: no smartd key without smartmontools" '[[ -z $(smartd_summary) ]]'
+printf '#!/bin/sh\n' > "$T/fake-smartd"; chmod +x "$T/fake-smartd"
+export HC_SMARTD_BIN=$T/fake-smartd
+run; expect 0 "smartd: installed and active: silent"
+# shellcheck disable=SC2016  # eval in chk
+chk "smartd=ok in summary" '[[ $(smartd_summary) == smartd=ok ]]'
+export FAKE_SMARTD_STATE=failed
+run; expect 1 "smartd: failed: one ALERT" '^alert\|smartd не работает \(systemd: failed\): SMART-мониторинг дисков выключен$'
+run; expect 0 "smartd: still failed: no repeat"
+# shellcheck disable=SC2016  # eval in chk
+chk "smartd=BAD in summary, recorder unit still ok" '[[ $(smartd_summary) == smartd=BAD ]] && grep -q "unit=active" "$T/last.out"'
+export FAKE_SMARTD_STATE=inactive
+run; expect 0 "smartd: failed -> inactive: same alert, no repeat"
+export FAKE_SMARTD_STATE=active
+run; expect 1 "smartd: active again: recovered" '^ok\|восстановлено: smartd не работает'
+run; expect 0 "smartd: nothing after recovery"
+# Recorder down must not be reported as smartd and vice versa.
+export FAKE_UNIT_STATE=failed
+run; expect 1 "smartd ok, recorder failed: only the unit alert" '^alert\|recorder не работает'
+export FAKE_UNIT_STATE=active
+run; expect 1 "recorder back" '^ok\|восстановлено: recorder не работает'
+export HC_CHECK_SMARTD=0 FAKE_SMARTD_STATE=failed
+run; expect 0 "smartd: HC_CHECK_SMARTD=0: not checked"
+export HC_CHECK_SMARTD=1 HC_SMARTD_BIN=$T/no-smartd
+run; expect 1 "smartd: HC_CHECK_SMARTD=1 checks even without the binary" '^alert\|smartd не работает'
+export FAKE_SMARTD_STATE=active
+run; expect 1 "smartd: recovered" '^ok\|восстановлено: smartd'
+export HC_CHECK_SMARTD=auto
+unset FAKE_SMARTD_STATE
 
 # ------------------------------------------------- 10. everything at once ---
 run; expect 0 "final: healthy, silent"

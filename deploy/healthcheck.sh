@@ -18,7 +18,12 @@
 #   clock      chrony not synchronised or |offset| > HC_CLOCK_MAX_OFFSET_S
 #   backup     last successful backup older than HC_BACKUP_MAX_AGE_H (0 = off)
 #   raid       an md array in HC_MDSTAT (/proc/mdstat) is degraded ([U_], [_U])
-#              or inactive. Skipped when the file is missing or has no arrays
+#              or inactive (also when every array is inactive). Skipped when
+#              the file is missing or lists no arrays
+#   smartd     the smartd unit (HC_SMARTD_UNIT) is not `active`; checked when
+#              smartmontools is installed (HC_CHECK_SMARTD=auto). smartd sends
+#              the SMART warnings itself (smartd-event.sh), this only makes
+#              sure it is running
 # Events (one notification per new batch, no "recovered"):
 #   gaps       new rows in gaps.tsv since the last run (count, blocks, minutes)
 #   raid_sync  INFO once when a resync/recovery/reshape starts on an array
@@ -55,6 +60,9 @@ fi
 : "${HC_BACKUP_MAX_AGE_H:=0}"      # 0 = off (backup not enabled yet)
 : "${HC_CHECK_RAID:=1}"
 : "${HC_MDSTAT:=/proc/mdstat}"     # tests: a fake mdstat file
+: "${HC_CHECK_SMARTD:=auto}"       # auto = when HC_SMARTD_BIN exists; 1 = always; 0 = off
+: "${HC_SMARTD_BIN:=/usr/sbin/smartd}"
+: "${HC_SMARTD_UNIT:=smartmontools.service}"
 : "${HC_HEARTBEAT_URL:=}"
 : "${HC_NOW:=}"                    # tests only: fixed "now" (unix seconds)
 
@@ -329,7 +337,7 @@ fi
 raid_sync_txt=""
 if [[ $HC_CHECK_RAID == 1 && -r $HC_MDSTAT ]]; then
     raid_out=$(awk '
-        /^md[^ ]* : / { dev = $1; if ($3 == "inactive") print "BAD", dev, "inactive"; next }
+        /^md[^ ]* : / { dev = $1; if ($3 == "inactive") { n_arr++; print "BAD", dev, "inactive" }; next }
         /^unused devices/ { dev = ""; next }
         dev == "" { next }
         match($0, /\[[0-9]+\/[0-9]+\] \[[U_]+\]/) {
@@ -390,6 +398,21 @@ if [[ $HC_CHECK_RAID == 1 && -r $HC_MDSTAT ]]; then
     fi
 fi
 [[ -n $raid_sync_txt ]] && summary+=("raid_sync=${raid_sync_txt// /_}")
+
+# ----------------------------------------------------------------- smartd ---
+# smartd itself reports SMART problems (smartd-event.sh -> notify.sh); here we
+# only make sure it runs. A stopped smartd means no warning about a failing
+# disk until mdadm sees it drop out of the array.
+if [[ $HC_CHECK_SMARTD == 1 || ( $HC_CHECK_SMARTD == auto && -x $HC_SMARTD_BIN ) ]]; then
+    smartd_state=$(systemctl is-active "$HC_SMARTD_UNIT" 2>/dev/null)
+    smartd_state=${smartd_state:-unknown}
+    if [[ $smartd_state == active ]]; then
+        resolved smartd "smartd снова работает ($HC_SMARTD_UNIT)"
+    else
+        raise smartd "smartd не работает (systemd: $smartd_state): SMART-мониторинг дисков выключен" \
+            "systemctl status $HC_SMARTD_UNIT; journalctl -u $HC_SMARTD_UNIT -n 50. Запуск: systemctl start $HC_SMARTD_UNIT (recorder и RAID это не затрагивает)."
+    fi
+fi
 
 log "healthcheck: unit=$unit_state feed_age_s=$feed_age feed_src=$feed_src disk_pct=${disk_pct:-?} ${summary[*]}"
 

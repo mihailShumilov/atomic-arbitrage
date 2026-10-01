@@ -112,6 +112,51 @@ ok "mdadm-event.sh TestMessage reaches journald through notify.sh" "mdadm-event.
     x '/opt/hoodchain-mev/deploy/mdadm-event.sh TestMessage /dev/md/0 && sleep 1 &&
        journalctl -t hood-notify -o cat --no-pager | grep -q "^\[INFO\] hood-test: RAID: тестовое сообщение mdadm для /dev/md/0"'
 
+# Task 015: smartd. Installed by bootstrap from apt; our config via the drop-in.
+# shellcheck disable=SC2016  # expands inside the container
+ok "smartmontools installed, smartd-event.sh and smartd-test.conf in place" "smartmontools / hook missing" \
+    x 'dpkg-query -W -f="\${db:Status-Status}" smartmontools | grep -qx installed &&
+       test -x /opt/hoodchain-mev/deploy/smartd-event.sh && test -f /opt/hoodchain-mev/deploy/smartd-test.conf'
+ok "smartd ExecStart reads /etc/hoodchain/smartd.conf (drop-in)" "smartd drop-in not applied" \
+    x 'systemctl show -p ExecStart --value smartmontools.service | grep -q -- "-c /etc/hoodchain/smartd.conf" &&
+       cmp -s /etc/hoodchain/smartd.conf /opt/hoodchain-mev/src/deploy/smartd-hood.conf'
+# shellcheck disable=SC2016  # expands inside the container
+ok "packaged /etc/smartd.conf left as shipped (dpkg conffile)" "/etc/smartd.conf modified" \
+    x 'dpkg-query -W -f="\${Conffiles}\n" smartmontools | awk "\$1 == \"/etc/smartd.conf\" { print \$2 \"  \" \$1 }" | md5sum -c --quiet'
+# shellcheck disable=SC2016  # expands inside the container
+ok "smartd.conf and smartd-test.conf parse (smartd stops only for lack of disks)" "smartd config error" \
+    x 'for c in /etc/hoodchain/smartd.conf /opt/hoodchain-mev/deploy/smartd-test.conf; do
+           out=$(smartd -q onecheck -s - -c "$c" 2>&1)
+           grep -q "was parsed, found DEVICESCAN" <<< "$out" && ! grep -qi "syntax" <<< "$out" || exit 1
+       done'
+# In Docker the unit is skipped (ConditionVirtualization=no), as on any VM:
+# healthcheck must say smartd is not running.
+sstate=$(x 'systemctl is-active smartmontools.service' || true)
+ok "smartd not active in a container ($sstate): healthcheck ALERT smartd" "no smartd ALERT" \
+    x 'systemctl start healthcheck.service && sleep 1 &&
+       journalctl -t hood-notify -o cat --no-pager | grep -q "^\[ALERT\] hood-test: smartd не работает (systemd: inactive)"'
+# Test-only: clear the condition so the daemon really starts with our
+# ExecStart; with no disks smartd exits 17 after reading our config.
+x 'mkdir -p /etc/systemd/system/smartmontools.service.d &&
+   printf "[Unit]\nConditionVirtualization=\n" > /etc/systemd/system/smartmontools.service.d/test-container.conf &&
+   systemctl daemon-reload; systemctl start smartmontools.service 2>/dev/null; sleep 1' || true
+ok "smartd under systemd opens /etc/hoodchain/smartd.conf" "smartd did not read our config" \
+    x 'journalctl -u smartmontools.service -o cat --no-pager | grep -q "Opened configuration file /etc/hoodchain/smartd.conf"'
+x 'rm -f /etc/systemd/system/smartmontools.service.d/test-container.conf && systemctl daemon-reload && systemctl reset-failed smartmontools.service' || true
+# shellcheck disable=SC2016  # PIPESTATUS must expand inside the container
+ok "test-smartd-event.sh incl. the real smartd_warning.sh" "test-smartd-event.sh" \
+    x 'bash /opt/hoodchain-mev/src/deploy/test/test-smartd-event.sh | tail -n 1; exit "${PIPESTATUS[0]}"'
+# What smartd does on "-M test": env + smartd_warning.sh -> hook -> notify.sh -> journald.
+# shellcheck disable=SC2016  # expands inside the container
+ok "smartd_warning.sh -> smartd-event.sh -> notify.sh -> journald (EmailTest)" "smartd chain -> journald" \
+    x 'out=$(env -i PATH=/usr/bin:/bin SMARTD_MAILER=/opt/hoodchain-mev/deploy/smartd-event.sh SMARTD_ADDRESS= \
+           SMARTD_FAILTYPE=EmailTest SMARTD_MESSAGE="TEST EMAIL from smartd for device: /dev/sdb [SAT]" SMARTD_PREVCNT=0 \
+           SMARTD_NEXTDAYS= SMARTD_DEVICE=/dev/sdb SMARTD_DEVICESTRING="/dev/sdb [SAT]" SMARTD_DEVICETYPE=auto \
+           SMARTD_DEVICEINFO=ST4000NM0245-1Z2107 SMARTD_SUBJECT= sh /usr/share/smartmontools/smartd_warning.sh 2>&1) &&
+       [ -z "$out" ] && sleep 1 &&
+       journalctl -t hood-notify -o cat --no-pager | grep -q "^\[INFO\] hood-test: SMART: тестовое сообщение smartd для /dev/sdb \[SAT\]"'
+c=$(boot); expect_changes 0 "$c" "bootstrap after the smartd checks"
+
 if (( build )); then
     x 'bash /opt/hoodchain-mev/src/deploy/build-on-server.sh' | grep '^\[build\]'
     c3=$(boot); expect_changes 2 "$c3" "bootstrap run 3 (enables 2 timers)"
