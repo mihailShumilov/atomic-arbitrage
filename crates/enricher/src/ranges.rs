@@ -60,6 +60,30 @@ pub fn read_ranges_file(path: &Path, what: &str) -> Result<Vec<Range>> {
     }
 }
 
+/// Split off an unterminated last line (no trailing `\n`): the recorder may
+/// be appending it right now (task 012 item 5). Returns the complete part
+/// and the cut line, if any. Whitespace-only tails are not reported.
+pub fn split_unterminated(text: &str) -> (&str, Option<&str>) {
+    if text.is_empty() || text.ends_with('\n') {
+        return (text, None);
+    }
+    let cut = text.rfind('\n').map_or(0, |i| i + 1);
+    let tail = &text[cut..];
+    (&text[..cut], (!tail.trim().is_empty()).then_some(tail))
+}
+
+/// The recorder's `gaps.tsv` for `--gaps`. Like [`read_ranges_file`], but
+/// an unterminated last line is ignored and returned (the caller logs a
+/// WARN) instead of failing the run: it is either being written right now
+/// or will be completed later, and the next run picks it up. A broken line
+/// that does end with `\n` is still an error. A missing file is an error.
+pub fn read_gaps_file(path: &Path) -> Result<(Vec<Range>, Option<String>)> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let (complete, cut) = split_unterminated(&text);
+    let ranges = parse_ranges_tsv(complete, "gaps").with_context(|| path.display().to_string())?;
+    Ok((ranges, cut.map(str::to_owned)))
+}
+
 /// Sort and merge overlapping or adjacent ranges.
 pub fn merge(mut v: Vec<Range>) -> Vec<Range> {
     v.sort();
@@ -124,6 +148,28 @@ mod tests {
         assert_eq!(parse_ranges_tsv(t, "gaps").unwrap(), vec![r(100, 199), r(300, 300)]);
         assert!(parse_ranges_tsv("5\tx\n", "gaps").is_err());
         assert!(parse_ranges_tsv("9\t5\n", "gaps").is_err());
+    }
+
+    /// Task 012 item 5: the cases from the 011 review (`77200000`,
+    /// `77200000\t`, a full range without recv_ns, a cut recv_ns) are all
+    /// ignored while unterminated; once `\n` is there the line counts.
+    #[test]
+    fn unterminated_last_gaps_line_is_cut_off() {
+        let head = "100\t199\t1790000000000000000\n";
+        for tail in ["77200000", "77200000\t", "77200000\t77200099", "77200000\t77200099\t17908"] {
+            let text = format!("{head}{tail}");
+            let (complete, cut) = split_unterminated(&text);
+            assert_eq!(complete, head);
+            assert_eq!(cut, Some(tail));
+            assert_eq!(parse_ranges_tsv(complete, "gaps").unwrap(), vec![r(100, 199)]);
+        }
+        assert_eq!(split_unterminated(head), (head, None));
+        assert_eq!(split_unterminated(""), ("", None));
+        assert_eq!(split_unterminated("5\t9"), ("", Some("5\t9")));
+        // Trailing spaces without a newline are not a line.
+        assert_eq!(split_unterminated("5\t9\t1\n  "), ("5\t9\t1\n", None));
+        // A terminated broken line is still an error.
+        assert!(parse_ranges_tsv(split_unterminated("5\tx\n").0, "gaps").is_err());
     }
 
     #[test]

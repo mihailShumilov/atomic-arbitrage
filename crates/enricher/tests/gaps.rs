@@ -73,3 +73,31 @@ async fn missing_gaps_file_is_an_error() {
                    "--out-dir", d.join("b").to_str().unwrap()]);
     assert!(enricher::run(&a, Arc::new(Stats::default())).await.is_err());
 }
+
+/// Task 012 item 5: the recorder may be appending the last line of gaps.tsv
+/// while `--gaps` reads it. An unterminated last line is ignored (WARN), the
+/// complete ones are filled; once the line is terminated the next run fills it.
+#[tokio::test]
+async fn unterminated_last_gaps_line_is_ignored_until_complete() {
+    let m = start(Behavior::default()).await;
+    let d = scratch("gaps-torn");
+    let out = d.join("blocks");
+    let gaps = d.join("gaps.tsv");
+    let base = ["--rpc-url", &m.url, "--gaps", gaps.to_str().unwrap(), "--rps", "0", "--batch", "5",
+                "--out-dir", out.to_str().unwrap()];
+    for tail in ["300", "300\t", "300\t302", "300\t302\t17908"] {
+        std::fs::write(&gaps, format!("100\t102\t1\n{tail}")).unwrap();
+        enricher::run(&args(&base), Arc::new(Stats::default())).await.unwrap();
+    }
+    let mut got = m.blocks_requested();
+    got.sort();
+    assert_eq!(got, vec![100, 101, 102], "only the complete line is filled, once");
+    std::fs::write(&gaps, "100\t102\t1\n300\t302\t17908000\n").unwrap();
+    enricher::run(&args(&base), Arc::new(Stats::default())).await.unwrap();
+    let mut got = m.blocks_requested();
+    got.sort();
+    assert_eq!(got, vec![100, 101, 102, 300, 301, 302]);
+    // A broken line that does end with a newline is still an error.
+    std::fs::write(&gaps, "100\t102\t1\n5\tx\n").unwrap();
+    assert!(enricher::run(&args(&base), Arc::new(Stats::default())).await.is_err());
+}

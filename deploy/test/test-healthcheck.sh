@@ -35,6 +35,7 @@ cat > "$T/bin/fake-notify" <<'EOF'
 #!/usr/bin/env bash
 [[ ${FAKE_NOTIFY_FAIL:-0} == 1 ]] && exit 1
 printf '%s|%s\n' "$1" "$2" >> "$NLOG"
+printf '%s|%s|%s\n' "$1" "$2" "${3:-}" >> "$NLOG.body"
 EOF
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH" NLOG
@@ -235,6 +236,117 @@ printf '76800000\t768' >> "$T/feed/gaps.tsv"
 run; expect 0 "partial gaps.tsv row (no newline yet): not reported"
 printf '00099\t%s\n' "$(ns "$now")" >> "$T/feed/gaps.tsv"
 run; expect 1 "gaps.tsv row completed: one INFO, 100 blocks" '^info\|новые дыры в фиде: 1 шт., 100 блоков'
+
+# ------------------------- 13. feed age by last_seq.txt, not hour files ---
+# Review 011 Z1 / task 012 item 4: ping-only frames keep the hour file fresh
+# while no block reaches disk; only last_seq.txt tracks new blocks. Hour
+# files count only when last_seq.txt does not exist.
+hour_dir="$T/feed/$(date -u -d "@$now" +%Y/%m/%d)"
+hour_file="$hour_dir/feed-$(date -u -d "@$now" +%Y%m%d-%H).tsv.zst"
+mkdir -p "$hour_dir"
+: > "$hour_file"
+touch -d "@$now" "$hour_file"
+touch -d "@$((now - 600))" "$T/feed/last_seq.txt"
+run; expect 1 "hour file fresh, last_seq.txt 600 s old: ALERT" '^alert\|фид молчит'
+if tail -n 1 "$NLOG.body" | grep -q 'только ping'; then
+    echo "PASS  ping-only hint in the alert body"; pass=$((pass + 1))
+else
+    echo "FAIL  ping-only hint missing: $(tail -n 1 "$NLOG.body")"; fail=$((fail + 1))
+fi
+if grep -q 'feed_src=last_seq.txt' "$T/last.out"; then
+    echo "PASS  feed_src=last_seq.txt in summary"; pass=$((pass + 1))
+else
+    echo "FAIL  feed_src: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
+fi
+run; expect 0 "hour file fresh, last_seq.txt old: no repeat"
+fresh
+run; expect 1 "last_seq.txt fresh again: recovered" '^ok\|восстановлено: фид молчит'
+# No last_seq.txt (first minutes after the very first start): hour file used.
+mv "$T/feed/last_seq.txt" "$T/last_seq.saved"
+run; expect 0 "no last_seq.txt, hour file fresh: healthy (fallback)"
+if grep -q 'feed_src=hour_file' "$T/last.out" && grep -q 'feed=ok' "$T/last.out"; then
+    echo "PASS  fallback: feed_src=hour_file feed=ok"; pass=$((pass + 1))
+else
+    echo "FAIL  fallback: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
+fi
+touch -d "@$((now - 600))" "$hour_file"
+run; expect 1 "no last_seq.txt, hour file 600 s old: ALERT" '^alert\|фид молчит'
+rm -f "$hour_file"
+run; expect 0 "no last_seq.txt, no hour files: still the same alert"
+if grep -q 'feed_age_s=-1' "$T/last.out"; then
+    echo "PASS  nothing at all: feed_age_s=-1"; pass=$((pass + 1))
+else
+    echo "FAIL  nothing at all: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
+fi
+mv "$T/last_seq.saved" "$T/feed/last_seq.txt"
+fresh
+run; expect 1 "last_seq.txt back and fresh: recovered" '^ok\|восстановлено: фид молчит'
+
+# ------------------------------- 14. task 012 rows: block_idle reconnect ---
+# Recorder after task 012: no message with seq > 0 for
+# --block-idle-timeout-secs (30) -> Close 1000, `disconnected block_idle`,
+# reconnect with the requested-seq header. Not a ban; frequent ones are
+# caught by `reconnects`. Reason name and Close text as in the task 012 code
+# (backoff.rs EndKind::BlockIdle, net.rs "block idle timeout"); pause from
+# the transient ladder (first step 5 s).
+conn_full 40 client_close server_replied 101 - - 300.000 2900 - 'sent close 1000, waited 90 ms; close 1000 "block idle timeout": close frame code=Some(1000) reason="block idle timeout"'
+conn_full 40 disconnected block_idle 101 - 5.000 300.000 2900 1 'rule=transient no block (seq > 0) for 30s'
+conn_full 38 connected - 101 - - - - 0 'wss://feed.mainnet.chain.robinhood.com requested=77173000 mode=header'
+conn_full 37 backlog "done" 101 - - 0.500 300 - 'requested=77173000 last_seq_before=77172999 first_seq=77173000 first_minus_requested=0 backlog_blocks=300 complete=true'
+fresh
+run; expect 0 "012 block_idle reconnect rows: silent"
+if grep -q 'ban=ok' "$T/last.out" && grep -q 'reconnects=ok' "$T/last.out"; then
+    echo "PASS  block_idle rows: ban=ok reconnects=ok"; pass=$((pass + 1))
+else
+    echo "FAIL  block_idle rows: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
+fi
+
+# ------------------- 15. final task 012 recorder rows (mock run, 2026-10-01) ---
+# Rows copied from the task 012 mock runs of the final recorder binary
+# (scratchpad 012/sample-connections.txt; ws://127.0.0.1 mock, no feed),
+# columns unchanged, timestamps shifted to "now". Checks the 11-column
+# positional parsing against the real output, and that none of these is a ban.
+# Earlier sections left 6 `connected` rows in the last hour; drop them so
+# that `reconnects` stays below the threshold here.
+awk -F'\t' -v cut="$(ns $((now - 3600)))" '/^#/ || $2 + 0 < cut + 0' "$T/feed/connections.tsv" > "$T/c" &&
+    mv "$T/c" "$T/feed/connections.tsv"
+conn_full 90 connected - 101 - - - - 0 'ws://127.0.0.1:60020/ requested=- mode=no_data'
+conn_full 88 backlog session_ended 101 - - 0.000 2 - 'requested=- last_seq_before=- first_seq=300 first_minus_requested=- first_lag_ms=251567611 backlog_blocks=2 backlog_end_seq=301 live_seq=- live_lag_ms=- live_after_ms=0 stale_frames=0 complete=false'
+conn_full 88 client_close server_replied 101 - - 2.002 2 - 'sent close 1000, waited 0 ms; close 1000 "block idle timeout": close frame code=Some(1000) reason=""'
+conn_full 88 disconnected block_idle 101 - 5.454 2.002 2 0 'rule=transient no block (seq > 0) for 2s'
+conn_full 83 connected - 101 - - - - 0 'ws://127.0.0.1:60020/ requested=302 mode=header'
+conn_full 83 backlog "done" 101 - - 0.122 2 - 'requested=302 last_seq_before=301 first_seq=302 first_minus_requested=0 first_lag_ms=60071 backlog_blocks=2 backlog_end_seq=303 live_seq=304 live_lag_ms=193 live_after_ms=121 stale_frames=0 complete=true'
+conn_full 83 shutdown SIGTERM - - - - - - -
+conn_full 83 client_close server_replied 101 - - 0.326 3 - 'sent close 1000, waited 0 ms; close 1000 "recorder shutdown": close frame code=Some(1000) reason=""'
+conn_full 82 startup_wait min_connect_interval - - 79.510 - - 0 'previous session ended 40.490s ago (end=data_mtime), min interval 120s'
+fresh
+run; expect 0 "012 mock rows (block_idle, SIGTERM, startup_wait new detail): silent"
+if grep -q 'ban=ok' "$T/last.out" && grep -q 'reconnects=ok' "$T/last.out" && grep -q 'writer=ok' "$T/last.out"; then
+    echo "PASS  012 mock rows: ban=ok reconnects=ok writer=ok"; pass=$((pass + 1))
+else
+    echo "FAIL  012 mock rows: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
+fi
+# Writer error: shutdown writer_error, client_close "recorder writer error",
+# no `disconnected`, exit 2; then systemd restarts it and the min-interval
+# wait follows. Not a ban, but its own `writer` alert.
+conn_full 42 connected - 101 - - - - 0 'ws://127.0.0.1:60021/ requested=- mode=no_data'
+conn_full 41 shutdown writer_error - - - - - - 'Not a directory (os error 20)'
+conn_full 41 backlog session_ended 101 - - 0.000 1 - 'requested=- last_seq_before=- first_seq=500 first_minus_requested=- first_lag_ms=251567617 backlog_blocks=1 backlog_end_seq=500 live_seq=- live_lag_ms=- live_after_ms=0 stale_frames=0 complete=false'
+conn_full 41 client_close server_replied 101 - - 0.000 1 - 'sent close 1000, waited 0 ms; close 1000 "recorder writer error": close frame code=Some(1000) reason=""'
+conn_full 40 startup_wait min_connect_interval - - 79.510 - - 0 'previous session ended 40.490s ago (end=data_mtime), min interval 120s'
+run; expect 1 "shutdown writer_error: one writer alert, no ban" '^alert\|recorder: ошибка записи на диск \(1 за 60 мин\)'
+if tail -n 1 "$NLOG.body" | grep -q 'Not a directory' && grep -q 'ban=ok' "$T/last.out"; then
+    echo "PASS  writer alert body has the error text; ban=ok"; pass=$((pass + 1))
+else
+    echo "FAIL  writer alert: $(tail -n 1 "$NLOG.body") / $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
+fi
+conn_full 39 writer_error final_commit - - - - - - 'No space left on device (os error 28)'
+run; expect 0 "writer_error final_commit while raised: no repeat"
+conn_full 1 connected - 101 - - - - 0 'ws://127.0.0.1:60021/ requested=501 mode=header'
+run; expect 0 "reconnected but the error is younger than the window: still raised"
+export HC_WRITER_ERROR_WINDOW_S=30
+run; expect 1 "writer rows older than the window: recovered" '^ok\|восстановлено: recorder: ошибка записи'
+run; expect 0 "writer: nothing after recovery"
 
 # ------------------------------------------------- 10. everything at once ---
 run; expect 0 "final: healthy, silent"

@@ -82,6 +82,8 @@ async fn call_budget_is_never_exceeded() {
     let stats = Arc::new(Stats::default());
     let err = enricher::run(&a, stats.clone()).await.unwrap_err();
     assert!(format!("{err:#}").contains("call budget exhausted"), "{err:#}");
+    // Task 012 item 5: typed, so the binary can exit with 75.
+    assert!(enricher::rpc::is_budget_exhausted(&err), "{err:#}");
     assert_eq!(m.requests(), 2);
     assert_eq!(m.calls.lock().unwrap().len(), 40);
     assert!(!out.join("blocks-1-10.jsonl.zst").exists());

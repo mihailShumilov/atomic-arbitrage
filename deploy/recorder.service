@@ -26,8 +26,12 @@ ExecStart=/opt/hoodchain-mev/bin/recorder --out-dir /srv/hood/data/feed
 Restart=always
 # 120 s between a crash and the next start. The 2026-09-30 ban followed a
 # reconnect 11 s after kill -9. The recorder also enforces this itself
-# (--min-connect-interval-secs 120, from connections.tsv), so a manual
-# `systemctl restart` is spaced out as well. See deploy/README.md.
+# (--min-connect-interval-secs 120, counted from the END of the previous
+# session: the later of the last connections.tsv row and the newest hour
+# file mtime; task 012), so a manual `systemctl restart` waits ~120 s after the stop.
+# Defaults need no flags here: --block-idle-timeout-secs 30 (no block for
+# 30 s -> Close 1000 and reconnect with backfill), --idle-timeout-secs 10.
+# See deploy/README.md.
 RestartSec=120
 # SIGTERM: drain queue, close the zstd frame, fsync, write last_seq.txt.
 KillSignal=SIGTERM

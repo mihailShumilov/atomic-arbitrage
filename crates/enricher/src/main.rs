@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use enricher::rpc::{is_budget_exhausted, EXIT_BUDGET_EXHAUSTED};
 use enricher::stats::Stats;
 use enricher::{report, run, Args};
 use tracing::warn;
@@ -51,6 +52,13 @@ async fn main() -> Result<()> {
         Err((e, Some(_))) => {
             warn!("{e:#}");
             std::process::exit(130);
+        }
+        // Task 012 item 5: a used-up --max-calls is not a failure of the
+        // run; finished files are already in filled.tsv. systemd treats 75
+        // as success via SuccessExitStatus=75 (deploy/enricher-gaps.service).
+        Err((e, None)) if is_budget_exhausted(&e) => {
+            warn!("{e:#}; stopping with exit code {EXIT_BUDGET_EXHAUSTED}, the next run continues");
+            std::process::exit(EXIT_BUDGET_EXHAUSTED);
         }
         Err((e, None)) => Err(e),
     }

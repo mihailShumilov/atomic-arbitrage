@@ -1,5 +1,6 @@
 //! End-to-end tests of the recorder binary against a local mock feed on
-//! 127.0.0.1 (task 008, items 2 and 3; task 009, items 1, 2 and 6). No connection to the real feed and no
+//! 127.0.0.1 (task 008, items 2 and 3; task 009, items 1, 2 and 6; task 012,
+//! items 1-3). No connection to the real feed and no
 //! RPC: the binary always gets an explicit `--url ws://127.0.0.1:<port>` and
 //! `--out-dir <tmp>`, and FEED_URL / RPC_URL / RECORDER_OUT_DIR are removed
 //! from its environment.
@@ -379,9 +380,12 @@ async fn sigterm_without_close_reply_gives_up_after_2s() {
     std::fs::remove_file(out.with_extension("log")).ok();
 }
 
-/// Item 2: `connected` 30 s ago in connections.tsv -> the new process waits
-/// the rest of the 120 s minimum interval (~90 s) before connecting; SIGTERM
-/// interrupts the wait and the exit code is 0. The mock must see no attempt.
+/// Item 2 (008): `connected` 30 s ago and `shutdown` 20 s ago in
+/// connections.tsv -> the new process waits the rest of the 120 s minimum
+/// interval before connecting. Since task 012 the interval counts from the
+/// end of the session (the `shutdown` row): ~100 s (008: ~90 s from
+/// `connected`). SIGTERM interrupts the wait and the exit code is 0. The
+/// mock must see no attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn min_connect_interval_survives_restart_and_sigterm_interrupts() {
     let out = tmpdir("minint");
@@ -410,7 +414,8 @@ async fn min_connect_interval_survives_restart_and_sigterm_interrupts() {
         .find(|l| l.contains("\tstartup_wait\t"))
         .unwrap();
     let pause: f64 = row.split('\t').nth(6).unwrap().parse().unwrap();
-    assert!((88.0..=90.5).contains(&pause), "pause {pause}, row {row}");
+    assert!((98.0..=100.5).contains(&pause), "pause {pause}, row {row}");
+    assert!(row.contains("(end=log_row)"), "{row}");
 
     // Nobody may connect while the wait is running.
     let accepted = tokio::time::timeout(Duration::from_millis(1500), listener.accept()).await;
@@ -767,6 +772,281 @@ async fn idle_timeout_sends_close_then_resumes_from_memory() {
     assert_eq!(connected.len(), 2, "{conns}");
     assert!(connected[0].ends_with("requested=- mode=no_data"));
     assert!(connected[1].ends_with("requested=302 mode=header"));
+    assert_eq!(gaps(&out), "");
+    assert_eq!(recorded_seqs(&out), (300..=304).collect::<Vec<_>>());
+    std::fs::remove_dir_all(&out).ok();
+    std::fs::remove_file(out.with_extension("log")).ok();
+}
+
+// ------------------------------------------------------------- task 012 ---
+
+const CONN_HEADER: &str = "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail";
+
+/// Start the recorder on a prepared out-dir, wait for its `startup_wait`
+/// row, check that nobody connects, SIGTERM it (exit 0) and return the row.
+async fn startup_wait_row(out: &Path) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let mut child = spawn_recorder(&url, out, &[]);
+    wait_until("startup_wait event", Duration::from_secs(10), || {
+        connections(out).contains("\tstartup_wait\t")
+    })
+    .await;
+    let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+    assert!(accepted.is_err(), "recorder connected during the wait");
+    sigterm(&child);
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("SIGTERM did not interrupt the wait")
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "log:\n{}", read_log(out));
+    let conns = connections(out);
+    eprintln!("connections.tsv:\n{conns}");
+    row(&conns, "startup_wait").to_string()
+}
+
+fn pause_of(row: &str) -> f64 {
+    row.split('\t').nth(6).unwrap().parse().unwrap()
+}
+
+/// Item 1, case "clean end": a 10-minute session (connected 630 s ago)
+/// that ended with SIGTERM 30 s ago. Before 012 the recorder would connect
+/// at once (last `connected` > 120 s ago); now it waits ~90 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn min_connect_interval_counts_from_end_of_session() {
+    let out = tmpdir("end-log");
+    let now = now_ns();
+    let s = 1_000_000_000u128;
+    std::fs::write(
+        out.join("connections.tsv"),
+        format!(
+            "{CONN_HEADER}\n\
+             x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://127.0.0.1:9/ requested=- mode=no_data\n\
+             x\t{}\tbacklog\tdone\t101\t-\t-\t0.300\t4\t-\trequested=-\n\
+             x\t{}\tshutdown\tSIGTERM\t-\t-\t-\t-\t-\t-\t-\n\
+             x\t{}\tclient_close\tserver_replied\t101\t-\t-\t600.000\t6000\t-\tsent close 1000\n",
+            now - 630 * s,
+            now - 629 * s,
+            now - 31 * s,
+            now - 30 * s
+        ),
+    )
+    .unwrap();
+    let r = startup_wait_row(&out).await;
+    assert!(r.contains("\tstartup_wait\tmin_connect_interval\t"), "{r}");
+    assert!((88.0..=90.5).contains(&pause_of(&r)), "{r}");
+    assert!(r.contains("(end=log_row)"), "{r}");
+    std::fs::remove_dir_all(&out).ok();
+    std::fs::remove_file(out.with_extension("log")).ok();
+}
+
+/// Item 1, case "kill -9": nothing after the last `connected` (600 s ago);
+/// the newest hourly file was last written 40 s ago -> wait ~80 s from its
+/// mtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn min_connect_interval_after_kill9_uses_data_mtime() {
+    let out = seeded_out("end-mtime");
+    let now = now_ns();
+    let s = 1_000_000_000u128;
+    std::fs::write(
+        out.join("connections.tsv"),
+        format!(
+            "{CONN_HEADER}\n\
+             x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://127.0.0.1:9/ requested=- mode=no_data\n",
+            now - 600 * s
+        ),
+    )
+    .unwrap();
+    let f = out.join("2026/09/30/feed-20260930-12.tsv.zst");
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(40))
+        .unwrap();
+    let r = startup_wait_row(&out).await;
+    assert!(r.contains("\tstartup_wait\tmin_connect_interval\t"), "{r}");
+    assert!((78.0..=80.5).contains(&pause_of(&r)), "{r}");
+    assert!(r.contains("(end=data_mtime)"), "{r}");
+    std::fs::remove_dir_all(&out).ok();
+    std::fs::remove_file(out.with_extension("log")).ok();
+}
+
+/// Item 1, case "pending pause": a 403 with a 900 s pause 100 s ago, then
+/// SIGTERM 99 s ago -> the pause remainder (~800 s) beats the interval
+/// from the end (~21 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_pause_beats_interval_from_end() {
+    let out = tmpdir("end-pause");
+    let now = now_ns();
+    let s = 1_000_000_000u128;
+    std::fs::write(
+        out.join("connections.tsv"),
+        format!(
+            "{CONN_HEADER}\n\
+             x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://127.0.0.1:9/\n\
+             x\t{}\tdisconnected\tforbidden\t403\t-\t900.000\t0.000\t0\t1\tupgrade\n\
+             x\t{}\tshutdown\tSIGTERM\t-\t-\t-\t-\t-\t-\t-\n",
+            now - 400 * s,
+            now - 100 * s,
+            now - 99 * s
+        ),
+    )
+    .unwrap();
+    let r = startup_wait_row(&out).await;
+    assert!(r.contains("\tstartup_wait\tpending_pause\t"), "{r}");
+    assert!((798.0..=800.5).contains(&pause_of(&r)), "{r}");
+    std::fs::remove_dir_all(&out).ok();
+    std::fs::remove_file(out.with_extension("log")).ok();
+}
+
+/// Item 2 (remark Н1 of the 009 audit): the writer fails (here: the year
+/// directory of the hourly path is a regular file, so creating it fails like
+/// a full disk would) -> the recorder sends Close 1000 "recorder writer
+/// error", waits for the reply, logs `shutdown writer_error` and
+/// `client_close`, and exits with code 2. Before 012 it exited at once
+/// without a Close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writer_error_sends_close_then_exits_2() {
+    let out = tmpdir("writer-err");
+    let year: i32 = chrono_year_now();
+    for y in [year, year + 1] {
+        std::fs::write(out.join(y.to_string()), b"not a directory").unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let mut child = spawn_recorder(&url, &out, &[]);
+    let mut ws = tokio::time::timeout(Duration::from_secs(10), accept_ws(&listener))
+        .await
+        .expect("recorder did not connect to the mock");
+    ws.send(Frame::text(envelope(500))).await.unwrap();
+    let t0 = Instant::now();
+    let (code, reason) = loop {
+        match tokio::time::timeout(Duration::from_secs(5), ws.next_frame()).await {
+            Err(_) => panic!("no Close within 5 s of the write error"),
+            Ok(Err(e)) => panic!("stream ended without a Close frame: {e}"),
+            Ok(Ok(f)) if f.opcode() == OpCode::Close => {
+                break (
+                    f.close_code().map(u16::from),
+                    f.close_reason().ok().flatten().unwrap_or("").to_string(),
+                )
+            }
+            Ok(Ok(_)) => continue,
+        }
+    };
+    assert_eq!(code, Some(1000));
+    assert_eq!(reason, "recorder writer error");
+    ws.close().await.ok();
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("recorder did not exit")
+        .unwrap();
+    assert_eq!(status.code(), Some(2), "log:\n{}", read_log(&out));
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    let conns = connections(&out);
+    eprintln!("connections.tsv:\n{conns}");
+    let sd = row(&conns, "shutdown");
+    assert!(sd.contains("\tshutdown\twriter_error\t"), "{sd}");
+    let cc = row(&conns, "client_close");
+    assert!(cc.contains("\tclient_close\tserver_replied\t"), "{cc}");
+    assert!(cc.contains("\"recorder writer error\""), "{cc}");
+    assert_eq!(conns.matches("\tconnected\t").count(), 1, "{conns}");
+    assert!(!conns.contains("\tdisconnected\t"), "{conns}");
+    std::fs::remove_dir_all(&out).ok();
+    std::fs::remove_file(out.with_extension("log")).ok();
+}
+
+fn chrono_year_now() -> i32 {
+    use chrono::Datelike;
+    chrono::Utc::now().year()
+}
+
+/// Item 3 (З1-б of the 011 review): after two blocks the mock sends only
+/// pings. With --block-idle-timeout-secs 2 the recorder sends Close 1000
+/// "block idle timeout" ~2 s after the last block (pings keep the plain idle
+/// timeout from firing), logs `disconnected block_idle` with the transient
+/// rule, reconnects and asks for last_seq + 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_idle_closes_and_resumes() {
+    let out = tmpdir("block-idle");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let mut child = spawn_recorder(
+        &url,
+        &out,
+        &["--block-idle-timeout-secs", "2", "--idle-timeout-secs", "1"],
+    );
+    let mut ws = tokio::time::timeout(Duration::from_secs(10), accept_ws(&listener))
+        .await
+        .expect("recorder did not connect to the mock");
+    ws.send(Frame::text(envelope(300))).await.unwrap();
+    ws.send(Frame::text(envelope(301))).await.unwrap();
+    let t_last = Instant::now();
+    // Pings every 300 ms (well inside the 1 s idle timeout), no blocks.
+    let (code, reason, after) = loop {
+        match tokio::time::timeout(Duration::from_millis(300), ws.next_frame()).await {
+            Err(_) => {
+                assert!(
+                    t_last.elapsed() < Duration::from_secs(6),
+                    "no Close within 6 s without blocks"
+                );
+                ws.send(Frame::ping(Vec::<u8>::new())).await.unwrap();
+            }
+            Ok(Err(e)) => panic!("stream ended without a Close frame: {e}"),
+            Ok(Ok(f)) if f.opcode() == OpCode::Close => {
+                break (
+                    f.close_code().map(u16::from),
+                    f.close_reason().ok().flatten().unwrap_or("").to_string(),
+                    t_last.elapsed(),
+                )
+            }
+            Ok(Ok(_)) => continue,
+        }
+    };
+    assert_eq!(code, Some(1000));
+    assert_eq!(reason, "block idle timeout");
+    assert!(
+        after >= Duration::from_millis(1900) && after < Duration::from_secs(3),
+        "Close after {after:?}"
+    );
+    ws.close().await.ok();
+    drop(ws);
+
+    // Transient ladder, first step 5 s +-20 %.
+    let t_close = Instant::now();
+    let (mut ws2, req2) = tokio::time::timeout(Duration::from_secs(12), accept_ws_req(&listener))
+        .await
+        .expect("recorder did not reconnect");
+    let gap = t_close.elapsed();
+    assert!(
+        gap >= Duration::from_millis(3500) && gap < Duration::from_secs(7),
+        "reconnect after {gap:?}"
+    );
+    assert_eq!(
+        header(&req2, "Arbitrum-Requested-Sequence-Number").as_deref(),
+        Some("302"),
+        "{req2}"
+    );
+    send_burst_then_live(&mut ws2, &[302, 303], &[304]).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    stop_recorder(&mut child, &mut ws2, &out).await;
+
+    let conns = connections(&out);
+    eprintln!("connections.tsv:\n{conns}");
+    let cc = row(&conns, "client_close");
+    assert!(cc.contains("\tclient_close\tserver_replied\t"), "{cc}");
+    assert!(cc.contains("\"block idle timeout\""), "{cc}");
+    let d = row(&conns, "disconnected");
+    assert!(d.contains("\tdisconnected\tblock_idle\t101\t"), "{d}");
+    assert!(
+        d.contains("rule=transient no block (seq > 0) for 2s"),
+        "{d}"
+    );
+    assert!(!conns.contains("\tidle_timeout\t"), "{conns}");
+    assert!(
+        conns.lines().all(|l| l.split('\t').count() == 11),
+        "{conns}"
+    );
     assert_eq!(gaps(&out), "");
     assert_eq!(recorded_seqs(&out), (300..=304).collect::<Vec<_>>());
     std::fs::remove_dir_all(&out).ok();

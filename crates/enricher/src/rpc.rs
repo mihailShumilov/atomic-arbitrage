@@ -115,19 +115,45 @@ pub enum Check {
 pub enum CallError {
     /// HTTP timeout, returned only when the caller asked for it (logs mode shrinks its window).
     Timeout,
+    /// Sending the next request would exceed `--max-calls` (task 012 item 5:
+    /// the binary exits with [`EXIT_BUDGET_EXHAUSTED`], not 1).
+    Budget(BudgetExhausted),
     Failed(anyhow::Error),
+}
+
+/// Exit code of the binary when the run stopped because `--max-calls` was
+/// used up (`EX_TEMPFAIL`): progress so far is committed, the next run goes
+/// on. Every other error exits with 1, a signal with 130.
+pub const EXIT_BUDGET_EXHAUSTED: i32 = 75;
+
+#[derive(Debug, Clone)]
+pub struct BudgetExhausted {
+    pub what: String,
+    pub sent: u64,
+    pub next: u64,
+    pub max: u64,
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::Timeout => write!(f, "request timed out"),
+            CallError::Budget(b) => write!(
+                f,
+                "{}: call budget exhausted: {} calls sent, {} more would exceed --max-calls {}",
+                b.what, b.sent, b.next, b.max
+            ),
             CallError::Failed(e) => write!(f, "{e:#}"),
         }
     }
 }
 
 impl std::error::Error for CallError {}
+
+/// True if the run stopped on `--max-calls` (anywhere in the error chain).
+pub fn is_budget_exhausted(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| matches!(c.downcast_ref::<CallError>(), Some(CallError::Budget(_))))
+}
 
 /// Spaces JSON-RPC calls at least `1/rps` apart across all concurrent tasks.
 /// A batch of N calls consumes N slots: providers (and, as observed on
@@ -241,9 +267,7 @@ impl Rpc {
                 let sent = self.calls_sent.fetch_add(n, Ordering::SeqCst);
                 if sent + n > max {
                     self.calls_sent.fetch_sub(n, Ordering::SeqCst);
-                    return Err(CallError::Failed(anyhow!(
-                        "{what}: call budget exhausted: {sent} calls sent, {n} more would exceed --max-calls {max}"
-                    )));
+                    return Err(CallError::Budget(BudgetExhausted { what: what.to_owned(), sent, next: n, max }));
                 }
             }
             self.limiter.acquire(n.min(u32::MAX as u64) as u32).await;

@@ -4,13 +4,16 @@
 # Conditions (one notification when a condition starts, one "восстановлено"
 # when it ends; state files in HC_STATE_DIR):
 #   unit       recorder unit is not `active`
-#   feed       newest of last_seq.txt / current-hour feed file older than
-#              HC_FEED_MAX_AGE_S (not raised while a ban is active: the ban
-#              alert already explains the silence)
+#   feed       last_seq.txt older than HC_FEED_MAX_AGE_S (no new blocks on
+#              disk); the current/previous hour files are used only while
+#              last_seq.txt does not exist. Not raised while a ban is active:
+#              the ban alert already explains the silence
 #   disk       data filesystem usage >= HC_DISK_MAX_PCT
 #   ban        last connect-related row of connections.tsv is a 4xx refusal
 #              (403 ban, 429) or a startup_wait pending_pause >= HC_BAN_MIN_PAUSE_S
 #   reconnects more than HC_MAX_CONNECTS_PER_HOUR `connected` rows in the last hour
+#   writer     `shutdown writer_error` / `writer_error` row in connections.tsv
+#              younger than HC_WRITER_ERROR_WINDOW_S (disk/fsync failure, exit 2)
 #   backfill   gaps older than HC_BACKFILL_MAX_LAG_H not covered by filled.tsv
 #   clock      chrony not synchronised or |offset| > HC_CLOCK_MAX_OFFSET_S
 #   backup     last successful backup older than HC_BACKUP_MAX_AGE_H (0 = off)
@@ -38,6 +41,7 @@ fi
 : "${HC_DISK_MAX_PCT:=80}"
 : "${HC_BAN_MIN_PAUSE_S:=600}"
 : "${HC_MAX_CONNECTS_PER_HOUR:=6}"
+: "${HC_WRITER_ERROR_WINDOW_S:=3600}"
 : "${HC_GAP_ALERT_BLOCKS:=2979}"   # ~5 min at ~9.93 blocks/s (chain-facts)
 : "${HC_BLOCKS_PER_S:=9.93}"
 : "${HC_BACKFILL_MAX_LAG_H:=24}"   # 0 = off
@@ -126,21 +130,42 @@ else
 fi
 
 # ------------------------------------------------------------------- feed ---
+# Feed age = mtime of last_seq.txt. The recorder rewrites it only when the
+# last seq on disk grew (at each frame commit, <= --frame-secs), so it tracks
+# new blocks. Hourly files are NOT a block signal: ping-only frames still go
+# into them and the frame closes every <= 60 s even without blocks (review
+# 011, Z1). They are used only when last_seq.txt does not exist yet.
+last_seq_file="$HC_FEED_DIR/last_seq.txt"
 cur_hour_file="$HC_FEED_DIR/$(date -u -d "@$now_s" +%Y/%m/%d)/feed-$(date -u -d "@$now_s" +%Y%m%d-%H).tsv.zst"
 prev_s=$((now_s - 3600))
 prev_hour_file="$HC_FEED_DIR/$(date -u -d "@$prev_s" +%Y/%m/%d)/feed-$(date -u -d "@$prev_s" +%Y%m%d-%H).tsv.zst"
-newest=0
-for f in "$HC_FEED_DIR/last_seq.txt" "$cur_hour_file" "$prev_hour_file"; do
+hour_newest=0
+for f in "$cur_hour_file" "$prev_hour_file"; do
     m=$(mtime "$f")
-    (( m > newest )) && newest=$m
+    (( m > hour_newest )) && hour_newest=$m
 done
-last_seq=$(head -c 32 "$HC_FEED_DIR/last_seq.txt" 2>/dev/null | tr -dc '0-9')
+last_seq=""
+if [[ -e $last_seq_file ]]; then
+    feed_src=last_seq.txt
+    newest=$(mtime "$last_seq_file")
+    last_seq=$(head -c 32 "$last_seq_file" 2>/dev/null | tr -dc '0-9')
+else
+    feed_src=hour_file
+    newest=$hour_newest
+fi
 if (( newest == 0 )); then
     feed_age=-1
-    feed_msg="нет ни last_seq.txt, ни файла текущего часа в $HC_FEED_DIR"
+    feed_msg="нет ни last_seq.txt, ни файла текущего или прошлого часа в $HC_FEED_DIR"
 else
     feed_age=$((now_s - newest))
-    feed_msg="последняя запись ${feed_age} с назад, last_seq=${last_seq:-?}"
+    if [[ $feed_src == last_seq.txt ]]; then
+        feed_msg="last_seq.txt не менялся ${feed_age} с, last_seq=${last_seq:-?}"
+        if (( hour_newest > 0 && now_s - hour_newest < HC_FEED_MAX_AGE_S )); then
+            feed_msg+=". Файл часа при этом обновлялся $((now_s - hour_newest)) с назад: соединение, похоже, живо, но блоков нет (только ping?)"
+        fi
+    else
+        feed_msg="last_seq.txt нет; файл часа обновлялся ${feed_age} с назад"
+    fi
 fi
 if (( feed_age >= 0 && feed_age < HC_FEED_MAX_AGE_S )); then
     resolved feed "$feed_msg"
@@ -174,6 +199,25 @@ if [[ -r $conn ]]; then
             "Риск бана IP. tail -n 30 $conn; journalctl -u $HC_RECORDER_UNIT -n 200"
     else
         resolved reconnects
+    fi
+fi
+
+# ----------------------------------------------------------------- writer ---
+# Task 012: a fatal writer error (disk full, fsync, EIO) makes the recorder
+# send Close 1000 and exit 2; connections.tsv gets `shutdown writer_error`
+# (or `writer_error final_commit` if it failed in the last commit after a
+# signal). systemd restarts it after RestartSec=120, so `unit` may never be
+# seen. Raised while such a row is younger than HC_WRITER_ERROR_WINDOW_S.
+if [[ -r $conn ]]; then
+    w_row=$(tail -c 262144 "$conn" | awk -F'\t' -v since="$(( now_s - HC_WRITER_ERROR_WINDOW_S ))" '
+        $0 !~ /^#/ && (($3 == "shutdown" && $4 == "writer_error") || $3 == "writer_error") &&
+        ($2 / 1e9) >= since { n++; last = $1 " " $3 " " $4 ": " $11 }
+        END { if (n) print n "\t" last }')
+    if [[ -n $w_row ]]; then
+        raise writer "recorder: ошибка записи на диск (${w_row%%$'\t'*} за $((HC_WRITER_ERROR_WINDOW_S / 60)) мин)" \
+            "${w_row#*$'\t'}. Recorder закрыл соединение и вышел с кодом 2, systemd перезапустит через 120 с. df -h $HC_DATA_DIR; journalctl -u $HC_RECORDER_UNIT -n 100. Сырьё не удалять, пока оно не в бэкапе."
+    else
+        resolved writer
     fi
 fi
 
@@ -262,7 +306,7 @@ if (( HC_BACKUP_MAX_AGE_H > 0 )); then
     fi
 fi
 
-log "healthcheck: unit=$unit_state feed_age_s=$feed_age disk_pct=${disk_pct:-?} ${summary[*]}"
+log "healthcheck: unit=$unit_state feed_age_s=$feed_age feed_src=$feed_src disk_pct=${disk_pct:-?} ${summary[*]}"
 
 # -------------------------------------------------------------- heartbeat ---
 # Optional external dead-man switch: alerts when this host stops pinging.

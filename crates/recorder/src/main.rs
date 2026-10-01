@@ -9,12 +9,16 @@
 //! `{"recorderFrame":...}`) have `seq_first = seq_last = 0`.
 //!
 //! Start-up: repair torn zstd tails, add holes missing from gaps.tsv, wait
-//! out a pending pause / the minimum connect interval. Every connection asks
+//! out a pending pause / the minimum connect interval, counted from the end
+//! of the previous session (task 012 item 1). Every connection asks
 //! the feed to resume at `last_seq + 1` (`Arbitrum-Requested-Sequence-Number`,
 //! task 009; `last_seq` from memory, at start-up from the data), unless there
 //! is no data yet or `--no-requested-seq` is given. Whenever the recorder ends
-//! a connection itself (SIGINT/SIGTERM, idle timeout): WebSocket Close 1000,
+//! a connection itself (SIGINT/SIGTERM, idle timeout, no block for
+//! `--block-idle-timeout-secs`, fatal writer error): WebSocket Close 1000,
 //! wait <= 2 s for the reply, then drop TCP; on shutdown drain and commit.
+//! A fatal writer error (disk full, fsync) exits with code 2 after the Close
+//! (task 012 item 2).
 //!
 //! Side files in <out>:
 //!   gaps.tsv         `from \t to \t recv_ns` of missing L2 blocks (for RPC backfill)
@@ -41,8 +45,11 @@ use clap::Parser;
 use hood_core::FEED_URL;
 use tracing::{error, info, warn};
 
-use crate::backoff::{startup_wait, Ladder, StartupWaitReason};
-use crate::net::{now_ns, run_connection, stopped, tls_connector, ConnEvent, ConnLog, Sink};
+use crate::backoff::{session_end_ns, startup_wait, Ladder, StartupWaitReason};
+use crate::net::{
+    now_ns, run_connection, stop_reason, stopped, tls_connector, ConnEvent, ConnLog, Sink,
+    SHUTDOWN_REASON,
+};
 use crate::resume::{requested_seq, Backlog};
 use crate::route::Line;
 use crate::writer::FeedWriter;
@@ -70,12 +77,20 @@ struct Args {
     /// over; the default is to honour both.
     #[arg(long)]
     ignore_pending_pause: bool,
-    /// Minimum time between the last successful connect of an earlier run
-    /// (from connections.tsv) and the first connect after a (re)start. The
-    /// 403 + Retry-After: 3600 ban of 2026-09-30 followed a reconnect 11 s
-    /// after kill -9; the cause is unknown, so restarts are spaced out.
+    /// Minimum time between the end of the previous session and the first
+    /// connect after a (re)start. End = last row of connections.tsv after the
+    /// last `connected`, or the mtime of the newest hourly data file if that
+    /// is later (kill -9 leaves no row). The 403 + Retry-After: 3600 ban of
+    /// 2026-09-30 followed a reconnect 11 s after kill -9; the cause is
+    /// unknown, so restarts are spaced out.
     #[arg(long, default_value_t = 120)]
     min_connect_interval_secs: u64,
+    /// Reconnect (Close 1000, then resume at last_seq + 1) if no frame with a
+    /// block (seq > 0) arrives for this many seconds, even if pings and
+    /// confirmations keep the stream alive. Blocks are ~100 ms apart. 0
+    /// disables.
+    #[arg(long, default_value_t = 30)]
+    block_idle_timeout_secs: u64,
     /// Do not send `Arbitrum-Feed-Client-Version` /
     /// `Arbitrum-Requested-Sequence-Number` on connect: the stream then
     /// starts at the tip, as before task 009.
@@ -127,6 +142,17 @@ async fn main() -> Result<()> {
         .init();
     let args = Args::parse();
     fs::create_dir_all(&args.out_dir)?;
+    let conn_log = ConnLog::new(&args.out_dir);
+
+    // End of the previous session (task 012 item 1). Read before recovery
+    // and before this run writes any row: a torn-tail repair rewrites the
+    // newest file (mtime) and start-up rows would look like a later end.
+    let last_session = conn_log.last_session();
+    let session_end = session_end_ns(
+        last_session.map(|s| s.connected_ns),
+        last_session.and_then(|s| s.last_row_ns),
+        writer::newest_data_mtime_ns(&args.out_dir),
+    );
 
     // Crash recovery before anything is written.
     let rec = writer::recover(&args.out_dir)?;
@@ -134,7 +160,6 @@ async fn main() -> Result<()> {
         state = ?rec.state_seq, data = ?rec.data_seq, resume = ?rec.resume_seq,
         torn_repairs = rec.repairs.len(), "recovery done"
     );
-    let conn_log = ConnLog::new(&args.out_dir);
     for g in &rec.reconciled {
         let detail = format!(
             "{}..{} recv_ns={} missing from gaps.tsv, appended",
@@ -170,17 +195,28 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.frame_secs.max(1)),
         rec.resume_seq,
     );
-    let writer = std::thread::spawn(move || {
-        if let Err(e) = writer::run(rx, w) {
-            error!(error = %e, "writer failed");
-            std::process::exit(2);
+    // A fatal writer error (disk full, fsync) is reported here; `run` has
+    // already dropped `rx`, so the network side cannot block on a full
+    // channel. The main task then closes the connection politely and exits
+    // with code 2 (task 012 item 2; before: exit(2) right in this thread,
+    // without a WebSocket Close).
+    let (writer_err_tx, mut writer_err_rx) = tokio::sync::oneshot::channel::<String>();
+    let writer = std::thread::spawn(move || match writer::run(rx, w) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            error!(error = %msg, "writer failed");
+            let _ = writer_err_tx.send(msg.clone());
+            Err(msg)
         }
     });
 
     let tls = tls_connector()?;
     let idle = Duration::from_secs(args.idle_timeout_secs);
+    let block_idle = Duration::from_secs(args.block_idle_timeout_secs);
     let min_interval = Duration::from_secs(args.min_connect_interval_secs);
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel::<Option<&'static str>>(None);
+    let mut writer_failed: Option<String> = None;
     // The network future borrows `tx`; it lives in this block so that `tx`
     // can be dropped after it.
     {
@@ -188,16 +224,17 @@ async fn main() -> Result<()> {
             let mut stop = stop_rx.clone();
             let mut ladder = Ladder::default();
             // Honour a pause (e.g. Retry-After of a ban) chosen before a restart
-            // and the minimum interval since the last successful connect.
+            // and the minimum interval since the end of the previous session.
             if !args.ignore_pending_pause {
                 let pending = conn_log.last_pause();
                 if let Some(p) = pending {
                     ladder.strikes = p.strikes;
                 }
+                let now = now_ns();
                 let wait = startup_wait(
-                    now_ns(),
+                    now,
                     pending.map(|p| p.not_before_ns),
-                    conn_log.last_connected_ns(),
+                    session_end.map(|e| e.0),
                     min_interval,
                 );
                 if let Some((wait, why)) = wait {
@@ -212,10 +249,15 @@ async fn main() -> Result<()> {
                         StartupWaitReason::PendingPause => {
                             format!("remaining pause from previous run, strikes={strikes}")
                         }
-                        StartupWaitReason::MinConnectInterval => format!(
-                            "last connect less than {}s ago",
-                            args.min_connect_interval_secs
-                        ),
+                        StartupWaitReason::MinConnectInterval => {
+                            let (end, src) = session_end.expect("interval wait needs an end");
+                            format!(
+                                "previous session ended {:.3}s ago (end={}), min interval {}s",
+                                now.saturating_sub(end) as f64 / 1e9,
+                                src.as_str(),
+                                args.min_connect_interval_secs
+                            )
+                        }
                     };
                     conn_log.event(ConnEvent {
                         event: "startup_wait",
@@ -255,6 +297,7 @@ async fn main() -> Result<()> {
                     &args.url,
                     &tls,
                     idle,
+                    block_idle,
                     requested,
                     &mut sink,
                     &mut stop,
@@ -299,7 +342,7 @@ async fn main() -> Result<()> {
                         ..Default::default()
                     });
                 }
-                if *stop.borrow() {
+                if stop_reason(&stop).is_some() {
                     return;
                 }
                 let (pause, rule) =
@@ -330,23 +373,34 @@ async fn main() -> Result<()> {
         };
         tokio::pin!(net);
 
-        let sig = tokio::select! {
+        let (sig, close_reason) = tokio::select! {
             _ = &mut net => unreachable!("network loop only returns after stop"),
-            s = shutdown_signal() => s,
+            s = shutdown_signal() => (s, SHUTDOWN_REASON),
+            Ok(msg) = &mut writer_err_rx => {
+                writer_failed = Some(msg);
+                ("writer_error", "recorder writer error")
+            }
         };
-        info!(
-            signal = sig,
-            "shutting down: closing connection, draining queue, closing frame, fsync"
-        );
+        match &writer_failed {
+            None => info!(
+                signal = sig,
+                "shutting down: closing connection, draining queue, closing frame, fsync"
+            ),
+            Some(e) => error!(
+                error = %e,
+                "writer failed: closing the connection (Close 1000), then exit 2"
+            ),
+        }
         conn_log.event(ConnEvent {
             event: "shutdown",
             reason: sig,
+            detail: writer_failed.as_deref().unwrap_or(""),
             ..Default::default()
         });
         // Let the network loop finish the WebSocket close handshake (<= 2 s for
         // the server's reply + 0.5 s for the stream shutdown). The outer bound
         // only guards against a bug; systemd gives us TimeoutStopSec=30.
-        let _ = stop_tx.send(true);
+        let _ = stop_tx.send(Some(close_reason));
         if tokio::time::timeout(Duration::from_secs(5), &mut net)
             .await
             .is_err()
@@ -356,9 +410,26 @@ async fn main() -> Result<()> {
     }
     // Dropping the sender lets the writer drain everything queued and commit.
     drop(tx);
-    if writer.join().is_err() {
-        error!("writer thread panicked");
-        std::process::exit(2);
+    match writer.join() {
+        Err(_) => {
+            error!("writer thread panicked");
+            std::process::exit(2);
+        }
+        Ok(Err(e)) => {
+            // Failed during the run (Close already sent above) or in the
+            // final commit after a signal.
+            if writer_failed.is_none() {
+                conn_log.event(ConnEvent {
+                    event: "writer_error",
+                    reason: "final_commit",
+                    detail: &e,
+                    ..Default::default()
+                });
+            }
+            error!(error = %e, "writer failed, exit 2");
+            std::process::exit(2);
+        }
+        Ok(Ok(())) => {}
     }
     info!("stopped");
     Ok(())

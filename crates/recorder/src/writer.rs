@@ -154,6 +154,22 @@ pub fn list_feed_files(root: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Unix ns of the newest modification among the hourly feed files (the two
+/// newest by name are enough: older hours are closed). None without data.
+/// Used as the end of the previous session when connections.tsv has nothing
+/// after the last `connected` (kill -9, task 012 item 1). Must be read before
+/// [`recover`]: truncating a torn tail updates the mtime.
+pub fn newest_data_mtime_ns(root: &Path) -> Option<u128> {
+    list_feed_files(root)
+        .iter()
+        .rev()
+        .take(2)
+        .filter_map(|p| fs::metadata(p).ok()?.modified().ok())
+        .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .max()
+}
+
 /// Highest `seq_last` among lines of a (repaired) feed file; None if the file
 /// has no sequenced lines.
 pub fn max_seq_in_file(path: &Path) -> Result<Option<u64>> {

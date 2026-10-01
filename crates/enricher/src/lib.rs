@@ -59,6 +59,7 @@ pub struct Args {
     #[arg(long, required_unless_present = "gaps", conflicts_with = "gaps")]
     pub to: Option<u64>,
     /// Recorder gaps file(s) (`from \t to \t recv_ns`); fill them in blocks mode. Repeatable.
+    /// An unterminated last line (no `\n`, being written) is ignored with a WARN.
     #[arg(long)]
     pub gaps: Vec<PathBuf>,
     /// Output dir for blocks mode (also holds filled.tsv).
@@ -77,7 +78,7 @@ pub struct Args {
     #[arg(long, default_value_t = 4.0)]
     pub rps: f64,
     /// Hard budget of JSON-RPC calls for the whole run (retries included);
-    /// the run stops with an error instead of exceeding it.
+    /// the run stops instead of exceeding it, the binary with exit code 75.
     #[arg(long)]
     pub max_calls: Option<u64>,
     /// Attempts per request before the run stops with an error.
@@ -182,7 +183,10 @@ async fn run_gaps(a: &Args, stats: Arc<Stats>) -> Result<()> {
     let mut gaps = Vec::new();
     for g in &a.gaps {
         ensure!(g.exists(), "gaps file {} does not exist", g.display());
-        let v = ranges::read_ranges_file(g, "gaps")?;
+        let (v, cut) = ranges::read_gaps_file(g)?;
+        if let Some(line) = cut {
+            warn!(file = %g.display(), line = %line.escape_debug(), "ignoring unterminated last line of gaps file (being written?); the next run picks it up");
+        }
         info!(file = %g.display(), gaps = v.len(), "read gaps");
         gaps.extend(v);
     }

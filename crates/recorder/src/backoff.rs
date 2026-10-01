@@ -11,6 +11,9 @@
 //!   min (cap 60 min).
 //! - HTTP 403 / refused upgrade: same ladder, starting at 15 min.
 //! - A session that stayed connected for >= 10 min resets the ladder.
+//! - Frames without blocks for `--block-idle-timeout-secs` (task 012 item 3):
+//!   always the transient ladder below, so a persistent stall reconnects at
+//!   most ~11 times an hour instead of every ~35 s.
 //! - Not specified by the task, added defensively: network/TLS errors, 5xx and
 //!   sessions closed within 30 s of connecting use a gentle transient ladder
 //!   5 s -> 10 s -> ... -> 5 min, so a flapping server does not turn into a
@@ -40,8 +43,11 @@ pub const RETRY_AFTER_MAX: Duration = Duration::from_secs(6 * 60 * 60);
 pub enum EndKind {
     /// Server closed the stream (close frame, EOF, reset) after the upgrade.
     ServerClosed,
-    /// No frame for `idle_timeout`; we dropped the connection.
+    /// No frame for `idle_timeout`; we closed the connection.
     Idle,
+    /// Frames (pings, confirmations) but no block (seq > 0) for
+    /// `--block-idle-timeout-secs`; we closed the connection (task 012 item 3).
+    BlockIdle,
     /// HTTP 429 on the upgrade request.
     RateLimited,
     /// HTTP 403 or any other refused upgrade (4xx, missing Upgrade header, redirect).
@@ -57,6 +63,7 @@ impl EndKind {
         match self {
             EndKind::ServerClosed => "server_closed",
             EndKind::Idle => "idle_timeout",
+            EndKind::BlockIdle => "block_idle",
             EndKind::RateLimited => "http_429",
             EndKind::Forbidden => "forbidden",
             EndKind::HttpError => "http_error",
@@ -147,7 +154,16 @@ impl Ladder {
                 let ms = 1000 + (rand01 * 4000.0) as u64;
                 (Duration::from_millis(ms), Rule::NormalJitter)
             }
-            EndKind::ServerClosed | EndKind::Idle | EndKind::HttpError | EndKind::NetError => {
+            // A stalled stream (frames without blocks) always takes the
+            // escalating transient ladder, also after a >= 30 s session: if
+            // the stall persists across reconnects, 1..5 s pauses would mean
+            // ~100 connects an hour. A session >= RESET_AFTER (blocks flowed
+            // for 10 min before the stall) still starts it from the bottom.
+            EndKind::ServerClosed
+            | EndKind::Idle
+            | EndKind::BlockIdle
+            | EndKind::HttpError
+            | EndKind::NetError => {
                 let base = doubled(TRANSIENT_BASE, self.transient, TRANSIENT_CAP);
                 self.transient = self.transient.saturating_add(1);
                 // +-20 % jitter, still capped.
@@ -164,7 +180,8 @@ impl Ladder {
 pub enum StartupWaitReason {
     /// A pause chosen by the previous process (e.g. `Retry-After` of a ban).
     PendingPause,
-    /// Less than `--min-connect-interval-secs` since the last `connected`.
+    /// Less than `--min-connect-interval-secs` since the end of the previous
+    /// session (task 012 item 1; before that: since the last `connected`).
     MinConnectInterval,
 }
 
@@ -177,22 +194,77 @@ impl StartupWaitReason {
     }
 }
 
-/// How long to wait before the first connection after a (re)start (task 008,
-/// item 2). Both limits come from connections.tsv of earlier runs:
-/// `pending_until_ns` is the end of the last chosen reconnect pause,
-/// `last_connected_ns` the time of the last successful upgrade. The longer
-/// remaining wait wins; None if neither is still running.
+/// Where the end of the previous session was taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndSource {
+    /// Last row of connections.tsv after the last `connected`.
+    LogRow,
+    /// mtime of the newest hourly data file (newer than every log row after
+    /// `connected`, or no such row: kill -9).
+    DataMtime,
+    /// Only the `connected` row itself (no later row, no newer data).
+    Connected,
+}
+
+impl SessionEndSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionEndSource::LogRow => "log_row",
+            SessionEndSource::DataMtime => "data_mtime",
+            SessionEndSource::Connected => "connected",
+        }
+    }
+}
+
+/// End of the previous session (task 012, item 1), unix ns.
+///
+/// - `connected_ns` / `last_row_ns`: the last `connected` row of
+///   connections.tsv and the newest row of any type after it
+///   ([`crate::net::LogSession`]). No `connected` -> None (no wait).
+/// - `data_mtime_ns`: mtime of the newest hourly data file, read before
+///   crash recovery.
+///
+/// The task's rule is "last row after `connected`, else (kill -9) the data
+/// mtime". The later of the two is used in both cases: since task 009 a
+/// `backlog` row follows `connected` about 1 s into every session, so after
+/// kill -9 in the middle of a long session the last row would be that early
+/// `backlog` row, while the data file was written until (at most
+/// `--frame-secs` before) the kill. Taking the later time never makes the
+/// wait shorter than the task's rule.
+pub fn session_end_ns(
+    connected_ns: Option<u128>,
+    last_row_ns: Option<u128>,
+    data_mtime_ns: Option<u128>,
+) -> Option<(u128, SessionEndSource)> {
+    // No `connected` in the log: no session of this out-dir to space from
+    // (fresh dir, copied data); as before task 012, no interval wait.
+    let connected = connected_ns?;
+    let log = match last_row_ns {
+        Some(r) => (r, SessionEndSource::LogRow),
+        None => (connected, SessionEndSource::Connected),
+    };
+    match data_mtime_ns {
+        Some(m) if m > log.0 => Some((m, SessionEndSource::DataMtime)),
+        _ => Some(log),
+    }
+}
+
+/// How long to wait before the first connection after a (re)start (task 008
+/// item 2, task 012 item 1). `pending_until_ns` is the end of the last chosen
+/// reconnect pause, `session_end_ns` the end of the previous session (see
+/// [`session_end_ns`]). Waits `max(pause remainder, min_interval - (now -
+/// end))`; None if neither is still running.
 pub fn startup_wait(
     now_ns: u128,
     pending_until_ns: Option<u128>,
-    last_connected_ns: Option<u128>,
+    session_end_ns: Option<u128>,
     min_interval: Duration,
 ) -> Option<(Duration, StartupWaitReason)> {
     let left = |until: u128| {
         Duration::from_nanos(until.saturating_sub(now_ns).min(u64::MAX as u128) as u64)
     };
     let pending = pending_until_ns.map(left).unwrap_or_default();
-    let interval = last_connected_ns
+    let interval = session_end_ns
         .map(|t| left(t.saturating_add(min_interval.as_nanos())))
         .unwrap_or_default();
     match (pending.is_zero(), interval.is_zero()) {
@@ -275,6 +347,130 @@ mod tests {
         assert_eq!(
             (w, r),
             (Duration::from_secs(3), StartupWaitReason::PendingPause)
+        );
+    }
+
+    /// Task 012 item 1, case 1: the previous session ended cleanly (rows
+    /// after `connected`). A 10-minute session that ended 30 s ago -> wait
+    /// ~90 s, although the last `connected` is long past (before 012: no wait).
+    #[test]
+    fn interval_counts_from_last_row_after_connected() {
+        let now = 1_790_800_000 * SEC;
+        let min = Duration::from_secs(120);
+        let log = crate::net::parse_last_session(&format!(
+            "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail\n\
+             x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://a requested=- mode=no_data\n\
+             x\t{}\tbacklog\tdone\t101\t-\t-\t0.500\t5\t-\trequested=-\n\
+             x\t{}\tshutdown\tSIGTERM\t-\t-\t-\t-\t-\t-\t-\n\
+             x\t{}\tclient_close\tserver_replied\t101\t-\t-\t600.000\t6000\t-\tsent close 1000\n",
+            now - 630 * SEC,
+            now - 629 * SEC,
+            now - 31 * SEC,
+            now - 30 * SEC
+        ))
+        .unwrap();
+        assert_eq!(log.connected_ns, now - 630 * SEC);
+        assert_eq!(log.last_row_ns, Some(now - 30 * SEC));
+        // Data mtime at the final commit, a few ms before the client_close row.
+        let (end, src) = session_end_ns(
+            Some(log.connected_ns),
+            log.last_row_ns,
+            Some(now - 30 * SEC - 5_000_000),
+        )
+        .unwrap();
+        assert_eq!((end, src), (now - 30 * SEC, SessionEndSource::LogRow));
+        let (w, r) = startup_wait(now, None, Some(end), min).unwrap();
+        assert_eq!(
+            (w, r),
+            (
+                Duration::from_secs(90),
+                StartupWaitReason::MinConnectInterval
+            )
+        );
+        // Ended more than the interval ago: no wait.
+        let (end, _) = session_end_ns(Some(now - 900 * SEC), Some(now - 121 * SEC), None).unwrap();
+        assert_eq!(startup_wait(now, None, Some(end), min), None);
+    }
+
+    /// Case 2: kill -9 -> nothing after `connected` in the log; the end is
+    /// the mtime of the newest hourly file. Also: only an early `backlog` row
+    /// after `connected` (kill -9 mid-session since task 009) -> data mtime.
+    #[test]
+    fn interval_after_kill9_counts_from_data_mtime() {
+        let now = 1_790_800_000 * SEC;
+        let min = Duration::from_secs(120);
+        let log = crate::net::parse_last_session(&format!(
+            "x\t{}\tdisconnected\tserver_closed\t101\t-\t2.000\t50.000\t9\t0\trule=jitter_1_5s\n\
+             x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://a\n",
+            now - 700 * SEC,
+            now - 600 * SEC
+        ))
+        .unwrap();
+        assert_eq!(log.last_row_ns, None);
+        let (end, src) = session_end_ns(
+            Some(log.connected_ns),
+            log.last_row_ns,
+            Some(now - 40 * SEC),
+        )
+        .unwrap();
+        assert_eq!((end, src), (now - 40 * SEC, SessionEndSource::DataMtime));
+        let (w, _) = startup_wait(now, None, Some(end), min).unwrap();
+        assert_eq!(w, Duration::from_secs(80));
+        // Early backlog row, data written much later.
+        let (end, src) = session_end_ns(
+            Some(now - 600 * SEC),
+            Some(now - 599 * SEC),
+            Some(now - 10 * SEC),
+        )
+        .unwrap();
+        assert_eq!((end, src), (now - 10 * SEC, SessionEndSource::DataMtime));
+        // No data at all (connected, killed before the first commit): the
+        // connected row is the best we have.
+        let (end, src) = session_end_ns(Some(now - 20 * SEC), None, None).unwrap();
+        assert_eq!((end, src), (now - 20 * SEC, SessionEndSource::Connected));
+        // No `connected` in the log (fresh dir, copied data): no end, even
+        // with recent data.
+        assert_eq!(session_end_ns(None, None, Some(now - 5 * SEC)), None);
+        assert_eq!(session_end_ns(None, None, None), None);
+    }
+
+    /// Case 3: a pending pause and the interval from the end of the session
+    /// -> the longer remainder wins, both ways round.
+    #[test]
+    fn pending_pause_and_end_interval_take_the_longer() {
+        let now = 1_790_800_000 * SEC;
+        let min = Duration::from_secs(120);
+        // disconnected 403 with a 900 s pause 100 s ago, then SIGTERM 99 s ago.
+        let log = crate::net::parse_last_session(&format!(
+            "x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://a\n\
+             x\t{}\tdisconnected\tforbidden\t403\t-\t900.000\t0.000\t0\t1\tupgrade\n\
+             x\t{}\tshutdown\tSIGTERM\t-\t-\t-\t-\t-\t-\t-\n",
+            now - 400 * SEC,
+            now - 100 * SEC,
+            now - 99 * SEC
+        ))
+        .unwrap();
+        let pause_row = format!(
+            "x\t{}\tdisconnected\tforbidden\t403\t-\t900.000\t0.000\t0\t1\tupgrade",
+            now - 100 * SEC
+        );
+        let pending = crate::net::parse_pause_row(&pause_row).unwrap();
+        let (end, _) = session_end_ns(Some(log.connected_ns), log.last_row_ns, None).unwrap();
+        assert_eq!(end, now - 99 * SEC);
+        let (w, r) = startup_wait(now, Some(pending.not_before_ns), Some(end), min).unwrap();
+        assert_eq!(
+            (w, r),
+            (Duration::from_secs(800), StartupWaitReason::PendingPause)
+        );
+        // Short pause (3 s, from 1 s ago) vs. a session that ended 1 s ago:
+        // the interval (119 s) wins.
+        let (w, r) = startup_wait(now, Some(now + 2 * SEC), Some(now - SEC), min).unwrap();
+        assert_eq!(
+            (w, r),
+            (
+                Duration::from_secs(119),
+                StartupWaitReason::MinConnectInterval
+            )
         );
     }
 
@@ -394,6 +590,30 @@ mod tests {
         let (hi, _) = l.next_pause(EndKind::HttpError, None, S0, 0.999);
         assert_eq!(lo, Duration::from_secs(4));
         assert!(hi < Duration::from_secs(6));
+    }
+
+    /// Task 012 item 3: block_idle escalates even after 30 s sessions; a
+    /// healthy normal close clears it; a 10-minute session resets it.
+    #[test]
+    fn block_idle_uses_transient_ladder() {
+        let mut l = Ladder::default();
+        let s = Duration::from_secs(31);
+        let got: Vec<(u64, Rule)> = (0..8)
+            .map(|_| {
+                let (p, r) = l.next_pause(EndKind::BlockIdle, None, s, 0.5);
+                (p.as_secs(), r)
+            })
+            .collect();
+        let secs: Vec<u64> = got.iter().map(|g| g.0).collect();
+        assert_eq!(secs, vec![5, 10, 20, 40, 80, 160, 300, 300]);
+        assert!(got.iter().all(|g| g.1 == Rule::Transient));
+        assert_eq!(EndKind::BlockIdle.as_str(), "block_idle");
+        // Blocks flowed for 10 min before the stall: start from the bottom.
+        let (p, _) = l.next_pause(EndKind::BlockIdle, None, minutes(10), 0.5);
+        assert_eq!(p.as_secs(), 5);
+        // Healthy normal close clears the ladder.
+        l.next_pause(EndKind::ServerClosed, None, minutes(1), 0.5);
+        assert_eq!(l.transient, 0);
     }
 
     #[test]

@@ -13,14 +13,14 @@
 |---|---|---|
 | `bootstrap.sh` | запускается из `/opt/hoodchain-mev/src` | идемпотентная подготовка чистой Ubuntu 24.04: пакеты, пользователь `hood`, каталоги, chrony, ufw, лимиты journald, скрипты, юниты. Повторный прогон печатает `done: 0 change(s)` |
 | `build-on-server.sh` | там же | сборка `recorder` и `enricher` на сервере от пользователя `hoodbuild` (`cargo build --release --locked`), установка в `/opt/hoodchain-mev/bin`, прошлые бинарники остаются как `*.prev`. Recorder не перезапускает |
-| `recorder.service` | `/etc/systemd/system/` | сам recorder (задача 008: `RestartSec=120`, Close при остановке; задача 009: досылка по `Arbitrum-Requested-Sequence-Number`, Close и при idle-таймауте — флагов в юните не требует) |
+| `recorder.service` | `/etc/systemd/system/` | сам recorder (задача 008: `RestartSec=120`, Close при остановке; задача 009: досылка по `Arbitrum-Requested-Sequence-Number`, Close и при idle-таймауте; задача 012: Close при ошибке записи, `--block-idle-timeout-secs 30`, пауза 120 с от конца прошлой сессии — флагов в юните не требует) |
 | `healthcheck.sh`, `healthcheck.service`, `healthcheck.timer` | `/opt/hoodchain-mev/deploy/`, юниты | проверки раз в 5 мин, см. «Мониторинг» |
 | `notify.sh`, `notify-failure@.service` | то же | отправка уведомлений: journald всегда, Telegram — если задан в `/etc/hoodchain/notify.env`. `notify-failure@` вызывается через `OnFailure=` у служебных юнитов |
 | `feed-audit-daily.sh`, `feed-audit.service`, `feed-audit.timer` | то же; скрипт аудита копируется в `/opt/hoodchain-mev/deploy/feed_audit.py` | в 00:10 UTC проверка прошлых суток через `feed-audit`, без RPC (`--rpc-sample 0`), с `--frame-secs` = `AUDIT_FRAME_SECS` (60, как у recorder). Отчёт кладётся в `/srv/hood/reports/feed-audit-YYYYMMDD.txt` |
 | `backup.sh`, `backup.service`, `backup.timer` | то же | бэкап сырья через rclone. **Выключен**, пока хранилище не выбрано |
 | `enricher-gaps.service`, `enricher-gaps.timer` | юниты | дозаливка дыр через `enricher --gaps` с обязательным `--max-calls`. **Выключен**, пока не выбран провайдер RPC (0002) |
 | `journald-hood.conf` | `/etc/systemd/journald.conf.d/hood.conf` | журнал хранится на диске, до 2 ГБ и до 90 дней |
-| `needrestart-hood.conf` | `/etc/needrestart/conf.d/hood.conf` | apt и unattended-upgrades не перезапускают recorder сами: каждый рестарт — дыра от 2 мин |
+| `needrestart-hood.conf` | `/etc/needrestart/conf.d/hood.conf` | apt и unattended-upgrades не перезапускают recorder сами: каждый рестарт — простой ~2 мин (пауза 120 с после остановки), из них бэклог фида закрывает ~60–70 с, остальное — дыра |
 | `etc/*.example` | `/etc/hoodchain/*.example` | шаблоны конфигов; настоящие файлы создаются руками |
 | `test/` | — | офлайн-тесты набора и образ для локальной проверки (см. последний раздел) |
 
@@ -108,7 +108,7 @@ srv# journalctl -u recorder -f
 | 1–2 мин | `cat /srv/hood/data/feed/last_seq.txt` дважды с паузой 60 с | число растёт примерно на 600 в минуту (~9.93 блока/с) |
 | 2 мин | `tail -n 3 /srv/hood/data/feed/connections.tsv` | строка `connected` с кодом 101 и `detail` вида `wss://… requested=- mode=no_data` (папка была пустая, заголовок досылки не отправлялся), за ней одна строка `backlog done`; ни одной `disconnected`. После любого следующего старта — `requested=<last_seq+1> mode=header` |
 | 2 мин | `ls -la /srv/hood/data/feed/$(date -u +%Y/%m/%d)/` | файл `feed-YYYYMMDD-HH.tsv.zst` растёт примерно на 1.5 МБ/мин (90–97 МБ/ч по 001/002) |
-| 5 мин | `systemctl start healthcheck; journalctl -u healthcheck -n 3 -o cat` | строка `healthcheck: unit=active feed_age_s=<60 ... unit=ok ban=ok feed=ok disk=ok` |
+| 5 мин | `systemctl start healthcheck; journalctl -u healthcheck -n 3 -o cat` | строка `healthcheck: unit=active feed_age_s=<60 feed_src=last_seq.txt ... unit=ok ban=ok feed=ok disk=ok`. В первую минуту, пока `last_seq.txt` ещё нет, — `feed_src=hour_file` |
 | 5 мин | Telegram | при включении таймеров (до старта recorder) healthcheck прислал «recorder не работает» и «фид молчит»; через ≤ 5 мин после старта — «восстановлено» по обоим. Это и есть проверка канала уведомлений |
 | 10 мин | `zstd -t` по файлу прошлого часа (если час сменился) | OK |
 | 15 мин | `cat /srv/hood/data/feed/gaps.tsv` | пусто (дыр нет) |
@@ -123,7 +123,7 @@ srv# journalctl -u recorder -f
 - [ ] `systemctl is-enabled backup.timer enricher-gaps.timer` → `disabled` (пока нет решений по хранилищу и провайдеру)
 - [ ] тестовое уведомление дошло до Telegram (п. 4)
 - [ ] `ufw status`: открыт только ssh; вход по ssh из нового окна работает
-- [ ] `chronyc tracking`: `Leap status : Normal`, смещение меньше 0.5 с. Это нужно не только для `recv_unix_ns`: граница бэклога в строке `backlog` (задача 009) считается по правилу «отставание `header.timestamp` kind 3 от времени приёма < 2 с», и при ошибке часов больше 1–2 с статистика бэклога съезжает (данные и `gaps.tsv` от этого не зависят)
+- [ ] `chronyc tracking`: `Leap status : Normal`, `System time` — смещение меньше 0.5 с (задачи 009, 012). Это нужно не только для `recv_unix_ns`: граница бэклога в строке `backlog` (задача 009) считается по правилу «отставание `header.timestamp` kind 3 от времени приёма < 2 с», и при ошибке часов больше 1–2 с статистика бэклога съезжает (данные и `gaps.tsv` от этого не зависят)
 - [ ] `df -h /srv/hood`: свободно больше 80%
 - [ ] `/etc/hoodchain/*.env` — `root:hood 0640`, в `/opt/hoodchain-mev/src` нет `.env`
 - [ ] IP сервера записан **только** у Михаила, не в репозитории; на Mac, где идут тесты фида, этот IP не используется как прокси
@@ -136,10 +136,11 @@ srv# journalctl -u recorder -f
 | Ключ | Условие | Порог (`/etc/hoodchain/healthcheck.env`) |
 |---|---|---|
 | `unit` | `systemctl is-active recorder` ≠ `active` (в том числе пауза `RestartSec` после падения) | — |
-| `feed` | самый свежий mtime из `last_seq.txt` и файлов текущего и прошлого часа старше порога. Пока активен `ban`, отдельно не шлётся | `HC_FEED_MAX_AGE_S=300` |
-| `ban` | последняя строка `connected`/`disconnected`/`startup_wait` в `connections.tsv` — отказ 4xx (403, 429) или `startup_wait pending_pause` от 600 с. Строки `backlog`, `client_close`, `shutdown`, `torn_repair`, `gap_reconciled` не учитываются; `startup_wait min_connect_interval` и `disconnected idle_timeout` баном не считаются | `HC_BAN_MIN_PAUSE_S=600` |
-| `reconnects` | больше N строк `connected` за последний час (риск бана) | `HC_MAX_CONNECTS_PER_HOUR=6` |
+| `feed` | mtime `last_seq.txt` старше порога, то есть новые блоки не доходят до диска (recorder переписывает файл только при росте seq, на каждом закрытии фрейма, не реже раза в 60 с). Файлы текущего и прошлого часа берутся, **только если `last_seq.txt` ещё нет** (первые минуты на пустой папке): ping без блоков тоже пишутся в часовой файл, поэтому его свежесть ничего не говорит о блоках (задача 012, З1 из отзыва 011). Если файл часа свежий, а `last_seq.txt` старый, в тексте алерта будет подсказка «только ping?». Источник виден в итоговой строке: `feed_src=last_seq.txt` / `hour_file`. Пока активен `ban`, отдельно не шлётся | `HC_FEED_MAX_AGE_S=300` |
+| `ban` | последняя строка `connected`/`disconnected`/`startup_wait` в `connections.tsv` — отказ 4xx (403, 429) или `startup_wait pending_pause` от 600 с. Строки `backlog`, `client_close`, `shutdown`, `writer_error`, `torn_repair`, `gap_reconciled` не учитываются; `startup_wait min_connect_interval`, `disconnected idle_timeout` и `disconnected block_idle` баном не считаются | `HC_BAN_MIN_PAUSE_S=600` |
+| `reconnects` | больше N строк `connected` за последний час (риск бана). Ловит и цикл переподключений по `block_idle`/`idle_timeout` | `HC_MAX_CONNECTS_PER_HOUR=6` |
 | `disk` | заполнение файловой системы `/srv/hood/data` | `HC_DISK_MAX_PCT=80` |
+| `writer` | в `connections.tsv` есть строка `shutdown writer_error` или `writer_error` (ошибка записи: диск, fsync; recorder вышел с кодом 2) моложе окна. «Восстановлено» — когда таких строк в окне не осталось, то есть через час без новых ошибок | `HC_WRITER_ERROR_WINDOW_S=3600` |
 | `backfill` | в `gaps.tsv` есть дыры старше N часов, не покрытые `blocks/filled.tsv` (отставание дозаливки) | `HC_BACKFILL_MAX_LAG_H=24` |
 | `clock` | chrony не синхронизирован или смещение больше порога | `HC_CLOCK_MAX_OFFSET_S=0.5` |
 | `backup` | `last_ok` бэкапа старше N часов; выключено, пока бэкап не включён | `HC_BACKUP_MAX_AGE_H=0` → поставить 3 |
@@ -147,10 +148,10 @@ srv# journalctl -u recorder -f
 
 Кроме того:
 - `feed-audit` в 00:10 UTC: при FAIL — ALERT, при PASS — короткая сводка INFO. Это ежедневный сигнал «жив», отключается `AUDIT_NOTIFY_PASS=0` в drop-in юнита;
-- любой служебный юнит (healthcheck, feed-audit, backup, enricher-gaps), завершившийся с ошибкой, присылает «юнит … завершился с ошибкой» через `notify-failure@`.
+- любой служебный юнит (healthcheck, feed-audit, backup, enricher-gaps), завершившийся с ошибкой, присылает «юнит … завершился с ошибкой» через `notify-failure@`. Не ошибка: код 3 у feed-audit (FAIL уже отправлен) и код 75 у enricher-gaps (исчерпан `--max-calls`, `SuccessExitStatus=75`); отставание дозаливки ловит `backfill`.
 
 Чего этот мониторинг **не** ловит:
-- соединение живо, но идут только ping без блоков. `feed` берёт самый свежий mtime из `last_seq.txt` и часовых файлов, а ping тоже пишутся в часовой файл (фрейм закрывается раз в 60 с), и idle-таймаут recorder ping тоже сбрасывают. Такое залипание видно только по `last_seq.txt` (`cat` дважды с паузой) и по дыре после переподключения. Открытый вопрос к infra-ops/indexer-engineer, см. отзыв `docs/reviews/011-deploy-kit-indexer-engineer.md`;
+- залипание «соединение живо, но только ping» (З1 из отзыва 011) теперь закрыто с двух сторон (задача 012): recorder сам переподключается через 30 с без блоков (`block_idle`), а `feed` смотрит на `last_seq.txt`. Остаётся слепое пятно короче порога: залипания до 5 мин алерта не дают, они видны как `block_idle` в `connections.tsv` и как дыра, если бэклога не хватило;
 - сервер целиком упал или пропала сеть. Тогда некому слать уведомления. Для этого нужен внешний «пульс» (dead-man switch), например check на healthchecks.io: `HC_HEARTBEAT_URL` в `healthcheck.env`, пинг на каждом прогоне. Это сторонний аккаунт, решение за Михаилом. Без него узнать о падении сервера можно только по отсутствию ежедневной сводки feed-audit.
 
 Ручной просмотр:
@@ -171,22 +172,13 @@ srv# systemctl restart recorder                              # SIGTERM → Close
 srv# journalctl -u recorder -f
 ```
 
-Что ожидаемо после `restart` (проверено по коду recorder 2026-10-01, вживую на сервере не проверялось):
+Что ожидаемо после `restart` (по коду recorder и задаче 012; вживую на сервере не проверялось):
 - остановка занимает 0–2.5 с: Close 1000, ожидание ответного Close до 2 с, закрытие TLS до 0.5 с, затем дописать очередь, закрыть фрейм, fsync, `last_seq.txt`. В `connections.tsv` — `shutdown`, затем `client_close server_replied`. `TimeoutStopSec=30` с большим запасом;
-- `systemctl restart` не ждёт `RestartSec` (он только для падений). Пауза при старте — это `--min-connect-interval-secs 120`, и она **считается от последнего `connected`, а не от конца сессии**. Поэтому:
-  - если recorder проработал больше 120 с (обычный случай), новый процесс подключается **сразу**, простой ~1–3 с;
-  - если последний `connected` был меньше 120 с назад, новый процесс ждёт остаток (`startup_wait min_connect_interval` в журнале и в `connections.tsv`). Это защита от бана, не ошибка. Не запускайте `restart` повторно;
-- новый процесс просит у фида `last_seq + 1` (заголовок `Arbitrum-Requested-Sequence-Number`, задача 009; в `connections.tsv` — `connected … requested=<N> mode=header`, затем строка `backlog`). Фид досылает бэклог примерно за последние 60–70 с (два замера 005 и один 009, глубина может меняться). Значит:
-  - простой короче бэклога (немедленный рестарт) — дыры обычно нет, строки в `gaps.tsv` не появится, `backlog … first_minus_requested=0`;
-  - простой длиннее бэклога — одна строка в `gaps.tsv`, короче простоя на размер бэклога (в 009: простой 121 с → дыра 578 блоков вместо ~1200). healthcheck пришлёт INFO «новые дыры в фиде».
+- `systemctl restart` не ждёт `RestartSec` (он только для падений), но новый процесс **сам ждёт ~120 с после остановки**: `--min-connect-interval-secs 120` с задачи 012 считается **от конца прошлой сессии** (позднее из двух: последняя строка `connections.tsv` любого типа после последнего `connected` — `shutdown`, `client_close`, `disconnected`…, и mtime последнего часового файла данных; второе важно после `kill -9`, когда строк конца сессии нет). В журнале и в `connections.tsv` — `startup_wait min_connect_interval` с остатком паузы. Это защита от бана (решение Cowork по вопросу 1 задачи 009), не ошибка. **Не запускайте `restart` повторно**: каждый новый старт снова отсчитает 120 с от конца предыдущего;
+- отдельный `stop && sleep 120 && start` больше не нужен: `restart` делает то же самое сам. Пока процесс ждёт, юнит `active`, healthcheck не шлёт «recorder не работает»; `feed` (порог 300 с) за ~120 с паузы плюс ≤ 60 с до первого фрейма тоже не срабатывает;
+- после паузы новый процесс просит у фида `last_seq + 1` (заголовок `Arbitrum-Requested-Sequence-Number`, задача 009; в `connections.tsv` — `connected … requested=<N> mode=header`, затем строка `backlog`). Фид досылает бэклог примерно за последние 60–70 с (два замера 005 и один 009, глубина может меняться). Простой ~120 с длиннее бэклога, поэтому **каждый рестарт даёт одну строку в `gaps.tsv` на ~50–60 с** (~500–600 блоков; в 009: простой 121 с → дыра 578 блоков вместо ~1200). healthcheck пришлёт INFO «новые дыры в фиде», дозаливка — через enricher-gaps.
 
-Открытый вопрос (009, вопрос 1, решает Михаил/Cowork): безопасен ли немедленный реконнект после Close 1000. Бан 2026-09-30 был после реконнекта через 11 с после `kill -9` **без** Close; реконнект через 120 с после Close проверен один раз (009). Пока ответа нет, осторожный вариант обновления — выдержать паузу руками:
-
-```bash
-srv# systemctl stop recorder && sleep 120 && systemctl start recorder   # дыра ~50–60 с вместо ~0, зато интервал между подключениями ≥ 120 с
-```
-
-Во время `sleep` healthcheck может прислать «recorder не работает» и потом «восстановлено» — это ожидаемо.
+Обновляйте бинарник пачкой изменений, а не по одному: цена каждого рестарта — около минуты дыры.
 
 Откат бинарника. `cp` поверх работающего бинарника падает с `Text file busy`, поэтому только через временный файл и `mv`:
 
@@ -205,7 +197,7 @@ ExecStart=/opt/hoodchain-mev/bin/recorder --out-dir /srv/hood/data/feed --no-req
 
 затем `systemctl restart recorder`. В `connections.tsv` будет `mode=disabled`, поток начнётся с вершины, как до 009, и каждый рестарт снова даст дыру на весь простой.
 
-Обновление ОС: unattended-upgrades ставит обновления безопасности, но recorder не перезапускается (`needrestart-hood.conf`). Перезагрузку сервера (`reboot`) делайте вручную, когда удобно. После неё recorder стартует сам; пауза `min_connect_interval` будет, только если последний `connected` был меньше 120 с назад (после долгой сессии её нет). Простой перезагрузки длиннее бэклога (~60–70 с) даст строку в `gaps.tsv`.
+Обновление ОС: unattended-upgrades ставит обновления безопасности, но recorder не перезапускается (`needrestart-hood.conf`). Перезагрузку сервера (`reboot`) делайте вручную, когда удобно. После неё recorder стартует сам и выждет остаток 120 с от конца прошлой сессии (последняя строка `connections.tsv`, обычно `shutdown` при остановке перед перезагрузкой). Если перезагрузка заняла больше 120 с, пауза не нужна и подключение сразу. Простой длиннее бэклога (~60–70 с) даст строку в `gaps.tsv`.
 
 ## Бэкап сырья (выключен до решения Михаила)
 
@@ -234,8 +226,8 @@ srv# echo 'HC_BACKUP_MAX_AGE_H=3' >> /etc/hoodchain/healthcheck.env
 ## Дозаливка дыр (выключена до выбора провайдера, 0002)
 
 `enricher-gaps.service` — oneshot `enricher --gaps /srv/hood/data/feed/gaps.tsv --out-dir /srv/hood/data/blocks --max-calls 4000 --rps 2 --batch 10 --concurrency 1`, таймер раз в час.
-- `--max-calls 4000` — жёсткий бюджет вызовов на прогон, повторы включены, 2 вызова на блок. Это 2000 блоков за прогон и не больше 96 000 вызовов в сутки. При исчерпании прогон завершается с ошибкой (придёт «юнит … завершился с ошибкой»). Прогресс сохраняется в `filled.tsv`, следующий прогон продолжит. Отдельного кода выхода у «бюджет исчерпан» пока нет (код 1, как у любой ошибки), поэтому при большой дозаливке «завершился с ошибкой» будет приходить каждый час; предложение — в отзыве `docs/reviews/011-deploy-kit-indexer-engineer.md`.
-- Если recorder дописывает строку `gaps.tsv` в момент чтения, enricher может увидеть строку без второго столбца и завершить прогон с ошибкой (`gaps line N: missing column` / `not a number`), ничего не скачав. Неверный диапазон из недописанной строки получиться практически не может (см. отзыв). Следующий прогон пройдёт; если ошибка повторяется — строка испорчена, смотреть `gaps.tsv` руками.
+- `--max-calls 4000` — жёсткий бюджет вызовов на прогон, повторы включены, 2 вызова на блок. Это 2000 блоков за прогон и не больше 96 000 вызовов в сутки. При исчерпании enricher выходит с кодом **75** (задача 012). В юните `SuccessExitStatus=75`: это не ошибка, уведомления «юнит … завершился с ошибкой» нет, и при большой дозаливке оно не приходит каждый час. Прогресс сохраняется в `filled.tsv`, следующий прогон продолжит. Настоящие ошибки (код 1: RPC, разбор, нет `enricher.env`) по-прежнему уведомляют через `notify-failure@`. Если дозаливка не успевает, через 24 ч придёт `backfill` от healthcheck. Отличить «бюджет исчерпан» от «всё залито» можно только по журналу enricher (`journalctl -u enricher-gaps -n 50`, WARN вида `<что>: call budget exhausted: N calls sent, M more would exceed --max-calls 4000; stopping with exit code 75, the next run continues`). Остатка работы в этом сообщении нет: его показывает строка `gaps plan` (`todo_blocks`) следующего прогона или `enricher --gaps … --dry-run` (план без вызовов RPC). По systemd не отличить: systemd 255 после успешного oneshot показывает `ExecMainStatus=0` и для кода 75 (проверено в контейнере 2026-10-01).
+- Если recorder дописывает строку `gaps.tsv` в момент чтения, последняя строка может быть без `\n`. С задачи 012 enricher такую строку пропускает с WARN в журнале и заливает остальные; следующий прогон возьмёт её целиком. Ошибка в строке, которая заканчивается `\n`, по-прежнему останавливает прогон (код 1, уведомление) — тогда смотреть `gaps.tsv` руками.
 - Без `/etc/hoodchain/enricher.env` юнит падает намеренно. Иначе enricher молча взял бы публичный RPC. Плейсхолдер `YOUR-PROVIDER` тоже отвергается (проверено в контейнере).
 - Включение: создать `enricher.env` (`RPC_URL=…`, `root:hood 0640`), при необходимости поправить бюджет через `systemctl edit enricher-gaps.service`, затем `systemctl enable --now enricher-gaps.timer`. Цену провайдера при выбранном бюджете — в `docs/costs.md`.
 
@@ -245,8 +237,8 @@ srv# echo 'HC_BACKUP_MAX_AGE_H=3' >> /etc/hoodchain/healthcheck.env
 
 2026-09-30 переподключение через 11 с после `kill -9` получило бан IP: `403 Forbidden` с `Retry-After: 3600`, то есть час дыры. Перед этим 429 не было. Причина не установлена; гипотезы — частота подключений или обрыв без close-фрейма. Поэтому (задача 008):
 - systemd перезапускает упавший recorder не раньше чем через 120 с (`RestartSec=120`);
-- recorder и сам не подключается раньше чем через 120 с после последнего успешного подключения предыдущего запуска (`--min-connect-interval-secs 120`, время берётся из события `connected` в `connections.tsv`). Это действует и при ручном `systemctl restart`, который `RestartSec` не ждёт;
-- когда соединение заканчивает сам recorder, он отправляет WebSocket Close 1000 и ждёт ответный Close до 2 с (кадры, пришедшие за это время, пишутся в сырьё), а уже потом закрывает TLS/TCP. С задачи 009 это не только остановка (`"recorder shutdown"`), но и idle-таймаут (`"idle timeout"`, нет кадров 10 с) и пропажа writer (`"recorder writer gone"`). Итог пишется в `connections.tsv` событием `client_close` (`server_replied`, `no_reply`, `stream_ended`, `send_failed`), перед `disconnected`.
+- recorder и сам не подключается раньше чем через 120 с после **конца** сессии предыдущего запуска (`--min-connect-interval-secs 120`, задача 012). Конец — позднее из двух: время последней строки `connections.tsv` любого типа после последнего `connected` и mtime последнего часового файла данных. Второе нужно после kill -9 или пропажи питания: строк конца сессии тогда нет, а последняя строка — ранняя `backlog` в начале сессии. Ждёт дольшее из двух: остаток паузы из `disconnected` и `120 − (сейчас − конец)`. Если в `connections.tsv` нет ни одного `connected` (новая папка, скопированные данные без журнала), интервал не ждётся, как до 012. Это действует и при ручном `systemctl restart`, который `RestartSec` не ждёт. После падения сначала проходит `RestartSec=120`, к этому моменту интервал обычно уже выдержан;
+- когда соединение заканчивает сам recorder, он отправляет WebSocket Close 1000 и ждёт ответный Close до 2 с (кадры, пришедшие за это время, пишутся в сырьё), а уже потом закрывает TLS/TCP. С задачи 009 это не только остановка (`"recorder shutdown"`), но и idle-таймаут (`"idle timeout"`, нет кадров 10 с) и пропажа writer (`"recorder writer gone"`). С задачи 012 ещё два случая: нет блоков (`block_idle`, см. ниже) и ошибка writer'а (диск, fsync) — перед выходом с кодом 2 recorder посылает Close 1000 и ждёт ответ до 2 с, а не обрывает соединение, как при kill -9. Итог пишется в `connections.tsv` событием `client_close` (`server_replied`, `no_reply`, `stream_ended`, `send_failed`). При idle-таймауте и `block_idle` за ним идёт `disconnected`; при остановке и при ошибке writer'а `disconnected` нет: сначала строка `shutdown` (`SIGTERM`/`SIGINT` или `writer_error`), затем `client_close`, затем выход (0 или 2).
 
 ### Досылка после переподключения (задача 009)
 
@@ -263,7 +255,7 @@ srv# echo 'HC_BACKUP_MAX_AGE_H=3' >> /etc/hoodchain/healthcheck.env
 | `YYYY/MM/DD/feed-YYYYMMDD-HH.tsv.zst` | Сырьё: `recv_unix_ns \t seq_first \t seq_last \t <JSON>`. Внутри часового файла много zstd-фреймов: фрейм закрывается не реже раза в 60 с (`--frame-secs`), при ротации часа и при остановке. Читать `zstd -dc` или ридером, который понимает несколько фреймов. |
 | `gaps.tsv` | `from \t to \t recv_ns` — пропущенные L2-блоки для дозаливки через RPC (enricher). Пишется только после fsync данных. |
 | `last_seq.txt` | Последний seq, который уже на диске (fsync). Заменяется атомарно. |
-| `connections.tsv` | События `connected`, `backlog`, `client_close`, `disconnected`, `startup_wait`, `shutdown`, `torn_repair`, `gap_reconciled`: причина, HTTP-код, `Retry-After`, выбранная пауза, число страйков, `detail`. Первая строка — заголовок, 11 столбцов (`.claude/skills/hoodchain-mev/references/data-model.md`). healthcheck читает столбцы 1–7 по позиции, поэтому новые поля добавляются только в `detail` (последний столбец). |
+| `connections.tsv` | События `connected`, `backlog`, `client_close`, `disconnected`, `startup_wait`, `shutdown`, `writer_error` (с 012), `torn_repair`, `gap_reconciled`: причина, HTTP-код, `Retry-After`, выбранная пауза, число страйков, `detail`. Первая строка — заголовок, 11 столбцов (`.claude/skills/hoodchain-mev/references/data-model.md`). healthcheck читает столбцы 1–7 по позиции, поэтому новые поля добавляются только в `detail` (последний столбец). |
 | `_torn/` | Оборванные хвосты zstd, отрезанные при старте после аварийного завершения. Хранятся для разбора, recorder их не удаляет. |
 
 Строки с `seq_first = seq_last = 0` (конверты без `messages`, ping и прочие кадры в обёртке `recorderFrame`) — норма, отбрасывать их — задача разбора (`.claude/skills/hoodchain-mev/references/data-model.md`).
@@ -272,9 +264,11 @@ srv# echo 'HC_BACKUP_MAX_AGE_H=3' >> /etc/hoodchain/healthcheck.env
 
 - **`systemctl stop` / SIGTERM.** Close 1000 → ожидание ответа до 2 с → закрытие TLS до 0.5 с → дописать очередь, закрыть фрейм, fsync, `last_seq.txt` → выход 0. Если SIGTERM пришёл во время паузы, `startup_wait` или установки соединения — выход сразу. `TimeoutStopSec=30`, обычно хватает 0–2.5 с (внутренний предел сети — 5 с).
 - **Idle-таймаут** (нет кадров 10 с): Close 1000 `"idle timeout"` → `client_close` → `disconnected idle_timeout` → пауза 1–5 с → переподключение с `requested=<last_seq+1>` из памяти. Короткий обрыв закрывается бэклогом без дыры.
+- **Нет блоков при живом соединении** (задача 012, флаг `--block-idle-timeout-secs`, по умолчанию 30): ping и прочие кадры идут, а сообщений с seq > 0 нет дольше порога. Recorder отправляет Close 1000 `"block idle timeout"`, пишет `client_close` и `disconnected` с причиной `block_idle`, затем переподключается с досылкой (`requested=<last_seq+1>`). Пауза — не 1–5 с, а «осторожная» лестница: 5 → 10 → 20 → 40 → 80 → 160 → 300 с (±20 % джиттера, потолок 5 мин); сбрасывается после сессии от 10 мин или обычного закрытия здоровой сессии. Первое залипание: 30 с + 5 с паузы — меньше бэклога (~60–70 с), дыры обычно нет. Устойчивое залипание даёт до ~11 подключений в час, это поймает `reconnects` (порог 6) в healthcheck, а `feed` — по `last_seq.txt`. `--block-idle-timeout-secs 0` выключает проверку. Порог меняется drop-in'ом юнита (`ExecStart=` с `--block-idle-timeout-secs N`). Сильно уменьшать не стоит: распределение естественных пауз между блоками на этом фиде не измерялось, а лишние переподключения — риск бана.
+- **Ошибка записи** (диск полон, fsync): строка `shutdown writer_error` (текст ошибки в `detail`) → Close 1000 `"recorder writer error"` (≤ 2 с) → `client_close` → выход с кодом 2, строки `disconnected` нет. Если writer упал на финальном commit уже после SIGTERM, пишется `writer_error final_commit`, код тоже 2. systemd перезапустит через `RestartSec=120`. healthcheck пришлёт `writer` (по строке в `connections.tsv`), `unit`, если прогон попал в эти 120 с, при полном диске — `disk`, а если падения повторяются — `feed` и `reconnects` (~1 подключение в 2 мин). Перезапуск без места на диске снова упадёт: сначала освободить место (сырьё не удалять, пока оно не в бэкапе).
 - **kill -9, падение, пропало питание.** Теряется только открытый фрейм, то есть не больше последних 60 с. При следующем старте оборванный хвост уходит в `_torn/`. Простой попадает в `gaps.tsv` одной строкой, когда придёт первый новый блок.
 - **Паузы переподключения.** Обычное закрытие: 1–5 с. 429: `Retry-After`, а без него 5 → 10 → 20 → 40 → 60 мин. 403 или отказ апгрейда: 15 → 30 → 60 мин, но не меньше `Retry-After`. Сетевые ошибки и 5xx: от 5 с до 5 мин. Сессия дольше 10 мин сбрасывает лестницу.
-- **Пауза переживает перезапуск.** При старте recorder ждёт дольшее из двух: остаток паузы из последней строки `disconnected` и остаток 120 с с последнего `connected` (не с конца сессии: после долгой сессии рестарт подключается сразу). Обойти можно `--ignore-pending-pause`, но только если точно известно, что бан снят.
+- **Пауза переживает перезапуск.** При старте recorder ждёт дольшее из двух: остаток паузы из последней строки `disconnected` и остаток 120 с от конца прошлой сессии (задача 012, см. «Почему `RestartSec=120`»; раньше считалось от `connected`, и рестарт после долгой сессии подключался сразу). Обойти можно `--ignore-pending-pause`, но только если точно известно, что бан снят.
 - **Сверка дыр при старте.** Разрыв в двух последних часовых файлах, которого нет в `gaps.tsv`, дописывается туда, с событием `gap_reconciled`.
 
 ## Проверка набора локально (без сервера)

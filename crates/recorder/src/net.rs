@@ -376,9 +376,29 @@ fn route_frame(frame: &Frame, recv_ns: u128) -> (Line, Option<String>) {
     }
 }
 
-/// Resolves once `stop` is true (or its sender is gone).
-pub async fn stopped(stop: &mut watch::Receiver<bool>) {
-    let _ = stop.wait_for(|s| *s).await;
+/// Stop signal for the network loop: `Some(close reason)` once the process
+/// is shutting down (signal: `"recorder shutdown"`, fatal writer error:
+/// `"recorder writer error"`, task 012 item 2).
+pub type Stop = watch::Receiver<Option<&'static str>>;
+
+/// Close reason when the stop signal carries none (sender gone).
+pub const SHUTDOWN_REASON: &str = "recorder shutdown";
+
+/// Outcome of one wait in the frame loop.
+enum Next<F> {
+    Stop,
+    BlockIdle,
+    Frame(F),
+}
+
+/// Resolves once a stop reason is set (or its sender is gone).
+pub async fn stopped(stop: &mut Stop) {
+    let _ = stop.wait_for(|s| s.is_some()).await;
+}
+
+/// Close reason of the stop signal, if stopping.
+pub fn stop_reason(stop: &Stop) -> Option<&'static str> {
+    *stop.borrow()
 }
 
 /// Where received frames go: the writer channel, plus the bookkeeping the
@@ -503,19 +523,24 @@ fn flush_backlog(sink: &mut Sink<'_>, on_backlog: &mut impl FnMut(&Backlog)) {
 }
 
 /// One connection: connect (with the resume header if `requested` is set),
-/// stream frames into the sink until it ends or `stop` becomes true.
+/// stream frames into the sink until it ends or `stop` is set.
 /// `on_connected` is called right after a successful upgrade, `on_backlog`
 /// once when the first burst ends (see `resume.rs`). Whenever we end the
-/// connection ourselves after the upgrade (stop, idle timeout, writer gone)
-/// the close handshake is done and reported in [`ConnEnd::client_close`].
+/// connection ourselves after the upgrade (stop, idle timeout, block idle
+/// timeout, writer gone) the close handshake is done and reported in
+/// [`ConnEnd::client_close`]. `block_idle` (task 012 item 3): no frame with
+/// seq > 0 for that long (pings and confirmations do not count; zero
+/// disables) ends the session like an idle timeout, so the reconnect asks
+/// for `last_seq + 1`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_connection(
     url: &str,
     tls: &TlsConnector,
     idle: Duration,
+    block_idle: Duration,
     requested: Option<u64>,
     sink: &mut Sink<'_>,
-    stop: &mut watch::Receiver<bool>,
+    stop: &mut Stop,
     mut on_connected: impl FnMut(),
     mut on_backlog: impl FnMut(&Backlog),
 ) -> ConnEnd {
@@ -533,6 +558,8 @@ pub async fn run_connection(
     info!(url, requested = ?requested, "connected");
     on_connected();
     let started = Instant::now();
+    // Last frame with a block; the session start counts as one.
+    let mut last_block = tokio::time::Instant::now();
     let mut last_log = Instant::now();
     let mut close_info: Option<String> = None;
 
@@ -549,21 +576,49 @@ pub async fn run_connection(
     };
 
     loop {
+        let block_deadline = (!block_idle.is_zero()).then(|| last_block + block_idle);
         let next = tokio::select! {
             biased;
-            _ = stopped(stop) => None,
-            r = tokio::time::timeout(idle, ws.next_frame()) => Some(r),
+            _ = stopped(stop) => Next::Stop,
+            _ = async {
+                match block_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            } => Next::BlockIdle,
+            r = tokio::time::timeout(idle, ws.next_frame()) => Next::Frame(r),
         };
-        let Some(next) = next else {
-            let outcome = close_gracefully(&mut ws, sink, "recorder shutdown").await;
-            flush_backlog(sink, &mut on_backlog);
-            info!(
-                reason = outcome.reason, took_ms = outcome.took.as_millis() as u64,
-                detail = %outcome.detail, "client close handshake done"
-            );
-            let mut e = end(EndKind::ServerClosed, "client shutdown".into(), sink);
-            e.client_close = Some(Box::new(outcome));
-            return e;
+        let next = match next {
+            Next::Frame(r) => r,
+            Next::Stop => {
+                let reason = stop_reason(stop).unwrap_or(SHUTDOWN_REASON);
+                let outcome = close_gracefully(&mut ws, sink, reason).await;
+                flush_backlog(sink, &mut on_backlog);
+                info!(
+                    reason = outcome.reason, took_ms = outcome.took.as_millis() as u64,
+                    detail = %outcome.detail, "client close handshake done"
+                );
+                let mut e = end(EndKind::ServerClosed, "client shutdown".into(), sink);
+                e.client_close = Some(Box::new(outcome));
+                return e;
+            }
+            Next::BlockIdle => {
+                // Task 012 item 3: frames keep coming (pings), blocks do not.
+                warn!(block_idle = ?block_idle, "no block within block idle timeout, closing");
+                let outcome = close_gracefully(&mut ws, sink, "block idle timeout").await;
+                flush_backlog(sink, &mut on_backlog);
+                info!(
+                    reason = outcome.reason, took_ms = outcome.took.as_millis() as u64,
+                    detail = %outcome.detail, "client close handshake done"
+                );
+                let mut e = end(
+                    EndKind::BlockIdle,
+                    format!("no block (seq > 0) for {block_idle:?}"),
+                    sink,
+                );
+                e.client_close = Some(Box::new(outcome));
+                return e;
+            }
         };
         let frame = match next {
             Err(_) => {
@@ -594,6 +649,9 @@ pub async fn run_connection(
             close_info = Some(c);
         }
         let seq_last = line.seq_last;
+        if line.has_seq() {
+            last_block = tokio::time::Instant::now();
+        }
         if sink.push(line).is_err() {
             let outcome = close_gracefully(&mut ws, sink, "recorder writer gone").await;
             flush_backlog(sink, &mut on_backlog);
@@ -710,9 +768,53 @@ impl ConnLog {
     }
 
     /// Unix ns of the last `connected` event, if the log has one.
+    #[allow(dead_code)] // kept for tests and diagnostics; start-up uses last_session()
     pub fn last_connected_ns(&self) -> Option<u128> {
         self.tail()?.lines().rev().find_map(parse_connected_row)
     }
+
+    /// The last session as seen in the log (task 012, item 1).
+    pub fn last_session(&self) -> Option<LogSession> {
+        parse_last_session(&self.tail()?)
+    }
+}
+
+/// The last `connected` row and the newest row of any type after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogSession {
+    pub connected_ns: u128,
+    /// Unix ns of the last row after `connected` (`backlog`, `client_close`,
+    /// `disconnected`, `shutdown`, ...). None if `connected` is the last row,
+    /// i.e. the process died without writing anything (kill -9, power loss).
+    pub last_row_ns: Option<u128>,
+}
+
+/// `ts_unix_ns` and `event` of a data row (both layouts, see
+/// [`parse_connected_row`]); None for the header, comments and torn lines.
+fn row_ns_event(line: &str) -> Option<(u128, &str)> {
+    if line.starts_with('#') {
+        return None;
+    }
+    let mut c = line.split('\t');
+    let _ts = c.next()?;
+    let ns: u128 = c.next()?.parse().ok()?;
+    let event = c.next()?;
+    (!event.is_empty()).then_some((ns, event))
+}
+
+pub fn parse_last_session(text: &str) -> Option<LogSession> {
+    let mut out: Option<LogSession> = None;
+    for (ns, event) in text.lines().filter_map(row_ns_event) {
+        if event == "connected" {
+            out = Some(LogSession {
+                connected_ns: ns,
+                last_row_ns: None,
+            });
+        } else if let Some(s) = out.as_mut() {
+            s.last_row_ns = Some(ns);
+        }
+    }
+    out
 }
 
 /// Timestamp of a `connected` row. Works for both column layouts seen so far

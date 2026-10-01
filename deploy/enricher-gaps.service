@@ -5,9 +5,13 @@
 #
 # Budget: --max-calls is mandatory and is the hard per-run cap of JSON-RPC
 # calls (retries included; 2 calls per block). 4000 calls = 2000 blocks per
-# run; with the hourly timer at most 96 000 calls/day. The run stops with an
-# error when the cap is hit; progress is kept in filled.tsv and the next run
-# continues. Change the numbers with a drop-in
+# run; with the hourly timer at most 96 000 calls/day. When the cap is hit the
+# enricher exits 75 (EX_TEMPFAIL, task 012): progress is kept in filled.tsv,
+# the next run continues, and SuccessExitStatus=75 below keeps this from
+# firing OnFailure every hour during a large backfill. Real errors (exit 1,
+# missing env, RPC failure) still notify. A backfill that falls behind is
+# reported by healthcheck (`backfill`: gaps older than 24 h not in
+# filled.tsv), not by this unit. Change the numbers with a drop-in
 # (systemctl edit enricher-gaps.service), not here, and record the
 # provider cost in docs/costs.md.
 [Unit]
@@ -26,6 +30,8 @@ EnvironmentFile=/etc/hoodchain/enricher.env
 Environment=RUST_LOG=info
 ExecStartPre=/bin/sh -c 'case "$RPC_URL" in ""|*YOUR-PROVIDER*) echo "RPC_URL not set in /etc/hoodchain/enricher.env" >&2; exit 1;; esac'
 ExecStart=/opt/hoodchain-mev/bin/enricher --gaps /srv/hood/data/feed/gaps.tsv --out-dir /srv/hood/data/blocks --max-calls 4000 --rps 2 --batch 10 --concurrency 1
+# 75 = --max-calls budget exhausted (normal for a large backlog of gaps).
+SuccessExitStatus=75
 TimeoutStartSec=55min
 Nice=5
 SyslogIdentifier=enricher-gaps
