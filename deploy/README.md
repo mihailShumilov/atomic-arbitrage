@@ -1,6 +1,6 @@
 # deploy — recorder на сервере: от пустой машины до записи
 
-Набор для сервера по решению `docs/decisions/0003-recorder-server.md` (вариант B, Ubuntu 24.04, Hetzner или похожий провайдер). Всё ставится скриптом `deploy/bootstrap.sh`, мониторинг и аудит работают по таймерам systemd, уведомления идут в journald и, если настроить, в Telegram.
+Набор для сервера по решению `docs/decisions/0003-recorder-server.md` (вариант B, Hetzner или похожий провайдер; проверен на Ubuntu 24.04 и 26.04, сервер `hood-rec` — 26.04). Всё ставится скриптом `deploy/bootstrap.sh`, мониторинг и аудит работают по таймерам systemd, уведомления идут в journald и, если настроить, в Telegram.
 
 Главные правила:
 - **С IP сервера никаких тестовых подключений к фиду и ручных проверок** (`websocat`, `curl` на `feed.*`, второй recorder). Наблюдался бан около часа: 2026-09-30 ответ 403 с `Retry-After: 3600` (`docs/handoff/from-code/002-recorder-hardening.md`). Лимит «2 соединения с IP, третье получает 429» **не проверен**: это факт из потерянной сессии. Все эксперименты с фидом — только с Mac.
@@ -11,7 +11,7 @@
 
 | Файл | Куда ставится | Что делает |
 |---|---|---|
-| `bootstrap.sh` | запускается из `/opt/hoodchain-mev/src` | идемпотентная подготовка чистой Ubuntu 24.04: пакеты, пользователь `hood`, каталоги, chrony, ufw, лимиты journald, скрипты, юниты. Повторный прогон печатает `done: 0 change(s)` |
+| `bootstrap.sh` | запускается из `/opt/hoodchain-mev/src` | идемпотентная подготовка чистой Ubuntu 24.04 или 26.04: пакеты, пользователь `hood`, каталоги, chrony, ufw, лимиты journald, скрипты, юниты. Повторный прогон печатает `done: 0 change(s)` |
 | `build-on-server.sh` | там же | сборка `recorder` и `enricher` на сервере от пользователя `hoodbuild` (`cargo build --release --locked`), установка в `/opt/hoodchain-mev/bin`, прошлые бинарники остаются как `*.prev`. Recorder не перезапускает |
 | `recorder.service` | `/etc/systemd/system/` | сам recorder (задача 008: `RestartSec=120`, Close при остановке; задача 009: досылка по `Arbitrum-Requested-Sequence-Number`, Close и при idle-таймауте; задача 012: Close при ошибке записи, `--block-idle-timeout-secs 30`, пауза 120 с от конца прошлой сессии — флагов в юните не требует) |
 | `healthcheck.sh`, `healthcheck.service`, `healthcheck.timer` | `/opt/hoodchain-mev/deploy/`, юниты | проверки раз в 5 мин, см. «Мониторинг» |
@@ -40,7 +40,7 @@
 
 ## Что нужно от Михаила
 
-1. Сервер: Ubuntu 24.04, **выделенный публичный IPv4**, диск ≥ 0.5 ТБ (только фид) или 1.5–2 ТБ (фид, история, блоки), трафик ≥ 3 ТБ/мес или без лимита (0003). Нужны IP и доступ root по ssh-ключу.
+1. Сервер: Ubuntu 24.04 или 26.04, **выделенный публичный IPv4**, диск ≥ 0.5 ТБ (только фид) или 1.5–2 ТБ (фид, история, блоки), трафик ≥ 3 ТБ/мес или без лимита (0003). Нужны IP и доступ root по ssh-ключу.
 2. Telegram (по желанию, бесплатно): бот от @BotFather (токен) и chat id. Без них уведомления остаются только в journald, а до Михаила они не дойдут: **без Telegram мониторинг формально есть, но никого не будит.**
 3. Позже, отдельными решениями: хранилище для бэкапа (п. «Бэкап») и провайдер RPC для дозаливки (0002).
 
@@ -52,7 +52,7 @@
 
 ```bash
 mac$ ssh root@<IP> 'cat /etc/os-release | head -2; nproc; free -g; df -h /; ip -4 addr show scope global'
-#     Ubuntu 24.04? Есть ли публичный IPv4 на интерфейсе (не 10.x/172.16-31.x/192.168.x — иначе NAT)?
+#     Ubuntu 24.04/26.04? Есть ли публичный IPv4 на интерфейсе (не 10.x/172.16-31.x/192.168.x — иначе NAT)?
 mac$ cd ~/sites/my/crypto/atomic-arbitrage
 mac$ rsync -a --delete --exclude target --exclude data --exclude .env --exclude '.env*' \
        --exclude .idea --exclude '*.zip' ./ root@<IP>:/opt/hoodchain-mev/src/
@@ -77,7 +77,7 @@ srv# bash /opt/hoodchain-mev/src/deploy/build-on-server.sh
 srv# cat /opt/hoodchain-mev/bin/BUILD_INFO
 ```
 
-Нужно ~4 ГБ RAM. При меньшем объёме сборка идёт в 1 поток; если её убьёт OOM, добавьте swap (`fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile`). Проверено в контейнере ubuntu:24.04 (arm64): rustup из архива Ubuntu, rustc 1.98.1, компиляция ~36 с на 14 ядрах. На x86_64-сервере ожидается так же, но это не проверялось.
+Нужно ~4 ГБ RAM. При меньшем объёме сборка идёт в 1 поток; если её убьёт OOM, добавьте swap (`fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile`). Проверено в контейнерах ubuntu:24.04 и ubuntu:26.04 (arm64): rustup из архива Ubuntu (в 26.04 — 1.27.1, есть и для amd64), rustc 1.98.1, компиляция ~40 с на 14 ядрах. На x86_64-сервере ожидается так же, но это не проверялось. Если в дереве на сервере есть незакоммиченные правки отслеживаемых файлов, в `BUILD_INFO` будет `git=<коммит>-dirty`: для сверки «коммит = HEAD» копируйте на сервер только закоммиченное состояние.
 
 Почему не кросс-компиляция с Mac: под Linux нужен свой линкер или `cross`/`zig`, это новые инструменты. Сборка на сервере использует ровно `Cargo.lock` (`--locked`), а Rust ставится одним пакетом.
 
@@ -281,10 +281,19 @@ docker run --rm --network none -e LANG=C.UTF-8 -v "$PWD/deploy":/mnt:ro koalaman
   $(cd deploy && ls *.sh test/*.sh | sed "s#^#/mnt/#")
 for f in deploy/*.sh deploy/test/*.sh; do bash -n "$f"; done
 
-# офлайн-тесты healthcheck и notify (подставные данные, без сети)
+# офлайн-тесты healthcheck и notify (подставные данные, без сети); повторить с ubuntu:26.04
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-healthcheck.sh
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-notify.sh
 
-# bootstrap дважды под настоящим systemd в ubuntu:24.04, verify юнитов, тест бэкапа
-bash deploy/test/run-systemd-container.sh            # добавить --build, чтобы проверить и сборку
+# bootstrap дважды под настоящим systemd, verify юнитов, тест бэкапа, chrony и ufw
+bash deploy/test/run-systemd-container.sh                  # ubuntu:24.04; --build — проверить и сборку
+bash deploy/test/run-systemd-container.sh --ubuntu 26.04   # как на сервере hood-rec
 ```
+
+### Ubuntu 26.04: что отличается (проверено 2026-10-01 в контейнере ubuntu:26.04 и осмотром `hood-rec`)
+
+- `stat`, `date`, `du`, `install`, `sort`, `tail` и другие — из uutils (Rust coreutils 0.8.0), `cp` — GNU. Все флаги, которые используют скрипты набора (`stat -c '%U:%G:%a'`/`%Y`, `date -u -d @N`/`-d yesterday`, `sort -V`, `install -D -o -g -m`, `tail -c`/`-n +N`, `head -c`, `df -P`, `touch -d`), дают тот же вывод, что GNU. Правок не понадобилось.
+- `sudo` — sudo-rs. Набор `sudo` не использует (всё под root, пользователи — через `runuser`).
+- systemd 259, chrony 4.8, ufw 0.36.2 (iptables-nft), needrestart 3.11, Python 3.14, rustup 1.27.1 в архиве. Формат `chronyc -n tracking` прежний, `hood.conf` для needrestart разбирается, recorder исключён.
+- ssh запускается через `ssh.socket`; `sshd -T` возвращает порт, bootstrap берёт его оттуда. После правки `/etc/ssh/sshd_config.d/*.conf`: `sshd -t`, затем `systemctl reload ssh`.
+- В Docker `chrony.service` на 26.04 пропускается (`ConditionVirtualization=!container`). Тестовый стенд снимает это условие только внутри контейнера, на сервере chrony работает штатно.

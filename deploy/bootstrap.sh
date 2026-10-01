@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hoodchain-mev: idempotent bootstrap of a clean Ubuntu 24.04 host (run as root)
+# hoodchain-mev: idempotent bootstrap of a clean Ubuntu 24.04/26.04 host (run as root)
 # for the feed recorder. Safe to re-run: every step checks before changing,
 # and the summary line counts real changes (a second run must print 0).
 #
@@ -65,8 +65,8 @@ die() { say "ERROR: $*"; exit 1; }
 [[ -f $AUDIT_SRC ]] || die "$AUDIT_SRC not found"
 # shellcheck source=/dev/null
 . /etc/os-release
-[[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 24.04 ]] ||
-    warn "tested on Ubuntu 24.04 only, this is ${PRETTY_NAME:-unknown}"
+[[ ${ID:-} == ubuntu && ${VERSION_ID:-} =~ ^(24|26)\.04$ ]] ||
+    warn "tested on Ubuntu 24.04 and 26.04 only, this is ${PRETTY_NAME:-unknown}"
 
 # ------------------------------------------------------------- packages ---
 pkgs=(chrony ufw zstd python3 curl ca-certificates rclone)

@@ -96,6 +96,13 @@ if (( ${#installed[@]} )) || [[ ! -f $PREFIX/bin/BUILD_INFO ]]; then
     rev=unknown
     if [[ -d $SRC/.git ]]; then
         rev=$(as_build git -c safe.directory="$SRC" rev-parse --short HEAD 2>/dev/null || echo unknown)
+        # Tracked files differing from HEAD (rsync of a working copy with
+        # uncommitted edits): the binary is not exactly that commit.
+        if [[ $rev != unknown ]] &&
+            [[ -n $(as_build git -c safe.directory="$SRC" status --porcelain --untracked-files=no 2>/dev/null) ]]; then
+            rev=$rev-dirty
+            say "WARNING: $SRC has uncommitted changes to tracked files; BUILD_INFO says git=$rev"
+        fi
     fi
     {
         echo "installed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
