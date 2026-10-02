@@ -1,0 +1,22 @@
+# Tool configuration only: this repository is not a Python package.
+# Python lives in analytics/ and .claude/skills/*/scripts/ (stdlib scripts).
+
+[tool.ruff]
+line-length = 120
+# feed_audit.py runs on the server and on the Mac with stdlib Python 3.9+
+# (Mac: 3.9.6, server: 3.14); keep syntax and suggested fixes 3.9-compatible.
+target-version = "py39"
+extend-exclude = ["data", "target", "deploy", "docs", ".claude/skills/clickhouse-*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "PL", "RUF"]
+ignore = [
+    # Report and audit scripts: thresholds and column indices read better inline
+    # than as named constants.
+    "PLR2004",
+]
+# B905 (`zip(strict=...)`) is not reported while target-version is py39:
+# `strict` needs Python 3.10 (all current zip() calls are in analytics/).
+
+[tool.ruff.format]
+quote-style = "double"

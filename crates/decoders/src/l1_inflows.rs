@@ -604,7 +604,8 @@ pub fn decode_block(line: &BlockLine, registry: &GatewayRegistry) -> Result<Bloc
     let mut redeem_max_refund: HashMap<B256, U256> = HashMap::new();
     for tx in txs {
         if hex_u64(&tx.tx_type)? == TX_TYPE_RETRY as u64 {
-            let ticket = parse_b256(tx.ticket_id.as_deref().ok_or_else(|| anyhow!("block {n}: 0x68 without ticketId"))?)?;
+            let ticket =
+                parse_b256(tx.ticket_id.as_deref().ok_or_else(|| anyhow!("block {n}: 0x68 without ticketId"))?)?;
             redeem_max_refund.insert(ticket, opt_u256(&tx.max_refund, "maxRefund")?);
         }
     }

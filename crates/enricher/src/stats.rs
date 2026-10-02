@@ -110,7 +110,13 @@ impl Stats {
             let avg = |x: u64| if s.results == 0 { 0.0 } else { x as f64 / s.results as f64 };
             sizes.insert(
                 k,
-                MethodSize { results: s.results, raw_bytes: s.raw, raw_avg: avg(s.raw), zstd_bytes: z, zstd_avg: avg(z) },
+                MethodSize {
+                    results: s.results,
+                    raw_bytes: s.raw,
+                    raw_avg: avg(s.raw),
+                    zstd_bytes: z,
+                    zstd_avg: avg(z),
+                },
             );
         }
         Summary { elapsed_s: self.started.elapsed().as_secs_f64(), counters: self.counters(), sizes }

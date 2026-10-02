@@ -17,18 +17,11 @@ use tokio::process::{Child, Command};
 use yawc::{Frame, OpCode, Options, Role, WebSocket};
 
 fn now_ns() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "recorder-it-{tag}-{}-{}",
-        std::process::id(),
-        now_ns()
-    ));
+    let d = std::env::temp_dir().join(format!("recorder-it-{tag}-{}-{}", std::process::id(), now_ns()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -63,12 +56,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
                 40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
                 _ => (b ^ c ^ d, 0xCA62C1D6),
             };
-            let t = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*wi);
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
             e = d;
             d = c;
             c = b.rotate_left(30);
@@ -96,10 +84,7 @@ fn accept_key(key: &str) -> String {
 #[test]
 fn sha1_known_vector() {
     // RFC 6455 section 1.3 example.
-    assert_eq!(
-        accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
-        "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-    );
+    assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 }
 
 /// Accept one TCP connection, answer the HTTP upgrade (no permessage-deflate:
@@ -112,9 +97,7 @@ async fn accept_ws(listener: &TcpListener) -> WebSocket<TcpStream> {
 fn header(req: &str, name: &str) -> Option<String> {
     req.lines().skip(1).find_map(|l| {
         let (k, v) = l.split_once(':')?;
-        k.trim()
-            .eq_ignore_ascii_case(name)
-            .then(|| v.trim().to_string())
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
     })
 }
 
@@ -133,9 +116,7 @@ async fn accept_ws_req(listener: &TcpListener) -> (WebSocket<TcpStream>, String)
         .lines()
         .find_map(|l| {
             let (k, v) = l.split_once(':')?;
-            k.trim()
-                .eq_ignore_ascii_case("sec-websocket-key")
-                .then(|| v.trim().to_string())
+            k.trim().eq_ignore_ascii_case("sec-websocket-key").then(|| v.trim().to_string())
         })
         .expect("Sec-WebSocket-Key");
     let resp = format!(
@@ -143,10 +124,7 @@ async fn accept_ws_req(listener: &TcpListener) -> (WebSocket<TcpStream>, String)
         accept_key(&key)
     );
     tcp.write_all(resp.as_bytes()).await.unwrap();
-    (
-        WebSocket::from_stream(tcp, Role::Server, Options::default()).unwrap(),
-        text,
-    )
+    (WebSocket::from_stream(tcp, Role::Server, Options::default()).unwrap(), text)
 }
 
 // Shape of a real envelope captured on 2026-09-28 (block 74755960,
@@ -189,10 +167,7 @@ fn spawn_recorder(url: &str, out: &Path, extra: &[&str]) -> Child {
 
 fn sigterm(child: &Child) {
     let pid = child.id().expect("child still running");
-    let st = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status()
-        .unwrap();
+    let st = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap();
     assert!(st.success());
 }
 
@@ -231,10 +206,7 @@ fn all_lines(out: &Path) -> Vec<String> {
     files.sort();
     let mut s = String::new();
     for f in files {
-        zstd::stream::read::Decoder::new(std::fs::File::open(f).unwrap())
-            .unwrap()
-            .read_to_string(&mut s)
-            .unwrap();
+        zstd::stream::read::Decoder::new(std::fs::File::open(f).unwrap()).unwrap().read_to_string(&mut s).unwrap();
     }
     s.lines().map(str::to_owned).collect()
 }
@@ -256,10 +228,7 @@ async fn sigterm_sends_close_1000_and_waits_for_reply() {
         ws.send(Frame::text(envelope(seq))).await.unwrap();
     }
     ws.send(Frame::ping(Vec::<u8>::new())).await.unwrap();
-    wait_until("connected event", Duration::from_secs(5), || {
-        connections(&out).contains("\tconnected\t")
-    })
-    .await;
+    wait_until("connected event", Duration::from_secs(5), || connections(&out).contains("\tconnected\t")).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     sigterm(&child);
     let t_sig = Instant::now();
@@ -283,43 +252,27 @@ async fn sigterm_sends_close_1000_and_waits_for_reply() {
             }
         }
     }
-    let (code, after) = client_close.unwrap_or_else(|| {
-        panic!("mock saw no Close frame from the client before EOF, frames: {seen:?}")
-    });
+    let (code, after) =
+        client_close.unwrap_or_else(|| panic!("mock saw no Close frame from the client before EOF, frames: {seen:?}"));
     assert_eq!(code, Some(1000), "close code, frames: {seen:?}");
     assert!(after < Duration::from_secs(2), "close sent after {after:?}");
     // Reply like a well-behaved server; the client should then exit.
     ws.close().await.ok();
 
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .expect("recorder did not exit")
-        .unwrap();
+    let status =
+        tokio::time::timeout(Duration::from_secs(5), child.wait()).await.expect("recorder did not exit").unwrap();
     assert_eq!(status.code(), Some(0), "log:\n{}", read_log(&out));
 
     let conns = connections(&out);
     eprintln!("connections.tsv:\n{conns}");
-    assert!(
-        conns.contains("\tclient_close\tserver_replied\t"),
-        "connections.tsv:\n{conns}"
-    );
+    assert!(conns.contains("\tclient_close\tserver_replied\t"), "connections.tsv:\n{conns}");
     let lines = all_lines(&out);
-    let seqs: Vec<&str> = lines
-        .iter()
-        .map(|l| l.split('\t').nth(1).unwrap())
-        .filter(|s| *s != "0")
-        .collect();
+    let seqs: Vec<&str> = lines.iter().map(|l| l.split('\t').nth(1).unwrap()).filter(|s| *s != "0").collect();
     assert_eq!(seqs, ["100", "101", "102", "103", "104"], "{lines:?}");
     assert!(lines.iter().any(|l| l.contains(r#""opcode":"ping""#)));
     // The server's Close reply is recorded too (nothing is dropped).
-    assert!(
-        lines.iter().any(|l| l.contains(r#""opcode":"close""#)),
-        "{lines:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(out.join("last_seq.txt")).unwrap(),
-        "104"
-    );
+    assert!(lines.iter().any(|l| l.contains(r#""opcode":"close""#)), "{lines:?}");
+    assert_eq!(std::fs::read_to_string(out.join("last_seq.txt")).unwrap(), "104");
     std::fs::remove_dir_all(&out).ok();
     std::fs::remove_file(out.with_extension("log")).ok();
 }
@@ -336,10 +289,7 @@ async fn sigterm_without_close_reply_gives_up_after_2s() {
         .await
         .expect("recorder did not connect to the mock");
     ws.send(Frame::text(envelope(7))).await.unwrap();
-    wait_until("connected event", Duration::from_secs(5), || {
-        connections(&out).contains("\tconnected\t")
-    })
-    .await;
+    wait_until("connected event", Duration::from_secs(5), || connections(&out).contains("\tconnected\t")).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     sigterm(&child);
     let t_sig = Instant::now();
@@ -358,24 +308,16 @@ async fn sigterm_without_close_reply_gives_up_after_2s() {
         }
         (got_close, ws)
     });
-    let status = tokio::time::timeout(Duration::from_secs(6), child.wait())
-        .await
-        .expect("recorder did not exit")
-        .unwrap();
+    let status =
+        tokio::time::timeout(Duration::from_secs(6), child.wait()).await.expect("recorder did not exit").unwrap();
     let took = t_sig.elapsed();
     assert_eq!(status.code(), Some(0), "log:\n{}", read_log(&out));
-    assert!(
-        took >= Duration::from_millis(1900) && took < Duration::from_secs(4),
-        "exit after {took:?}"
-    );
+    assert!(took >= Duration::from_millis(1900) && took < Duration::from_secs(4), "exit after {took:?}");
     let (code, _ws) = drain.await.unwrap();
     assert_eq!(code, Some(1000));
     let conns = connections(&out);
     eprintln!("connections.tsv:\n{conns}");
-    assert!(
-        conns.contains("\tclient_close\tno_reply\t"),
-        "connections.tsv:\n{conns}"
-    );
+    assert!(conns.contains("\tclient_close\tno_reply\t"), "connections.tsv:\n{conns}");
     std::fs::remove_dir_all(&out).ok();
     std::fs::remove_file(out.with_extension("log")).ok();
 }
@@ -409,10 +351,7 @@ async fn min_connect_interval_survives_restart_and_sigterm_interrupts() {
     .await;
     let conns = connections(&out);
     eprintln!("connections.tsv:\n{conns}");
-    let row = conns
-        .lines()
-        .find(|l| l.contains("\tstartup_wait\t"))
-        .unwrap();
+    let row = conns.lines().find(|l| l.contains("\tstartup_wait\t")).unwrap();
     let pause: f64 = row.split('\t').nth(6).unwrap().parse().unwrap();
     assert!((98.0..=100.5).contains(&pause), "pause {pause}, row {row}");
     assert!(row.contains("(end=log_row)"), "{row}");
@@ -432,11 +371,7 @@ async fn min_connect_interval_survives_restart_and_sigterm_interrupts() {
     let conns = connections(&out);
     eprintln!("connections.tsv:\n{conns}");
     assert_eq!(conns.matches("\tconnected\t").count(), 1, "{conns}");
-    assert!(conns
-        .lines()
-        .last()
-        .unwrap()
-        .contains("\tshutdown\tSIGTERM"));
+    assert!(conns.lines().last().unwrap().contains("\tshutdown\tSIGTERM"));
     std::fs::remove_dir_all(&out).ok();
     std::fs::remove_file(out.with_extension("log")).ok();
 }
@@ -449,13 +384,8 @@ fn data_frame(seqs: std::ops::RangeInclusive<u64>) -> Vec<u8> {
     let mut enc = zstd::Encoder::new(Vec::new(), 3).unwrap();
     enc.include_checksum(true).unwrap();
     for (i, seq) in seqs.enumerate() {
-        writeln!(
-            enc,
-            "{}\t{seq}\t{seq}\t{}",
-            1_790_769_600_000_000_000u128 + i as u128 * 100_000_000,
-            envelope(seq)
-        )
-        .unwrap();
+        writeln!(enc, "{}\t{seq}\t{seq}\t{}", 1_790_769_600_000_000_000u128 + i as u128 * 100_000_000, envelope(seq))
+            .unwrap();
     }
     enc.finish().unwrap()
 }
@@ -476,11 +406,7 @@ fn gaps(out: &Path) -> String {
 }
 
 fn recorded_seqs(out: &Path) -> Vec<u64> {
-    all_lines(out)
-        .iter()
-        .map(|l| l.split('\t').nth(1).unwrap().parse::<u64>().unwrap())
-        .filter(|&s| s != 0)
-        .collect()
+    all_lines(out).iter().map(|l| l.split('\t').nth(1).unwrap().parse::<u64>().unwrap()).filter(|&s| s != 0).collect()
 }
 
 /// Mock backlog + live stream: `backlog` back to back with
@@ -488,15 +414,11 @@ fn recorded_seqs(out: &Path) -> Vec<u64> {
 /// 120 ms pauses (live feed ~113 ms per block, see chain-facts.md).
 async fn send_burst_then_live(ws: &mut WebSocket<TcpStream>, backlog: &[u64], live: &[u64]) {
     for &seq in backlog {
-        ws.send(Frame::text(envelope_ts(seq, unix_s() - 60)))
-            .await
-            .unwrap();
+        ws.send(Frame::text(envelope_ts(seq, unix_s() - 60))).await.unwrap();
     }
     for &seq in live {
         tokio::time::sleep(Duration::from_millis(120)).await;
-        ws.send(Frame::text(envelope_ts(seq, unix_s())))
-            .await
-            .unwrap();
+        ws.send(Frame::text(envelope_ts(seq, unix_s()))).await.unwrap();
     }
 }
 
@@ -511,18 +433,13 @@ async fn stop_recorder(child: &mut Child, ws: &mut WebSocket<TcpStream>, out: &P
         }
     }
     ws.close().await.ok();
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .expect("recorder did not exit")
-        .unwrap();
+    let status =
+        tokio::time::timeout(Duration::from_secs(5), child.wait()).await.expect("recorder did not exit").unwrap();
     assert_eq!(status.code(), Some(0), "log:\n{}", read_log(out));
 }
 
 fn row<'a>(conns: &'a str, event: &str) -> &'a str {
-    conns
-        .lines()
-        .find(|l| l.split('\t').nth(2) == Some(event))
-        .unwrap_or_else(|| panic!("no {event} row in:\n{conns}"))
+    conns.lines().find(|l| l.split('\t').nth(2) == Some(event)).unwrap_or_else(|| panic!("no {event} row in:\n{conns}"))
 }
 
 /// Item 1 + acceptance: data up to 104 -> the handshake carries
@@ -539,22 +456,11 @@ async fn header_requests_last_seq_plus_one_and_backlog_closes_gap() {
     let (mut ws, req) = tokio::time::timeout(Duration::from_secs(10), accept_ws_req(&listener))
         .await
         .expect("recorder did not connect to the mock");
-    assert_eq!(
-        header(&req, "Arbitrum-Feed-Client-Version").as_deref(),
-        Some("2"),
-        "{req}"
-    );
-    assert_eq!(
-        header(&req, "Arbitrum-Requested-Sequence-Number").as_deref(),
-        Some("105"),
-        "{req}"
-    );
+    assert_eq!(header(&req, "Arbitrum-Feed-Client-Version").as_deref(), Some("2"), "{req}");
+    assert_eq!(header(&req, "Arbitrum-Requested-Sequence-Number").as_deref(), Some("105"), "{req}");
     // A server that honours the header starts exactly at 105.
     send_burst_then_live(&mut ws, &[105, 106, 107, 108, 109, 110], &[111, 112]).await;
-    wait_until("backlog event", Duration::from_secs(5), || {
-        connections(&out).contains("\tbacklog\t")
-    })
-    .await;
+    wait_until("backlog event", Duration::from_secs(5), || connections(&out).contains("\tbacklog\t")).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     stop_recorder(&mut child, &mut ws, &out).await;
 
@@ -567,17 +473,11 @@ async fn header_requests_last_seq_plus_one_and_backlog_closes_gap() {
         b.contains("requested=105 last_seq_before=104 first_seq=105 first_minus_requested=0 first_lag_ms=6"),
         "{b}"
     );
-    assert!(
-        b.contains("backlog_blocks=6 backlog_end_seq=110 live_seq=111"),
-        "{b}"
-    );
+    assert!(b.contains("backlog_blocks=6 backlog_end_seq=110 live_seq=111"), "{b}");
     assert!(b.contains("stale_frames=0 complete=true"), "{b}");
     assert_eq!(gaps(&out), "", "gaps.tsv must stay empty");
     assert_eq!(recorded_seqs(&out), (100..=112).collect::<Vec<_>>());
-    assert_eq!(
-        std::fs::read_to_string(out.join("last_seq.txt")).unwrap(),
-        "112"
-    );
+    assert_eq!(std::fs::read_to_string(out.join("last_seq.txt")).unwrap(), "112");
     std::fs::remove_dir_all(&out).ok();
     std::fs::remove_file(out.with_extension("log")).ok();
 }
@@ -594,16 +494,9 @@ async fn backlog_after_requested_leaves_exactly_one_gap() {
     let (mut ws, req) = tokio::time::timeout(Duration::from_secs(10), accept_ws_req(&listener))
         .await
         .expect("recorder did not connect to the mock");
-    assert_eq!(
-        header(&req, "Arbitrum-Requested-Sequence-Number").as_deref(),
-        Some("105"),
-        "{req}"
-    );
+    assert_eq!(header(&req, "Arbitrum-Requested-Sequence-Number").as_deref(), Some("105"), "{req}");
     send_burst_then_live(&mut ws, &[120, 121, 122, 123], &[124, 125]).await;
-    wait_until("backlog event", Duration::from_secs(5), || {
-        connections(&out).contains("\tbacklog\t")
-    })
-    .await;
+    wait_until("backlog event", Duration::from_secs(5), || connections(&out).contains("\tbacklog\t")).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     stop_recorder(&mut child, &mut ws, &out).await;
 
@@ -637,17 +530,10 @@ async fn no_header_without_data() {
     let (mut ws, req) = tokio::time::timeout(Duration::from_secs(10), accept_ws_req(&listener))
         .await
         .expect("recorder did not connect to the mock");
-    assert_eq!(
-        header(&req, "Arbitrum-Requested-Sequence-Number"),
-        None,
-        "{req}"
-    );
+    assert_eq!(header(&req, "Arbitrum-Requested-Sequence-Number"), None, "{req}");
     assert_eq!(header(&req, "Arbitrum-Feed-Client-Version"), None, "{req}");
     send_burst_then_live(&mut ws, &[500, 501], &[502]).await;
-    wait_until("backlog event", Duration::from_secs(5), || {
-        connections(&out).contains("\tbacklog\t")
-    })
-    .await;
+    wait_until("backlog event", Duration::from_secs(5), || connections(&out).contains("\tbacklog\t")).await;
     stop_recorder(&mut child, &mut ws, &out).await;
     let conns = connections(&out);
     eprintln!("connections.tsv:\n{conns}");
@@ -669,17 +555,10 @@ async fn no_requested_seq_flag_disables_header() {
     let (mut ws, req) = tokio::time::timeout(Duration::from_secs(10), accept_ws_req(&listener))
         .await
         .expect("recorder did not connect to the mock");
-    assert_eq!(
-        header(&req, "Arbitrum-Requested-Sequence-Number"),
-        None,
-        "{req}"
-    );
+    assert_eq!(header(&req, "Arbitrum-Requested-Sequence-Number"), None, "{req}");
     assert_eq!(header(&req, "Arbitrum-Feed-Client-Version"), None, "{req}");
     send_burst_then_live(&mut ws, &[200], &[201]).await;
-    wait_until("backlog event", Duration::from_secs(5), || {
-        connections(&out).contains("\tbacklog\t")
-    })
-    .await;
+    wait_until("backlog event", Duration::from_secs(5), || connections(&out).contains("\tbacklog\t")).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     stop_recorder(&mut child, &mut ws, &out).await;
     let conns = connections(&out);
@@ -706,11 +585,7 @@ async fn idle_timeout_sends_close_then_resumes_from_memory() {
     let (mut ws, req) = tokio::time::timeout(Duration::from_secs(10), accept_ws_req(&listener))
         .await
         .expect("recorder did not connect to the mock");
-    assert_eq!(
-        header(&req, "Arbitrum-Requested-Sequence-Number"),
-        None,
-        "{req}"
-    );
+    assert_eq!(header(&req, "Arbitrum-Requested-Sequence-Number"), None, "{req}");
     ws.send(Frame::text(envelope(300))).await.unwrap();
     ws.send(Frame::text(envelope(301))).await.unwrap();
     let t_last = Instant::now();
@@ -731,10 +606,7 @@ async fn idle_timeout_sends_close_then_resumes_from_memory() {
     };
     assert_eq!(code, Some(1000));
     assert_eq!(reason, "idle timeout");
-    assert!(
-        after >= Duration::from_millis(900) && after < Duration::from_secs(3),
-        "Close after {after:?}"
-    );
+    assert!(after >= Duration::from_millis(900) && after < Duration::from_secs(3), "Close after {after:?}");
     ws.close().await.ok();
     drop(ws);
 
@@ -743,16 +615,8 @@ async fn idle_timeout_sends_close_then_resumes_from_memory() {
     let (mut ws2, req2) = tokio::time::timeout(Duration::from_secs(12), accept_ws_req(&listener))
         .await
         .expect("recorder did not reconnect");
-    assert_eq!(
-        header(&req2, "Arbitrum-Feed-Client-Version").as_deref(),
-        Some("2"),
-        "{req2}"
-    );
-    assert_eq!(
-        header(&req2, "Arbitrum-Requested-Sequence-Number").as_deref(),
-        Some("302"),
-        "{req2}"
-    );
+    assert_eq!(header(&req2, "Arbitrum-Feed-Client-Version").as_deref(), Some("2"), "{req2}");
+    assert_eq!(header(&req2, "Arbitrum-Requested-Sequence-Number").as_deref(), Some("302"), "{req2}");
     send_burst_then_live(&mut ws2, &[302, 303], &[304]).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     stop_recorder(&mut child, &mut ws2, &out).await;
@@ -765,10 +629,7 @@ async fn idle_timeout_sends_close_then_resumes_from_memory() {
     assert!(conns.contains("\tdisconnected\tidle_timeout\t"), "{conns}");
     // First burst never ended in a pause: logged at the end of the session.
     assert!(conns.contains("\tbacklog\tsession_ended\t"), "{conns}");
-    let connected: Vec<&str> = conns
-        .lines()
-        .filter(|l| l.split('\t').nth(2) == Some("connected"))
-        .collect();
+    let connected: Vec<&str> = conns.lines().filter(|l| l.split('\t').nth(2) == Some("connected")).collect();
     assert_eq!(connected.len(), 2, "{conns}");
     assert!(connected[0].ends_with("requested=- mode=no_data"));
     assert!(connected[1].ends_with("requested=302 mode=header"));
@@ -780,7 +641,8 @@ async fn idle_timeout_sends_close_then_resumes_from_memory() {
 
 // ------------------------------------------------------------- task 012 ---
 
-const CONN_HEADER: &str = "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail";
+const CONN_HEADER: &str =
+    "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail";
 
 /// Start the recorder on a prepared out-dir, wait for its `startup_wait`
 /// row, check that nobody connects, SIGTERM it (exit 0) and return the row.
@@ -788,10 +650,7 @@ async fn startup_wait_row(out: &Path) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/", listener.local_addr().unwrap());
     let mut child = spawn_recorder(&url, out, &[]);
-    wait_until("startup_wait event", Duration::from_secs(10), || {
-        connections(out).contains("\tstartup_wait\t")
-    })
-    .await;
+    wait_until("startup_wait event", Duration::from_secs(10), || connections(out).contains("\tstartup_wait\t")).await;
     let accepted = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
     assert!(accepted.is_err(), "recorder connected during the wait");
     sigterm(&child);
@@ -926,10 +785,7 @@ async fn writer_error_sends_close_then_exits_2() {
             Err(_) => panic!("no Close within 5 s of the write error"),
             Ok(Err(e)) => panic!("stream ended without a Close frame: {e}"),
             Ok(Ok(f)) if f.opcode() == OpCode::Close => {
-                break (
-                    f.close_code().map(u16::from),
-                    f.close_reason().ok().flatten().unwrap_or("").to_string(),
-                )
+                break (f.close_code().map(u16::from), f.close_reason().ok().flatten().unwrap_or("").to_string())
             }
             Ok(Ok(_)) => continue,
         }
@@ -937,10 +793,8 @@ async fn writer_error_sends_close_then_exits_2() {
     assert_eq!(code, Some(1000));
     assert_eq!(reason, "recorder writer error");
     ws.close().await.ok();
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .expect("recorder did not exit")
-        .unwrap();
+    let status =
+        tokio::time::timeout(Duration::from_secs(5), child.wait()).await.expect("recorder did not exit").unwrap();
     assert_eq!(status.code(), Some(2), "log:\n{}", read_log(&out));
     assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
     let conns = connections(&out);
@@ -971,11 +825,7 @@ async fn block_idle_closes_and_resumes() {
     let out = tmpdir("block-idle");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/", listener.local_addr().unwrap());
-    let mut child = spawn_recorder(
-        &url,
-        &out,
-        &["--block-idle-timeout-secs", "2", "--idle-timeout-secs", "1"],
-    );
+    let mut child = spawn_recorder(&url, &out, &["--block-idle-timeout-secs", "2", "--idle-timeout-secs", "1"]);
     let mut ws = tokio::time::timeout(Duration::from_secs(10), accept_ws(&listener))
         .await
         .expect("recorder did not connect to the mock");
@@ -986,10 +836,7 @@ async fn block_idle_closes_and_resumes() {
     let (code, reason, after) = loop {
         match tokio::time::timeout(Duration::from_millis(300), ws.next_frame()).await {
             Err(_) => {
-                assert!(
-                    t_last.elapsed() < Duration::from_secs(6),
-                    "no Close within 6 s without blocks"
-                );
+                assert!(t_last.elapsed() < Duration::from_secs(6), "no Close within 6 s without blocks");
                 ws.send(Frame::ping(Vec::<u8>::new())).await.unwrap();
             }
             Ok(Err(e)) => panic!("stream ended without a Close frame: {e}"),
@@ -1005,10 +852,7 @@ async fn block_idle_closes_and_resumes() {
     };
     assert_eq!(code, Some(1000));
     assert_eq!(reason, "block idle timeout");
-    assert!(
-        after >= Duration::from_millis(1900) && after < Duration::from_secs(3),
-        "Close after {after:?}"
-    );
+    assert!(after >= Duration::from_millis(1900) && after < Duration::from_secs(3), "Close after {after:?}");
     ws.close().await.ok();
     drop(ws);
 
@@ -1018,15 +862,8 @@ async fn block_idle_closes_and_resumes() {
         .await
         .expect("recorder did not reconnect");
     let gap = t_close.elapsed();
-    assert!(
-        gap >= Duration::from_millis(3500) && gap < Duration::from_secs(7),
-        "reconnect after {gap:?}"
-    );
-    assert_eq!(
-        header(&req2, "Arbitrum-Requested-Sequence-Number").as_deref(),
-        Some("302"),
-        "{req2}"
-    );
+    assert!(gap >= Duration::from_millis(3500) && gap < Duration::from_secs(7), "reconnect after {gap:?}");
+    assert_eq!(header(&req2, "Arbitrum-Requested-Sequence-Number").as_deref(), Some("302"), "{req2}");
     send_burst_then_live(&mut ws2, &[302, 303], &[304]).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     stop_recorder(&mut child, &mut ws2, &out).await;
@@ -1038,15 +875,9 @@ async fn block_idle_closes_and_resumes() {
     assert!(cc.contains("\"block idle timeout\""), "{cc}");
     let d = row(&conns, "disconnected");
     assert!(d.contains("\tdisconnected\tblock_idle\t101\t"), "{d}");
-    assert!(
-        d.contains("rule=transient no block (seq > 0) for 2s"),
-        "{d}"
-    );
+    assert!(d.contains("rule=transient no block (seq > 0) for 2s"), "{d}");
     assert!(!conns.contains("\tidle_timeout\t"), "{conns}");
-    assert!(
-        conns.lines().all(|l| l.split('\t').count() == 11),
-        "{conns}"
-    );
+    assert!(conns.lines().all(|l| l.split('\t').count() == 11), "{conns}");
     assert_eq!(gaps(&out), "");
     assert_eq!(recorded_seqs(&out), (300..=304).collect::<Vec<_>>());
     std::fs::remove_dir_all(&out).ok();

@@ -68,10 +68,37 @@ pub enum ErrClass {
 pub fn classify(code: i64, msg: &str) -> ErrClass {
     let m = msg.to_ascii_lowercase();
     let has = |p: &[&str]| p.iter().any(|x| m.contains(x));
-    if has(&["rate limit", "rate-limit", "ratelimit", "too many requests", "request limit", "capacity", "throughput", "credits", "compute units", "exceeded the quota"]) {
+    if has(&[
+        "rate limit",
+        "rate-limit",
+        "ratelimit",
+        "too many requests",
+        "request limit",
+        "capacity",
+        "throughput",
+        "credits",
+        "compute units",
+        "exceeded the quota",
+    ]) {
         return ErrClass::RateLimit;
     }
-    if has(&["too many results", "more than", "results", "block range", "range too", "range is too", "too large", "too big", "response size", "size exceeded", "limit exceeded", "exceed max", "query timeout", "timed out", "timeout"]) {
+    if has(&[
+        "too many results",
+        "more than",
+        "results",
+        "block range",
+        "range too",
+        "range is too",
+        "too large",
+        "too big",
+        "response size",
+        "size exceeded",
+        "limit exceeded",
+        "exceed max",
+        "query timeout",
+        "timed out",
+        "timeout",
+    ]) {
         return ErrClass::TooMuchData;
     }
     if code == -32005 || code == 429 {
@@ -250,7 +277,13 @@ impl Rpc {
     /// errors, non-2xx, malformed/incomplete responses, JSON-RPC rate-limit
     /// errors and whatever `check` rejects. Other per-call JSON-RPC errors are
     /// passed to `check`, which decides.
-    pub async fn call<F>(&self, calls: &[Call], what: &str, return_timeout: bool, check: F) -> Result<Vec<Item>, CallError>
+    pub async fn call<F>(
+        &self,
+        calls: &[Call],
+        what: &str,
+        return_timeout: bool,
+        check: F,
+    ) -> Result<Vec<Item>, CallError>
     where
         F: Fn(&[Item]) -> Check,
     {
@@ -314,11 +347,8 @@ impl Rpc {
             .await
             .map_err(|e| self.transport(e))?;
         let status = resp.status();
-        let retry_after = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
+        let retry_after =
+            resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(parse_retry_after);
         let bytes = resp.bytes().await.map_err(|e| self.transport(e))?;
         self.stats.update(|s| s.http_body_bytes += bytes.len() as u64);
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -335,10 +365,8 @@ impl Rpc {
             }
             Failure::Retry(r, None)
         })?;
-        if let Some(e) = items
-            .iter()
-            .filter_map(|i| i.error.as_ref())
-            .find(|e| classify(e.code, &e.message) == ErrClass::RateLimit)
+        if let Some(e) =
+            items.iter().filter_map(|i| i.error.as_ref()).find(|e| classify(e.code, &e.message) == ErrClass::RateLimit)
         {
             self.stats.update(|s| s.rpc_rate_limited += 1);
             return Err(Failure::Retry(format!("rpc rate limit: {} {}", e.code, e.message), None));
@@ -373,10 +401,13 @@ fn parse_batch(bytes: &[u8], calls: &[Call]) -> Result<Vec<Item>, String> {
         Err(_) => {
             // Some servers answer a whole batch with one error object.
             let one: Item = serde_json::from_slice(bytes)
-                .with_context(|| format!("unparseable response: {}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)])))
+                .with_context(|| {
+                    format!("unparseable response: {}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)]))
+                })
                 .map_err(|e| format!("{e:#}"))?;
             if let Some(e) = &one.error {
-                let kind = if classify(e.code, &e.message) == ErrClass::RateLimit { "rpc rate limit" } else { "batch error" };
+                let kind =
+                    if classify(e.code, &e.message) == ErrClass::RateLimit { "rpc rate limit" } else { "batch error" };
                 return Err(format!("{kind}: {} {}", e.code, e.message));
             }
             vec![one]
@@ -436,10 +467,8 @@ mod tests {
 
     #[test]
     fn batch_is_reordered_and_checked() {
-        let calls = vec![
-            Call { id: 10, method: "a", params: json!([]) },
-            Call { id: 11, method: "b", params: json!([]) },
-        ];
+        let calls =
+            vec![Call { id: 10, method: "a", params: json!([]) }, Call { id: 11, method: "b", params: json!([]) }];
         let r = br#"[{"jsonrpc":"2.0","id":11,"result":{"x":1}},{"jsonrpc":"2.0","id":10,"result":null}]"#;
         let v = parse_batch(r, &calls).unwrap();
         assert!(v[0].result.is_none());

@@ -20,6 +20,7 @@ in the ledger -> stop. 403 -> stop. Three transport errors in a row -> stop.
 Phase 1 rules: read-only RPC, no keys, no signing, no feed connections.
 Stdlib only; compression via the `zstd` CLI.
 """
+
 import argparse
 import datetime as dt
 import json
@@ -109,8 +110,11 @@ class Rpc:
                 time.sleep(wait)
             self.last = time.time()
             body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
-            req = urllib.request.Request(self.url, data=body, headers={
-                "Content-Type": "application/json", "User-Agent": UA, "Accept-Encoding": "identity"})
+            req = urllib.request.Request(
+                self.url,
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": UA, "Accept-Encoding": "identity"},
+            )
             param = params[0]
             try:
                 with urllib.request.urlopen(req, timeout=60) as r:
@@ -176,7 +180,7 @@ def main():
     a = ap.parse_args()
 
     out = a.out
-    base = out[:-len(".jsonl.zst")] if out.endswith(".jsonl.zst") else out
+    base = out[: -len(".jsonl.zst")] if out.endswith(".jsonl.zst") else out
     partial = base + ".jsonl.partial"
     index_path = base + ".index.tsv"
     ledger_path = base + ".calls.tsv"
@@ -263,14 +267,16 @@ def main():
             bad = None
             if len(rc) != len(txs):
                 bad = f"{len(rc)} receipts for {len(txs)} txs"
-            elif any(r.get("blockHash") != blk["hash"] or r.get("transactionHash") != t["hash"]
-                     for r, t in zip(rc, txs)):
+            elif any(
+                r.get("blockHash") != blk["hash"] or r.get("transactionHash") != t["hash"] for r, t in zip(rc, txs)
+            ):
                 bad = "receipt blockHash/txHash mismatch"
             rpc.log("receipts", "eth_getBlockReceipts", param, status, bad is None, bad or f"n={len(rc)}")
             if bad:
                 raise Stop(f"block {n}: {bad}")
-            line = json.dumps({"number": n, "block": blk, "receipts": rc},
-                              sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+            line = json.dumps(
+                {"number": n, "block": blk, "receipts": rc}, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode()
             pf.write(line + b"\n")
             pf.flush()
             os.fsync(pf.fileno())
@@ -281,8 +287,10 @@ def main():
                 if 3.0 < r < 15.0:
                     rate = r
             prev = (n, ts)
-            print(f"{iso(T)} block {n} ts+{ts - T}s tries={tries} txs={len(txs)} "
-                  f"calls={rpc.total} search={rpc.search}", flush=True)
+            print(
+                f"{iso(T)} block {n} ts+{ts - T}s tries={tries} txs={len(txs)} calls={rpc.total} search={rpc.search}",
+                flush=True,
+            )
     except Stop as e:
         stop_reason = str(e)
     except KeyboardInterrupt:

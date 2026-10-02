@@ -85,9 +85,11 @@ fn answer(b: &Behavior, call: &Value) -> Value {
             let t0 = f["topics"][0][0].clone();
             Value::Array(
                 (a..=z)
-                    .map(|n| json!({"blockNumber": format!("0x{n:x}"), "blockHash": block_hash(n),
+                    .map(|n| {
+                        json!({"blockNumber": format!("0x{n:x}"), "blockHash": block_hash(n),
                                     "logIndex": "0x0", "transactionIndex": "0x0", "transactionHash": tx_hash(n, 0),
-                                    "address": "0x02", "topics": [t0], "data": "0x", "removed": false}))
+                                    "address": "0x02", "topics": [t0], "data": "0x", "removed": false})
+                    })
                     .collect(),
             )
         }
@@ -110,11 +112,8 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
-    let len: usize = head
-        .lines()
-        .find_map(|l| l.strip_prefix("content-length:"))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
+    let len: usize =
+        head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap_or(0);
     while buf.len() < header_end + len {
         let n = sock.read(&mut tmp).await.ok()?;
         if n == 0 {

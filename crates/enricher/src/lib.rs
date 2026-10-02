@@ -120,7 +120,8 @@ pub fn make_rpc(a: &Args, stats: Arc<Stats>) -> Result<Rpc> {
         base: Duration::from_millis(a.backoff_ms.max(1)),
         ..RetryPolicy::default()
     };
-    Ok(Rpc::new(&a.rpc_url, a.rps, Duration::from_secs(a.timeout_secs.max(1)), policy, stats)?.with_max_calls(a.max_calls))
+    Ok(Rpc::new(&a.rpc_url, a.rps, Duration::from_secs(a.timeout_secs.max(1)), policy, stats)?
+        .with_max_calls(a.max_calls))
 }
 
 fn check_budget(a: &Args, blocks: u64) -> Result<()> {

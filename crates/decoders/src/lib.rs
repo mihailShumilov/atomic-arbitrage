@@ -74,15 +74,15 @@ pub struct RawLog<'a> {
 /// pool metadata (which currency is the meme token) and happens downstream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PoolSwap {
-    pub pool: Address,          // v3: pool address; v4: PoolManager address
-    pub pool_id: Option<B256>,  // v4 only
+    pub pool: Address,         // v3: pool address; v4: PoolManager address
+    pub pool_id: Option<B256>, // v4 only
     pub sender: Address,
     pub amount0: I256,
     pub amount1: I256,
     pub sqrt_price_x96: alloy_primitives::U256,
     pub liquidity: u128,
     pub tick: i32,
-    pub fee_pips: Option<u32>,  // v4 only (dynamic fee aware)
+    pub fee_pips: Option<u32>, // v4 only (dynamic fee aware)
 }
 
 pub fn decode_swap(log: &RawLog) -> Option<PoolSwap> {
@@ -128,14 +128,20 @@ mod tests {
         assert_eq!(TOPIC_SWAP_V3, b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"));
         assert_eq!(TOPIC_TRANSFER, b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"));
         assert_eq!(TOPIC_SWAP_V4, keccak256("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"));
-        assert_eq!(TOPIC_INITIALIZE_V4, keccak256("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)"));
+        assert_eq!(
+            TOPIC_INITIALIZE_V4,
+            keccak256("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)")
+        );
         // Arbitrum token bridge, OffchainLabs/token-bridge-contracts @ 0746a71321cdb2d6df6b15158c7ecbb9ece84b12
         // (2026-03-13), contracts/tokenbridge/arbitrum/gateway/L2ArbitrumGateway.sol; abi/arbitrum-token-bridge/SOURCE.md.
         // DepositFinalized: seen on chain in block 77312169, tx 0x8a448fd9b19c63c41c5f3045b08b38745ed7bf80dd5deb3a34a9218424c05d4a, log 4.
         assert_eq!(TOPIC_DEPOSIT_FINALIZED, b256!("c7f2e9c55c40a50fbc217dfc70cd39a222940dfa62145aa0ca49eb9535d4fcb2"));
         assert_eq!(TOPIC_DEPOSIT_FINALIZED, keccak256("DepositFinalized(address,address,address,uint256)"));
         // WithdrawalInitiated: not observed on chain yet (2026-10-01).
-        assert_eq!(TOPIC_WITHDRAWAL_INITIATED, b256!("3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73"));
+        assert_eq!(
+            TOPIC_WITHDRAWAL_INITIATED,
+            b256!("3073a74ecb728d10be779fe19a74a1428e20468f5b4d167bf9c73d9067847d73")
+        );
         assert_eq!(
             TOPIC_WITHDRAWAL_INITIATED,
             keccak256("WithdrawalInitiated(address,address,address,uint256,uint256,uint256)")

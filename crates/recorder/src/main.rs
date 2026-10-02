@@ -47,8 +47,7 @@ use tracing::{error, info, warn};
 
 use crate::backoff::{session_end_ns, startup_wait, Ladder, StartupWaitReason};
 use crate::net::{
-    now_ns, run_connection, stop_reason, stopped, tls_connector, ConnEvent, ConnLog, Sink,
-    SHUTDOWN_REASON,
+    now_ns, run_connection, stop_reason, stopped, tls_connector, ConnEvent, ConnLog, Sink, SHUTDOWN_REASON,
 };
 use crate::resume::{requested_seq, Backlog};
 use crate::route::Line;
@@ -136,9 +135,7 @@ async fn shutdown_signal() -> &'static str {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let args = Args::parse();
     fs::create_dir_all(&args.out_dir)?;
@@ -161,31 +158,13 @@ async fn main() -> Result<()> {
         torn_repairs = rec.repairs.len(), "recovery done"
     );
     for g in &rec.reconciled {
-        let detail = format!(
-            "{}..{} recv_ns={} missing from gaps.tsv, appended",
-            g.from, g.to, g.recv_ns
-        );
-        conn_log.event(ConnEvent {
-            event: "gap_reconciled",
-            reason: "startup",
-            detail: &detail,
-            ..Default::default()
-        });
+        let detail = format!("{}..{} recv_ns={} missing from gaps.tsv, appended", g.from, g.to, g.recv_ns);
+        conn_log.event(ConnEvent { event: "gap_reconciled", reason: "startup", detail: &detail, ..Default::default() });
     }
     for r in &rec.repairs {
-        let detail = format!(
-            "{} kept={} torn={} saved={}",
-            r.file.display(),
-            r.kept_bytes,
-            r.torn_bytes,
-            r.saved_to.display()
-        );
-        conn_log.event(ConnEvent {
-            event: "torn_repair",
-            reason: "startup",
-            detail: &detail,
-            ..Default::default()
-        });
+        let detail =
+            format!("{} kept={} torn={} saved={}", r.file.display(), r.kept_bytes, r.torn_bytes, r.saved_to.display());
+        conn_log.event(ConnEvent { event: "torn_repair", reason: "startup", detail: &detail, ..Default::default() });
     }
 
     let (tx, rx) = sync_channel::<Line>(200_000);
@@ -231,12 +210,7 @@ async fn main() -> Result<()> {
                     ladder.strikes = p.strikes;
                 }
                 let now = now_ns();
-                let wait = startup_wait(
-                    now,
-                    pending.map(|p| p.not_before_ns),
-                    session_end.map(|e| e.0),
-                    min_interval,
-                );
+                let wait = startup_wait(now, pending.map(|p| p.not_before_ns), session_end.map(|e| e.0), min_interval);
                 if let Some((wait, why)) = wait {
                     let strikes = pending.map_or(0, |p| p.strikes);
                     warn!(
@@ -327,11 +301,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 if let Some(c) = &end.client_close {
-                    let detail = format!(
-                        "sent close 1000, waited {} ms; {}",
-                        c.took.as_millis(),
-                        c.detail
-                    );
+                    let detail = format!("sent close 1000, waited {} ms; {}", c.took.as_millis(), c.detail);
                     conn_log.event(ConnEvent {
                         event: "client_close",
                         reason: c.reason,
@@ -345,8 +315,7 @@ async fn main() -> Result<()> {
                 if stop_reason(&stop).is_some() {
                     return;
                 }
-                let (pause, rule) =
-                    ladder.next_pause(end.kind, end.retry_after, end.session, rand01());
+                let (pause, rule) = ladder.next_pause(end.kind, end.retry_after, end.session, rand01());
                 warn!(
                     reason = end.kind.as_str(), http = ?end.http_status, retry_after = ?end.retry_after_raw,
                     session_s = end.session.as_secs_f64(), envelopes = end.envelopes,
@@ -382,10 +351,7 @@ async fn main() -> Result<()> {
             }
         };
         match &writer_failed {
-            None => info!(
-                signal = sig,
-                "shutting down: closing connection, draining queue, closing frame, fsync"
-            ),
+            None => info!(signal = sig, "shutting down: closing connection, draining queue, closing frame, fsync"),
             Some(e) => error!(
                 error = %e,
                 "writer failed: closing the connection (Close 1000), then exit 2"
@@ -401,10 +367,7 @@ async fn main() -> Result<()> {
         // the server's reply + 0.5 s for the stream shutdown). The outer bound
         // only guards against a bug; systemd gives us TimeoutStopSec=30.
         let _ = stop_tx.send(Some(close_reason));
-        if tokio::time::timeout(Duration::from_secs(5), &mut net)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout(Duration::from_secs(5), &mut net).await.is_err() {
             warn!("network loop did not stop in 5 s, dropping the connection");
         }
     }

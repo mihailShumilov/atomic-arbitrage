@@ -1,5 +1,5 @@
 # 018 — Форматирование и конфиги линтеров (задача A ревью 2026-10-02)
-status: ready
+status: done
 phase: 1a
 depends-on: —
 executor: indexer-engineer

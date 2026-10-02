@@ -111,10 +111,8 @@ pub struct BlocksOpts {
 pub async fn write_range(rpc: &Rpc, dir: &Path, r: Range, o: &BlocksOpts) -> Result<PathBuf> {
     let path = dir.join(file_name(r));
     let mut f = AtomicZstdFile::create(&path, 3)?;
-    let batches: Vec<(u64, u64)> = (r.from..=r.to)
-        .step_by(o.batch as usize)
-        .map(|s| (s, (s + o.batch - 1).min(r.to)))
-        .collect();
+    let batches: Vec<(u64, u64)> =
+        (r.from..=r.to).step_by(o.batch as usize).map(|s| (s, (s + o.batch - 1).min(r.to))).collect();
     info!(from = r.from, to = r.to, batches = batches.len(), file = %path.display(), "range start");
 
     // `buffered` keeps output in block order while fetching concurrently.

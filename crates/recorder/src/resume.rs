@@ -95,24 +95,13 @@ fn lag_ms(recv_ns: u128, ts: u64) -> i64 {
 
 impl Backlog {
     pub fn new(requested: Option<u64>, last_seq_before: Option<u64>) -> Self {
-        Self {
-            requested,
-            last_seq_before,
-            ..Default::default()
-        }
+        Self { requested, last_seq_before, ..Default::default() }
     }
 
     /// Feed one sequenced frame (`kind3_ts`: its newest kind-3
     /// header.timestamp, if any). Returns true exactly once, when this frame
     /// is the first live one and so ends the backlog.
-    pub fn observe(
-        &mut self,
-        recv_ns: u128,
-        seq_first: u64,
-        seq_max: u64,
-        kind3_ts: Option<u64>,
-        stale: bool,
-    ) -> bool {
+    pub fn observe(&mut self, recv_ns: u128, seq_first: u64, seq_max: u64, kind3_ts: Option<u64>, stale: bool) -> bool {
         if stale {
             self.stale_frames += 1;
         }
@@ -130,8 +119,7 @@ impl Backlog {
             self.live_seq = Some(seq_first);
             self.live_lag_ms = lag;
             let first = self.first_ns.unwrap_or(recv_ns);
-            self.live_after =
-                Duration::from_nanos(recv_ns.saturating_sub(first).min(u64::MAX as u128) as u64);
+            self.live_after = Duration::from_nanos(recv_ns.saturating_sub(first).min(u64::MAX as u128) as u64);
             return true;
         }
         self.blocks += seq_max.saturating_sub(seq_first) + 1;
@@ -177,17 +165,11 @@ mod tests {
 
     #[test]
     fn requested_from_last_seq() {
-        assert_eq!(
-            requested_seq(Some(76_661_958), true),
-            (Some(76_661_959), ResumeMode::Header)
-        );
+        assert_eq!(requested_seq(Some(76_661_958), true), (Some(76_661_959), ResumeMode::Header));
         assert_eq!(requested_seq(None, true), (None, ResumeMode::NoData));
         assert_eq!(requested_seq(Some(5), false), (None, ResumeMode::Disabled));
         assert_eq!(requested_seq(None, false), (None, ResumeMode::Disabled));
-        assert_eq!(
-            requested_seq(Some(u64::MAX), true),
-            (None, ResumeMode::NoData)
-        );
+        assert_eq!(requested_seq(Some(u64::MAX), true), (None, ResumeMode::NoData));
         assert_eq!(ResumeMode::Header.as_str(), "header");
     }
 
@@ -206,30 +188,15 @@ mod tests {
             // a 99 ms pause after 6 blocks must not end the backlog
             recv += if i == 6 { 99 * MS } else { MS };
             let ts = ts0 + i / 11;
-            assert!(
-                !b.observe(recv, 77_169_713 + i, 77_169_713 + i, Some(ts), false),
-                "i={i}"
-            );
+            assert!(!b.observe(recv, 77_169_713 + i, 77_169_713 + i, Some(ts), false), "i={i}");
         }
         // Delayed message with an old timestamp: still backlog.
         recv += MS;
         assert!(!b.observe(recv, 77_170_343, 77_170_343, None, false));
         // Live: lag 1.4 s.
         let live_recv = 1_790_837_153 * SEC + 420 * MS;
-        assert!(b.observe(
-            live_recv,
-            77_170_344,
-            77_170_344,
-            Some(1_790_837_152),
-            false
-        ));
-        assert!(!b.observe(
-            live_recv + 113 * MS,
-            77_170_345,
-            77_170_345,
-            Some(1_790_837_152),
-            false
-        ));
+        assert!(b.observe(live_recv, 77_170_344, 77_170_344, Some(1_790_837_152), false));
+        assert!(!b.observe(live_recv + 113 * MS, 77_170_345, 77_170_345, Some(1_790_837_152), false));
         assert!(b.done);
         assert_eq!(b.first_seq, Some(77_169_713));
         assert_eq!(b.first_lag_ms, Some(63_631));
@@ -320,12 +287,7 @@ mod tests {
         b.observe(100 * SEC + MS, 8, 8, None, false);
         assert!(!b.done);
         let d = b.detail();
-        assert!(
-            d.contains(
-                "backlog_blocks=2 backlog_end_seq=8 live_seq=- live_lag_ms=- live_after_ms=0"
-            ),
-            "{d}"
-        );
+        assert!(d.contains("backlog_blocks=2 backlog_end_seq=8 live_seq=- live_lag_ms=- live_after_ms=0"), "{d}");
         assert!(d.ends_with("complete=false"), "{d}");
     }
 }

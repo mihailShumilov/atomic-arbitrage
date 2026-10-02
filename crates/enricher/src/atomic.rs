@@ -129,11 +129,8 @@ fn remove_partials(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Append one line to a small state file and fsync it.
 pub fn append_line_synced(path: &Path, line: &str) -> Result<()> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let mut f =
+        OpenOptions::new().create(true).append(true).open(path).with_context(|| format!("open {}", path.display()))?;
     f.write_all(line.as_bytes())?;
     f.write_all(b"\n")?;
     f.sync_all()?;

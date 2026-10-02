@@ -128,10 +128,7 @@ impl Ladder {
         match kind {
             EndKind::RateLimited => {
                 let out = match retry_after {
-                    Some(ra) => (
-                        ra.clamp(Duration::from_secs(1), RETRY_AFTER_MAX),
-                        Rule::RetryAfter,
-                    ),
+                    Some(ra) => (ra.clamp(Duration::from_secs(1), RETRY_AFTER_MAX), Rule::RetryAfter),
                     None => (doubled(BASE_429, self.strikes, LADDER_CAP), Rule::Ladder429),
                 };
                 self.strikes = self.strikes.saturating_add(1);
@@ -142,9 +139,7 @@ impl Ladder {
                 self.strikes = self.strikes.saturating_add(1);
                 match retry_after {
                     // Never shorter than the ladder, but respect a longer hint.
-                    Some(ra) if ra.min(RETRY_AFTER_MAX) > ladder => {
-                        (ra.min(RETRY_AFTER_MAX), Rule::RetryAfter)
-                    }
+                    Some(ra) if ra.min(RETRY_AFTER_MAX) > ladder => (ra.min(RETRY_AFTER_MAX), Rule::RetryAfter),
                     _ => (ladder, Rule::Ladder403),
                 }
             }
@@ -159,11 +154,7 @@ impl Ladder {
             // the stall persists across reconnects, 1..5 s pauses would mean
             // ~100 connects an hour. A session >= RESET_AFTER (blocks flowed
             // for 10 min before the stall) still starts it from the bottom.
-            EndKind::ServerClosed
-            | EndKind::Idle
-            | EndKind::BlockIdle
-            | EndKind::HttpError
-            | EndKind::NetError => {
+            EndKind::ServerClosed | EndKind::Idle | EndKind::BlockIdle | EndKind::HttpError | EndKind::NetError => {
                 let base = doubled(TRANSIENT_BASE, self.transient, TRANSIENT_CAP);
                 self.transient = self.transient.saturating_add(1);
                 // +-20 % jitter, still capped.
@@ -260,13 +251,9 @@ pub fn startup_wait(
     session_end_ns: Option<u128>,
     min_interval: Duration,
 ) -> Option<(Duration, StartupWaitReason)> {
-    let left = |until: u128| {
-        Duration::from_nanos(until.saturating_sub(now_ns).min(u64::MAX as u128) as u64)
-    };
+    let left = |until: u128| Duration::from_nanos(until.saturating_sub(now_ns).min(u64::MAX as u128) as u64);
     let pending = pending_until_ns.map(left).unwrap_or_default();
-    let interval = session_end_ns
-        .map(|t| left(t.saturating_add(min_interval.as_nanos())))
-        .unwrap_or_default();
+    let interval = session_end_ns.map(|t| left(t.saturating_add(min_interval.as_nanos()))).unwrap_or_default();
     match (pending.is_zero(), interval.is_zero()) {
         (true, true) => None,
         _ if pending >= interval => Some((pending, StartupWaitReason::PendingPause)),
@@ -282,9 +269,7 @@ pub fn parse_retry_after(v: &str, now_unix: i64) -> Option<Duration> {
         return Some(Duration::from_secs(secs));
     }
     let when = chrono::DateTime::parse_from_rfc2822(v).ok()?.timestamp();
-    Some(Duration::from_secs(
-        when.saturating_sub(now_unix).max(0) as u64
-    ))
+    Some(Duration::from_secs(when.saturating_sub(now_unix).max(0) as u64))
 }
 
 #[cfg(test)]
@@ -314,10 +299,7 @@ mod tests {
         assert_eq!(startup_wait(now, None, Some(now - 120 * SEC), min), None);
         assert_eq!(startup_wait(now, None, None, min), None);
         // Interval disabled.
-        assert_eq!(
-            startup_wait(now, None, Some(now - SEC), Duration::ZERO),
-            None
-        );
+        assert_eq!(startup_wait(now, None, Some(now - SEC), Duration::ZERO), None);
         // Clock went backwards (connected "in the future"): wait at most the interval.
         let (w, _) = startup_wait(now, None, Some(now + 5 * SEC), min).unwrap();
         assert_eq!(w, Duration::from_secs(125));
@@ -329,25 +311,13 @@ mod tests {
         let min = Duration::from_secs(120);
         // Ban pause (3600 s from 10 s ago) beats the interval.
         let (w, r) = startup_wait(now, Some(now + 3590 * SEC), Some(now - 11 * SEC), min).unwrap();
-        assert_eq!(
-            (w, r),
-            (Duration::from_secs(3590), StartupWaitReason::PendingPause)
-        );
+        assert_eq!((w, r), (Duration::from_secs(3590), StartupWaitReason::PendingPause));
         // Short pause already over, interval still running.
         let (w, r) = startup_wait(now, Some(now - SEC), Some(now - 100 * SEC), min).unwrap();
-        assert_eq!(
-            (w, r),
-            (
-                Duration::from_secs(20),
-                StartupWaitReason::MinConnectInterval
-            )
-        );
+        assert_eq!((w, r), (Duration::from_secs(20), StartupWaitReason::MinConnectInterval));
         // Pause still running, no connect in the log.
         let (w, r) = startup_wait(now, Some(now + 3 * SEC), None, min).unwrap();
-        assert_eq!(
-            (w, r),
-            (Duration::from_secs(3), StartupWaitReason::PendingPause)
-        );
+        assert_eq!((w, r), (Duration::from_secs(3), StartupWaitReason::PendingPause));
     }
 
     /// Task 012 item 1, case 1: the previous session ended cleanly (rows
@@ -372,21 +342,11 @@ mod tests {
         assert_eq!(log.connected_ns, now - 630 * SEC);
         assert_eq!(log.last_row_ns, Some(now - 30 * SEC));
         // Data mtime at the final commit, a few ms before the client_close row.
-        let (end, src) = session_end_ns(
-            Some(log.connected_ns),
-            log.last_row_ns,
-            Some(now - 30 * SEC - 5_000_000),
-        )
-        .unwrap();
+        let (end, src) =
+            session_end_ns(Some(log.connected_ns), log.last_row_ns, Some(now - 30 * SEC - 5_000_000)).unwrap();
         assert_eq!((end, src), (now - 30 * SEC, SessionEndSource::LogRow));
         let (w, r) = startup_wait(now, None, Some(end), min).unwrap();
-        assert_eq!(
-            (w, r),
-            (
-                Duration::from_secs(90),
-                StartupWaitReason::MinConnectInterval
-            )
-        );
+        assert_eq!((w, r), (Duration::from_secs(90), StartupWaitReason::MinConnectInterval));
         // Ended more than the interval ago: no wait.
         let (end, _) = session_end_ns(Some(now - 900 * SEC), Some(now - 121 * SEC), None).unwrap();
         assert_eq!(startup_wait(now, None, Some(end), min), None);
@@ -407,22 +367,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(log.last_row_ns, None);
-        let (end, src) = session_end_ns(
-            Some(log.connected_ns),
-            log.last_row_ns,
-            Some(now - 40 * SEC),
-        )
-        .unwrap();
+        let (end, src) = session_end_ns(Some(log.connected_ns), log.last_row_ns, Some(now - 40 * SEC)).unwrap();
         assert_eq!((end, src), (now - 40 * SEC, SessionEndSource::DataMtime));
         let (w, _) = startup_wait(now, None, Some(end), min).unwrap();
         assert_eq!(w, Duration::from_secs(80));
         // Early backlog row, data written much later.
-        let (end, src) = session_end_ns(
-            Some(now - 600 * SEC),
-            Some(now - 599 * SEC),
-            Some(now - 10 * SEC),
-        )
-        .unwrap();
+        let (end, src) = session_end_ns(Some(now - 600 * SEC), Some(now - 599 * SEC), Some(now - 10 * SEC)).unwrap();
         assert_eq!((end, src), (now - 10 * SEC, SessionEndSource::DataMtime));
         // No data at all (connected, killed before the first commit): the
         // connected row is the best we have.
@@ -450,50 +400,31 @@ mod tests {
             now - 99 * SEC
         ))
         .unwrap();
-        let pause_row = format!(
-            "x\t{}\tdisconnected\tforbidden\t403\t-\t900.000\t0.000\t0\t1\tupgrade",
-            now - 100 * SEC
-        );
+        let pause_row =
+            format!("x\t{}\tdisconnected\tforbidden\t403\t-\t900.000\t0.000\t0\t1\tupgrade", now - 100 * SEC);
         let pending = crate::net::parse_pause_row(&pause_row).unwrap();
         let (end, _) = session_end_ns(Some(log.connected_ns), log.last_row_ns, None).unwrap();
         assert_eq!(end, now - 99 * SEC);
         let (w, r) = startup_wait(now, Some(pending.not_before_ns), Some(end), min).unwrap();
-        assert_eq!(
-            (w, r),
-            (Duration::from_secs(800), StartupWaitReason::PendingPause)
-        );
+        assert_eq!((w, r), (Duration::from_secs(800), StartupWaitReason::PendingPause));
         // Short pause (3 s, from 1 s ago) vs. a session that ended 1 s ago:
         // the interval (119 s) wins.
         let (w, r) = startup_wait(now, Some(now + 2 * SEC), Some(now - SEC), min).unwrap();
-        assert_eq!(
-            (w, r),
-            (
-                Duration::from_secs(119),
-                StartupWaitReason::MinConnectInterval
-            )
-        );
+        assert_eq!((w, r), (Duration::from_secs(119), StartupWaitReason::MinConnectInterval));
     }
 
     #[test]
     fn ladder_429_without_retry_after() {
         let mut l = Ladder::default();
-        let got: Vec<u64> = (0..7)
-            .map(|_| {
-                l.next_pause(EndKind::RateLimited, None, S0, 0.5)
-                    .0
-                    .as_secs()
-                    / 60
-            })
-            .collect();
+        let got: Vec<u64> =
+            (0..7).map(|_| l.next_pause(EndKind::RateLimited, None, S0, 0.5).0.as_secs() / 60).collect();
         assert_eq!(got, vec![5, 10, 20, 40, 60, 60, 60]);
     }
 
     #[test]
     fn ladder_403_starts_at_15() {
         let mut l = Ladder::default();
-        let got: Vec<u64> = (0..5)
-            .map(|_| l.next_pause(EndKind::Forbidden, None, S0, 0.5).0.as_secs() / 60)
-            .collect();
+        let got: Vec<u64> = (0..5).map(|_| l.next_pause(EndKind::Forbidden, None, S0, 0.5).0.as_secs() / 60).collect();
         assert_eq!(got, vec![15, 30, 60, 60, 60]);
     }
 
@@ -506,30 +437,16 @@ mod tests {
         let (p, _) = l.next_pause(EndKind::RateLimited, None, S0, 0.1);
         assert_eq!(p, minutes(10));
         // Absurd values are capped.
-        let (p, _) = l.next_pause(
-            EndKind::RateLimited,
-            Some(Duration::from_secs(10_000_000)),
-            S0,
-            0.1,
-        );
+        let (p, _) = l.next_pause(EndKind::RateLimited, Some(Duration::from_secs(10_000_000)), S0, 0.1);
         assert_eq!(p, RETRY_AFTER_MAX);
     }
 
     #[test]
     fn mixed_429_and_403_share_strikes() {
         let mut l = Ladder::default();
-        assert_eq!(
-            l.next_pause(EndKind::RateLimited, None, S0, 0.0).0,
-            minutes(5)
-        );
-        assert_eq!(
-            l.next_pause(EndKind::Forbidden, None, S0, 0.0).0,
-            minutes(30)
-        );
-        assert_eq!(
-            l.next_pause(EndKind::RateLimited, None, S0, 0.0).0,
-            minutes(20)
-        );
+        assert_eq!(l.next_pause(EndKind::RateLimited, None, S0, 0.0).0, minutes(5));
+        assert_eq!(l.next_pause(EndKind::Forbidden, None, S0, 0.0).0, minutes(30));
+        assert_eq!(l.next_pause(EndKind::RateLimited, None, S0, 0.0).0, minutes(20));
     }
 
     #[test]
@@ -541,17 +458,11 @@ mod tests {
         // 9 min session: no reset, normal close gives jitter but keeps strikes.
         let (p, r) = l.next_pause(EndKind::ServerClosed, None, minutes(9), 0.0);
         assert_eq!((p, r), (Duration::from_secs(1), Rule::NormalJitter));
-        assert_eq!(
-            l.next_pause(EndKind::RateLimited, None, S0, 0.0).0,
-            minutes(40)
-        );
+        assert_eq!(l.next_pause(EndKind::RateLimited, None, S0, 0.0).0, minutes(40));
         // 10 min session resets.
         l.next_pause(EndKind::ServerClosed, None, minutes(10), 0.0);
         assert_eq!(l.strikes, 0);
-        assert_eq!(
-            l.next_pause(EndKind::RateLimited, None, S0, 0.0).0,
-            minutes(5)
-        );
+        assert_eq!(l.next_pause(EndKind::RateLimited, None, S0, 0.0).0, minutes(5));
     }
 
     #[test]
@@ -561,10 +472,7 @@ mod tests {
             let r = i as f64 / 100.0;
             let (p, rule) = l.next_pause(EndKind::ServerClosed, None, minutes(1), r);
             assert_eq!(rule, Rule::NormalJitter);
-            assert!(
-                p >= Duration::from_secs(1) && p < Duration::from_secs(5),
-                "{p:?}"
-            );
+            assert!(p >= Duration::from_secs(1) && p < Duration::from_secs(5), "{p:?}");
         }
         let (p, _) = l.next_pause(EndKind::Idle, None, minutes(1), 0.999);
         assert!(p < Duration::from_secs(5));
@@ -573,9 +481,7 @@ mod tests {
     #[test]
     fn flapping_and_net_errors_use_transient_ladder() {
         let mut l = Ladder::default();
-        let got: Vec<u64> = (0..9)
-            .map(|_| l.next_pause(EndKind::NetError, None, S0, 0.5).0.as_secs())
-            .collect();
+        let got: Vec<u64> = (0..9).map(|_| l.next_pause(EndKind::NetError, None, S0, 0.5).0.as_secs()).collect();
         assert_eq!(got, vec![5, 10, 20, 40, 80, 160, 300, 300, 300]);
         // A healthy session clears it.
         l.next_pause(EndKind::ServerClosed, None, minutes(2), 0.5);
@@ -618,19 +524,10 @@ mod tests {
 
     #[test]
     fn retry_after_parsing() {
-        assert_eq!(
-            parse_retry_after(" 120 ", 0),
-            Some(Duration::from_secs(120))
-        );
+        assert_eq!(parse_retry_after(" 120 ", 0), Some(Duration::from_secs(120)));
         // Sun, 06 Nov 1994 08:49:37 GMT = 784111777
-        assert_eq!(
-            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 - 30),
-            Some(Duration::from_secs(30))
-        );
-        assert_eq!(
-            parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 + 30),
-            Some(Duration::ZERO)
-        );
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 - 30), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 + 30), Some(Duration::ZERO));
         assert_eq!(parse_retry_after("soon", 0), None);
     }
 }

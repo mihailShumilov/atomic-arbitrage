@@ -10,8 +10,22 @@ use common::{scratch, start, Behavior};
 
 fn spawn(url: &str, out: &std::path::Path, from: u64, to: u64) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_enricher"))
-        .args(["--rpc-url", url, "--from", &from.to_string(), "--to", &to.to_string(), "--batch", "5",
-               "--concurrency", "1", "--rps", "0", "--out-dir", out.to_str().unwrap()])
+        .args([
+            "--rpc-url",
+            url,
+            "--from",
+            &from.to_string(),
+            "--to",
+            &to.to_string(),
+            "--batch",
+            "5",
+            "--concurrency",
+            "1",
+            "--rps",
+            "0",
+            "--out-dir",
+            out.to_str().unwrap(),
+        ])
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

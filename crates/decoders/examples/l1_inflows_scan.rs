@@ -134,15 +134,37 @@ fn main() -> Result<()> {
     }
 
     let c = &total;
-    println!("== total: {} files, blocks={} (range {}..{}), txs={}", files.len(), c.blocks, min_block, max_block, c.txs);
+    println!(
+        "== total: {} files, blocks={} (range {}..{}), txs={}",
+        files.len(),
+        c.blocks,
+        min_block,
+        max_block,
+        c.txs
+    );
     println!("registry: {} entries", registry.len());
     for e in registry.entries() {
-        println!("  gateway {:#x} token {} {}", e.gateway, opt(e.l2_token.map(|a| format!("{a:#x}"))), e.status.as_str());
+        println!(
+            "  gateway {:#x} token {} {}",
+            e.gateway,
+            opt(e.l2_token.map(|a| format!("{a:#x}"))),
+            e.status.as_str()
+        );
     }
     let types: Vec<String> = c.tx_types.iter().map(|(k, v)| format!("0x{k:02x}={v}")).collect();
     println!("tx types: {}", types.join(" "));
-    println!("rows  eth_deposit(0x64)   n={} sum={} ETH ({} wei)", c.deposit_rows.n, eth(c.deposit_rows.sum), c.deposit_rows.sum);
-    println!("rows  retry_eth(0x68)     n={} sum={} ETH ({} wei)", c.retry_eth_rows.n, eth(c.retry_eth_rows.sum), c.retry_eth_rows.sum);
+    println!(
+        "rows  eth_deposit(0x64)   n={} sum={} ETH ({} wei)",
+        c.deposit_rows.n,
+        eth(c.deposit_rows.sum),
+        c.deposit_rows.sum
+    );
+    println!(
+        "rows  retry_eth(0x68)     n={} sum={} ETH ({} wei)",
+        c.retry_eth_rows.n,
+        eth(c.retry_eth_rows.sum),
+        c.retry_eth_rows.sum
+    );
     println!("rows  token registered    n={} sum_raw={}", c.token_rows_registered.n, c.token_rows_registered.sum);
     println!("rows  token unregistered  n={} sum_raw={}", c.token_rows_unregistered.n, c.token_rows_unregistered.sum);
     println!(

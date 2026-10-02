@@ -35,9 +35,24 @@ async fn max_calls_exhausted_exits_75_and_keeps_finished_files() {
     // committed, the second runs out.
     std::fs::write(&gaps, "100\t103\t1\n200\t203\t2\n").unwrap();
     let stats = d.join("stats.json");
-    let (code, err) = run_bin(&["--rpc-url", &m.url, "--gaps", gaps.to_str().unwrap(), "--rps", "0", "--batch", "2",
-                                "--concurrency", "1", "--max-calls", "12", "--out-dir", out.to_str().unwrap(),
-                                "--stats-json", stats.to_str().unwrap()]);
+    let (code, err) = run_bin(&[
+        "--rpc-url",
+        &m.url,
+        "--gaps",
+        gaps.to_str().unwrap(),
+        "--rps",
+        "0",
+        "--batch",
+        "2",
+        "--concurrency",
+        "1",
+        "--max-calls",
+        "12",
+        "--out-dir",
+        out.to_str().unwrap(),
+        "--stats-json",
+        stats.to_str().unwrap(),
+    ]);
     assert_eq!(code, Some(75), "{err}");
     assert!(err.contains("call budget exhausted"), "{err}");
     assert!(out.join("blocks-100-103.jsonl.zst").exists());
@@ -53,12 +68,32 @@ async fn other_errors_still_exit_1() {
     // Retries exhausted (HTTP 429 forever, 1 attempt): not the budget.
     let m = start(Behavior { always_429: true, ..Default::default() }).await;
     let d = scratch("exit1");
-    let (code, err) = run_bin(&["--rpc-url", &m.url, "--from", "1", "--to", "2", "--rps", "0", "--max-attempts", "1",
-                                "--max-calls", "100", "--out-dir", d.join("blocks").to_str().unwrap()]);
+    let (code, err) = run_bin(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "1",
+        "--to",
+        "2",
+        "--rps",
+        "0",
+        "--max-attempts",
+        "1",
+        "--max-calls",
+        "100",
+        "--out-dir",
+        d.join("blocks").to_str().unwrap(),
+    ]);
     assert_eq!(code, Some(1), "{err}");
     assert!(err.contains("giving up after 1 attempts"), "{err}");
     // Missing gaps file.
-    let (code, err) = run_bin(&["--rpc-url", "http://127.0.0.1:9", "--gaps", d.join("nope.tsv").to_str().unwrap(),
-                                "--out-dir", d.join("b2").to_str().unwrap()]);
+    let (code, err) = run_bin(&[
+        "--rpc-url",
+        "http://127.0.0.1:9",
+        "--gaps",
+        d.join("nope.tsv").to_str().unwrap(),
+        "--out-dir",
+        d.join("b2").to_str().unwrap(),
+    ]);
     assert_eq!(code, Some(1), "{err}");
 }

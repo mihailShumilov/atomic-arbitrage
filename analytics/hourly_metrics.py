@@ -19,6 +19,7 @@ Definitions (task 006 + data-auditor 006, M1-M3):
                  enricher's raw counter); line_zstd3 = the whole line compressed alone
                  with `zstd -3` (no cross-block context, see report for calibration)
 """
+
 import argparse
 import datetime as dt
 import json
@@ -33,12 +34,38 @@ L2_TYPES = {"0x0", "0x1", "0x2", "0x3", "0x4"}
 L1_TYPES = {"0x64", "0x65", "0x66", "0x67", "0x68", "0x69", "0x78"}
 WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-COLS = ["hour_start_utc", "date", "weekday", "hour", "block", "ts", "offset_s",
-        "n_tx", "n_sys", "n_user", "n_l2", "n_l1", "n_other",
-        "reverts", "reverts_l2", "reverts_l1",
-        "swap_v3", "swap_v4", "swap_logs", "tx_with_swap",
-        "gas_used", "base_fee_wei", "n_l1gas_pos", "fee_median_wei", "fee_sum_wei",
-        "block_raw_b", "receipts_raw_b", "line_raw_b", "line_zstd3_b", "size_field"]
+COLS = [
+    "hour_start_utc",
+    "date",
+    "weekday",
+    "hour",
+    "block",
+    "ts",
+    "offset_s",
+    "n_tx",
+    "n_sys",
+    "n_user",
+    "n_l2",
+    "n_l1",
+    "n_other",
+    "reverts",
+    "reverts_l2",
+    "reverts_l1",
+    "swap_v3",
+    "swap_v4",
+    "swap_logs",
+    "tx_with_swap",
+    "gas_used",
+    "base_fee_wei",
+    "n_l1gas_pos",
+    "fee_median_wei",
+    "fee_sum_wei",
+    "block_raw_b",
+    "receipts_raw_b",
+    "line_raw_b",
+    "line_zstd3_b",
+    "size_field",
+]
 
 
 def dumps(o):
@@ -58,10 +85,19 @@ def metrics(line, hour_start=None):
     hs = hour_start if hour_start is not None else ts - ts % 3600
     d = dt.datetime.fromtimestamp(hs, dt.timezone.utc)
     m = dict.fromkeys(COLS, 0)
-    m.update(hour_start_utc=d.strftime("%Y-%m-%dT%H:%M:%SZ"), date=d.strftime("%Y-%m-%d"),
-             weekday=WD[d.weekday()], hour=d.hour, block=o["number"], ts=ts, offset_s=ts - hs,
-             n_tx=len(txs), gas_used=int(b["gasUsed"], 16),
-             base_fee_wei=int(b.get("baseFeePerGas", "0x0"), 16), size_field=int(b.get("size", "0x0"), 16))
+    m.update(
+        hour_start_utc=d.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        date=d.strftime("%Y-%m-%d"),
+        weekday=WD[d.weekday()],
+        hour=d.hour,
+        block=o["number"],
+        ts=ts,
+        offset_s=ts - hs,
+        n_tx=len(txs),
+        gas_used=int(b["gasUsed"], 16),
+        base_fee_wei=int(b.get("baseFeePerGas", "0x0"), 16),
+        size_field=int(b.get("size", "0x0"), 16),
+    )
     fees = []
     for t, r in zip(txs, rc):
         assert t["hash"] == r["transactionHash"]

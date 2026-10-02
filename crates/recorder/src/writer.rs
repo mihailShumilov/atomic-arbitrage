@@ -50,10 +50,7 @@ fn sync_dir(dir: &Path) {
 /// Atomically replace `path` with `contents`: tmp file, fsync, rename, fsync dir.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
-    ));
+    let tmp = dir.join(format!(".{}.tmp", path.file_name().and_then(|n| n.to_str()).unwrap_or("state")));
     {
         let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(contents.as_bytes())?;
@@ -65,11 +62,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
 }
 
 pub fn read_state(out: &Path) -> Option<u64> {
-    fs::read_to_string(out.join(STATE_FILE))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    fs::read_to_string(out.join(STATE_FILE)).ok()?.trim().parse().ok()
 }
 
 // --------------------------------------------------------------- recovery ---
@@ -113,8 +106,7 @@ pub fn repair_torn(path: &Path, torn_dir: &Path, stamp: &str) -> Result<Option<T
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("feed");
     let saved_to = torn_dir.join(format!("{name}.at{keep}.{stamp}.torn"));
     {
-        let mut f =
-            File::create(&saved_to).with_context(|| format!("create {}", saved_to.display()))?;
+        let mut f = File::create(&saved_to).with_context(|| format!("create {}", saved_to.display()))?;
         f.write_all(&data[keep..])?;
         f.sync_all()?;
     }
@@ -188,10 +180,7 @@ pub fn max_seq_in_file(path: &Path) -> Result<Option<u64>> {
         let _recv = cols.next();
         let _first = cols.next();
         let Some(last) = cols.next() else { continue };
-        let Some(s) = std::str::from_utf8(last)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-        else {
+        let Some(s) = std::str::from_utf8(last).ok().and_then(|s| s.parse::<u64>().ok()) else {
             continue;
         };
         if s > 0 {
@@ -227,11 +216,7 @@ pub fn read_gap_ranges(out: &Path) -> Vec<(u64, u64)> {
 
 /// Parts of `[from, to]` not covered by any of `listed`.
 fn uncovered(from: u64, to: u64, listed: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut iv: Vec<(u64, u64)> = listed
-        .iter()
-        .copied()
-        .filter(|&(f, t)| f <= t && t >= from && f <= to)
-        .collect();
+    let mut iv: Vec<(u64, u64)> = listed.iter().copied().filter(|&(f, t)| f <= t && t >= from && f <= to).collect();
     iv.sort_unstable();
     let mut out = Vec::new();
     let mut cur = from;
@@ -259,11 +244,7 @@ fn uncovered(from: u64, to: u64, listed: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// lines of one hourly file, continuing from `last` (highest seq seen before
 /// this file). Holes found are appended to `holes`. Returns the highest seq in
 /// the file. An empty file is fine (cut back to zero after a crash).
-pub fn scan_seq_holes(
-    path: &Path,
-    last: &mut Option<u64>,
-    holes: &mut Vec<GapRow>,
-) -> Result<Option<u64>> {
+pub fn scan_seq_holes(path: &Path, last: &mut Option<u64>, holes: &mut Vec<GapRow>) -> Result<Option<u64>> {
     let f = File::open(path)?;
     if f.metadata()?.len() == 0 {
         return Ok(None);
@@ -274,9 +255,7 @@ pub fn scan_seq_holes(
         let line = line.with_context(|| format!("read {}", path.display()))?;
         let mut cols = line.splitn(4, |&b| b == b'\t');
         let num = |c: Option<&[u8]>| -> Option<u128> { std::str::from_utf8(c?).ok()?.parse().ok() };
-        let (Some(recv_ns), Some(first), Some(lastc)) =
-            (num(cols.next()), num(cols.next()), num(cols.next()))
-        else {
+        let (Some(recv_ns), Some(first), Some(lastc)) = (num(cols.next()), num(cols.next()), num(cols.next())) else {
             continue;
         };
         let (first, lastc) = (first as u64, lastc as u64);
@@ -302,19 +281,11 @@ pub fn scan_seq_holes(
             continue; // the writer skips such lines; they are never on disk
         }
         if let Some(g) = detect_gap(*last, first) {
-            holes.push(GapRow {
-                from: g.from,
-                to: g.to,
-                recv_ns,
-            });
+            holes.push(GapRow { from: g.from, to: g.to, recv_ns });
         }
         for g in intra {
             if last.is_none_or(|s| g.to > s) {
-                holes.push(GapRow {
-                    from: g.from,
-                    to: g.to,
-                    recv_ns,
-                });
+                holes.push(GapRow { from: g.from, to: g.to, recv_ns });
             }
         }
         *last = Some(last.map_or(seq_max, |s| s.max(seq_max)));
@@ -331,11 +302,7 @@ pub fn reconcile_gaps(out: &Path, holes: &[GapRow]) -> Result<Vec<GapRow>> {
     let mut missing = Vec::new();
     for h in holes {
         for (from, to) in uncovered(h.from, h.to, &listed) {
-            missing.push(GapRow {
-                from,
-                to,
-                recv_ns: h.recv_ns,
-            });
+            missing.push(GapRow { from, to, recv_ns: h.recv_ns });
         }
     }
     if !missing.is_empty() {
@@ -371,10 +338,7 @@ pub fn recover(out: &Path) -> Result<Recovery> {
     let files = list_feed_files(out);
     let torn_dir = out.join(TORN_DIR);
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let mut rec = Recovery {
-        state_seq: read_state(out),
-        ..Default::default()
-    };
+    let mut rec = Recovery { state_seq: read_state(out), ..Default::default() };
     for f in files.iter().rev().take(2) {
         if let Some(r) = repair_torn(f, &torn_dir, &stamp)? {
             warn!(
@@ -410,20 +374,11 @@ pub fn recover(out: &Path) -> Result<Recovery> {
     rec.data_seq = recent_max.or(seam);
     rec.reconciled = reconcile_gaps(out, &holes)?;
     for g in &rec.reconciled {
-        warn!(
-            from = g.from,
-            to = g.to,
-            recv_ns = g.recv_ns as u64,
-            "hole in data was missing from gaps.tsv, appended"
-        );
+        warn!(from = g.from, to = g.to, recv_ns = g.recv_ns as u64, "hole in data was missing from gaps.tsv, appended");
     }
     rec.resume_seq = match (rec.data_seq, rec.state_seq) {
         (Some(d), Some(s)) if d != s => {
-            warn!(
-                data = d,
-                state = s,
-                "last_seq.txt disagrees with data, using data"
-            );
+            warn!(data = d, state = s, "last_seq.txt disagrees with data, using data");
             Some(d)
         }
         (Some(d), _) => Some(d),
@@ -499,9 +454,7 @@ impl FeedWriter {
     }
 
     fn path_for(&self, t: DateTime<Utc>) -> PathBuf {
-        self.root
-            .join(t.format("%Y/%m/%d").to_string())
-            .join(format!("feed-{}.tsv.zst", t.format("%Y%m%d-%H")))
+        self.root.join(t.format("%Y/%m/%d").to_string()).join(format!("feed-{}.tsv.zst", t.format("%Y%m%d-%H")))
     }
 
     fn ensure_hour(&mut self, t: DateTime<Utc>) -> Result<()> {
@@ -523,19 +476,14 @@ impl FeedWriter {
             .with_context(|| format!("open {}", path.display()))?;
         sync_dir(dir);
         info!(file = %path.display(), "writing");
-        self.cur = Some(HourFile {
-            key,
-            slot: Slot::Idle(file),
-        });
+        self.cur = Some(HourFile { key, slot: Slot::Idle(file) });
         Ok(())
     }
 
     fn encoder(&mut self) -> Result<&mut zstd::Encoder<'static, BufWriter<File>>> {
         let cur = self.cur.as_mut().expect("hour file open");
         if let Slot::Idle(_) = cur.slot {
-            let Slot::Idle(file) = std::mem::replace(&mut cur.slot, Slot::Empty) else {
-                unreachable!()
-            };
+            let Slot::Idle(file) = std::mem::replace(&mut cur.slot, Slot::Empty) else { unreachable!() };
             let mut enc = zstd::Encoder::new(BufWriter::with_capacity(1 << 16, file), self.level)?;
             enc.include_checksum(true)?;
             cur.slot = Slot::Frame(enc);
@@ -558,11 +506,7 @@ impl FeedWriter {
         // audit): otherwise a line could get more than 4 TSV fields.
         let raw = l.raw.replace(['\n', '\r', '\t'], "");
         let enc = self.encoder()?;
-        writeln!(
-            enc,
-            "{}\t{}\t{}\t{}",
-            l.recv_ns, l.seq_first, l.seq_last, raw
-        )?;
+        writeln!(enc, "{}\t{}\t{}\t{}", l.recv_ns, l.seq_first, l.seq_last, raw)?;
         self.stats.lines += 1;
         Ok(())
     }
@@ -579,24 +523,18 @@ impl FeedWriter {
             }
             if let Some(g) = detect_gap(self.last_seq, l.seq_first) {
                 warn!(from = g.from, to = g.to, "gap in feed");
-                self.pending_gaps
-                    .push(format!("{}\t{}\t{}", g.from, g.to, l.recv_ns));
+                self.pending_gaps.push(format!("{}\t{}\t{}", g.from, g.to, l.recv_ns));
                 self.stats.gaps += 1;
             }
             for g in &l.intra_gaps {
                 if self.last_seq.is_none_or(|s| g.to > s) {
                     warn!(from = g.from, to = g.to, "gap inside envelope");
-                    self.pending_gaps
-                        .push(format!("{}\t{}\t{}", g.from, g.to, l.recv_ns));
+                    self.pending_gaps.push(format!("{}\t{}\t{}", g.from, g.to, l.recv_ns));
                     self.stats.intra_gaps += 1;
                 }
             }
             if l.intra_disorder > 0 {
-                warn!(
-                    count = l.intra_disorder,
-                    seq_first = l.seq_first,
-                    "sequence disorder inside envelope"
-                );
+                warn!(count = l.intra_disorder, seq_first = l.seq_first, "sequence disorder inside envelope");
                 self.stats.intra_disorder += u64::from(l.intra_disorder);
             }
         } else {
@@ -621,17 +559,14 @@ impl FeedWriter {
 
     /// True when the open frame has reached its deadline.
     pub fn frame_due(&self) -> bool {
-        self.frame_time_left(Instant::now())
-            .is_some_and(|d| d.is_zero())
+        self.frame_time_left(Instant::now()).is_some_and(|d| d.is_zero())
     }
 
     /// Close the open frame, fsync, then publish gaps and last_seq.
     pub fn commit(&mut self) -> Result<()> {
         if let Some(cur) = self.cur.as_mut() {
             if let Slot::Frame(_) = cur.slot {
-                let Slot::Frame(enc) = std::mem::replace(&mut cur.slot, Slot::Empty) else {
-                    unreachable!()
-                };
+                let Slot::Frame(enc) = std::mem::replace(&mut cur.slot, Slot::Empty) else { unreachable!() };
                 let bw = enc.finish()?;
                 let file = bw.into_inner().map_err(|e| e.into_error())?;
                 file.sync_data()?;
@@ -652,12 +587,7 @@ impl FeedWriter {
             if let Some(s) = self.last_seq {
                 write_atomic(&self.root.join(STATE_FILE), &s.to_string())?;
                 self.durable_seq = Some(s);
-                info!(
-                    last_seq = s,
-                    frames = self.stats.frames,
-                    lines = self.stats.lines,
-                    "frame committed"
-                );
+                info!(last_seq = s, frames = self.stats.frames, lines = self.stats.lines, "frame committed");
             }
         }
         Ok(())
@@ -670,9 +600,7 @@ pub fn run(rx: Receiver<Line>, mut w: FeedWriter) -> Result<WriterStats> {
     loop {
         // Never sleep past the frame deadline: the wait is clipped to the
         // time left, so the frame is committed on time even in silence.
-        let wait = w
-            .frame_time_left(Instant::now())
-            .map_or(POLL_STEP, |left| left.min(POLL_STEP));
+        let wait = w.frame_time_left(Instant::now()).map_or(POLL_STEP, |left| left.min(POLL_STEP));
         match rx.recv_timeout(wait) {
             Ok(l) => w.accept(&l)?,
             Err(RecvTimeoutError::Timeout) => {}
@@ -697,10 +625,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!(
             "recorder-test-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&d).unwrap();
         d
@@ -715,10 +640,7 @@ mod tests {
 
     fn decode_all_frames(path: &Path) -> String {
         let mut s = String::new();
-        zstd::stream::read::Decoder::new(File::open(path).unwrap())
-            .unwrap()
-            .read_to_string(&mut s)
-            .unwrap();
+        zstd::stream::read::Decoder::new(File::open(path).unwrap()).unwrap().read_to_string(&mut s).unwrap();
         s
     }
 
@@ -781,12 +703,9 @@ mod tests {
         fs::create_dir_all(&day).unwrap();
         let p = day.join("feed-20260930-12.tsv.zst");
         let torn = frame("3\t0\t0\t{}\n3\t99\t99\t{}\n");
-        let content = [
-            frame("1\t10\t10\t{}\n2\t0\t0\t{\"c\":1}\n"),
-            frame("2\t11\t12\t{}\n"),
-            torn[..torn.len() - 3].to_vec(),
-        ]
-        .concat();
+        let content =
+            [frame("1\t10\t10\t{}\n2\t0\t0\t{\"c\":1}\n"), frame("2\t11\t12\t{}\n"), torn[..torn.len() - 3].to_vec()]
+                .concat();
         fs::write(&p, content).unwrap();
         fs::write(dir.join(STATE_FILE), "10").unwrap(); // lags behind data
 
@@ -807,11 +726,7 @@ mod tests {
         let dir = tmpdir("recover0");
         let day = dir.join("2026/09/30");
         fs::create_dir_all(&day).unwrap();
-        fs::write(
-            day.join("feed-20260930-11.tsv.zst"),
-            frame("1\t50\t50\t{}\n"),
-        )
-        .unwrap();
+        fs::write(day.join("feed-20260930-11.tsv.zst"), frame("1\t50\t50\t{}\n")).unwrap();
         let torn = frame(&"2\t51\t51\t{}\n".repeat(20));
         let p = day.join("feed-20260930-12.tsv.zst");
         fs::write(&p, &torn[..torn.len() - 1]).unwrap();
@@ -826,24 +741,12 @@ mod tests {
     }
 
     fn env_line(recv: u128, seqs: &[u64]) -> String {
-        let m: Vec<String> = seqs
-            .iter()
-            .map(|s| format!(r#"{{"sequenceNumber":{s}}}"#))
-            .collect();
-        format!(
-            "{recv}\t{}\t{}\t{{\"version\":1,\"messages\":[{}]}}\n",
-            seqs[0],
-            seqs[seqs.len() - 1],
-            m.join(",")
-        )
+        let m: Vec<String> = seqs.iter().map(|s| format!(r#"{{"sequenceNumber":{s}}}"#)).collect();
+        format!("{recv}\t{}\t{}\t{{\"version\":1,\"messages\":[{}]}}\n", seqs[0], seqs[seqs.len() - 1], m.join(","))
     }
 
     fn gaps_rows(dir: &Path) -> Vec<String> {
-        fs::read_to_string(dir.join(GAPS_FILE))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
+        fs::read_to_string(dir.join(GAPS_FILE)).unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
     #[test]
@@ -852,10 +755,7 @@ mod tests {
         assert_eq!(uncovered(10, 20, &[(10, 20)]), vec![]);
         assert_eq!(uncovered(10, 20, &[(5, 30)]), vec![]);
         assert_eq!(uncovered(10, 20, &[(12, 14)]), vec![(10, 11), (15, 20)]);
-        assert_eq!(
-            uncovered(10, 20, &[(18, 25), (1, 10), (13, 13)]),
-            vec![(11, 12), (14, 17)]
-        );
+        assert_eq!(uncovered(10, 20, &[(18, 25), (1, 10), (13, 13)]), vec![(11, 12), (14, 17)]);
         assert_eq!(uncovered(10, 20, &[(21, 30), (1, 9)]), vec![(10, 20)]);
         assert_eq!(uncovered(10, 20, &[(0, u64::MAX)]), vec![]);
     }
@@ -871,26 +771,13 @@ mod tests {
         // Hour 11: 100..=102. Hour 12: 103, hole 104..=106, 107, 108, ping.
         fs::write(
             day.join("feed-20260930-11.tsv.zst"),
-            frame(
-                &[
-                    env_line(1, &[100]),
-                    env_line(2, &[101]),
-                    env_line(3, &[102]),
-                ]
-                .concat(),
-            ),
+            frame(&[env_line(1, &[100]), env_line(2, &[101]), env_line(3, &[102])].concat()),
         )
         .unwrap();
         fs::write(
             day.join("feed-20260930-12.tsv.zst"),
             [
-                frame(
-                    &[
-                        env_line(4, &[103]),
-                        "5\t0\t0\t{\"recorderFrame\":{}}\n".into(),
-                    ]
-                    .concat(),
-                ),
+                frame(&[env_line(4, &[103]), "5\t0\t0\t{\"recorderFrame\":{}}\n".into()].concat()),
                 frame(&[env_line(6, &[107]), env_line(7, &[108])].concat()),
             ]
             .concat(),
@@ -899,14 +786,7 @@ mod tests {
         fs::write(dir.join(STATE_FILE), "108").unwrap();
 
         let rec = recover(&dir).unwrap();
-        assert_eq!(
-            rec.reconciled,
-            vec![GapRow {
-                from: 104,
-                to: 106,
-                recv_ns: 6
-            }]
-        );
+        assert_eq!(rec.reconciled, vec![GapRow { from: 104, to: 106, recv_ns: 6 }]);
         assert_eq!(gaps_rows(&dir), vec!["104\t106\t6"]);
         assert_eq!(rec.resume_seq, Some(108));
 
@@ -924,66 +804,31 @@ mod tests {
         let dir = tmpdir("reconcile2");
         let day = dir.join("2026/09/30");
         fs::create_dir_all(&day).unwrap();
-        fs::write(
-            day.join("feed-20260930-10.tsv.zst"),
-            frame(&env_line(1, &[50])),
-        )
-        .unwrap();
+        fs::write(day.join("feed-20260930-10.tsv.zst"), frame(&env_line(1, &[50]))).unwrap();
         // Seam hole 51..=99 (listed), then 100, 101.
-        fs::write(
-            day.join("feed-20260930-11.tsv.zst"),
-            frame(&[env_line(2, &[100]), env_line(3, &[101])].concat()),
-        )
-        .unwrap();
+        fs::write(day.join("feed-20260930-11.tsv.zst"), frame(&[env_line(2, &[100]), env_line(3, &[101])].concat()))
+            .unwrap();
         // 102..=109 missing, gaps.tsv lists only 102..=104. Then an envelope
         // 110, 112 with an intra hole 111, a stale duplicate 105, then 113.
         fs::write(
             day.join("feed-20260930-12.tsv.zst"),
-            frame(
-                &[
-                    env_line(4, &[110, 112]),
-                    env_line(5, &[105]),
-                    env_line(6, &[113]),
-                ]
-                .concat(),
-            ),
+            frame(&[env_line(4, &[110, 112]), env_line(5, &[105]), env_line(6, &[113])].concat()),
         )
         .unwrap();
         fs::write(dir.join(GAPS_FILE), "51\t99\t2\n102\t104\t4\n").unwrap();
         let rec = recover(&dir).unwrap();
         assert_eq!(
             rec.reconciled,
-            vec![
-                GapRow {
-                    from: 105,
-                    to: 109,
-                    recv_ns: 4
-                },
-                GapRow {
-                    from: 111,
-                    to: 111,
-                    recv_ns: 4
-                },
-            ]
+            vec![GapRow { from: 105, to: 109, recv_ns: 4 }, GapRow { from: 111, to: 111, recv_ns: 4 },]
         );
         assert_eq!(rec.data_seq, Some(113));
-        assert_eq!(
-            gaps_rows(&dir),
-            vec!["51\t99\t2", "102\t104\t4", "105\t109\t4", "111\t111\t4"]
-        );
+        assert_eq!(gaps_rows(&dir), vec!["51\t99\t2", "102\t104\t4", "105\t109\t4", "111\t111\t4"]);
         assert!(recover(&dir).unwrap().reconciled.is_empty());
 
         // Seam hole missing from gaps.tsv is found too.
         fs::write(dir.join(GAPS_FILE), "").unwrap();
         let rec = recover(&dir).unwrap();
-        assert_eq!(
-            rec.reconciled.first(),
-            Some(&GapRow {
-                from: 51,
-                to: 99,
-                recv_ns: 2
-            })
-        );
+        assert_eq!(rec.reconciled.first(), Some(&GapRow { from: 51, to: 99, recv_ns: 2 }));
         assert_eq!(rec.reconciled.len(), 3);
         fs::remove_dir_all(&dir).ok();
     }
@@ -1021,19 +866,11 @@ mod tests {
         let budget = Duration::from_secs(60) - COMMIT_GUARD;
         assert_eq!(w.frame_time_left(opened), Some(budget));
         let just_before = opened + budget - Duration::from_millis(1);
-        assert_eq!(
-            w.frame_time_left(just_before),
-            Some(Duration::from_millis(1))
-        );
+        assert_eq!(w.frame_time_left(just_before), Some(Duration::from_millis(1)));
         assert_eq!(w.frame_time_left(opened + budget), Some(Duration::ZERO));
-        assert_eq!(
-            w.frame_time_left(opened + Duration::from_secs(61)),
-            Some(Duration::ZERO)
-        );
+        assert_eq!(w.frame_time_left(opened + Duration::from_secs(61)), Some(Duration::ZERO));
         // The writer thread never blocks past the deadline.
-        let wait = w
-            .frame_time_left(just_before)
-            .map_or(POLL_STEP, |l| l.min(POLL_STEP));
+        let wait = w.frame_time_left(just_before).map_or(POLL_STEP, |l| l.min(POLL_STEP));
         assert!(wait <= Duration::from_millis(1));
         w.commit().unwrap();
         assert_eq!(w.frame_time_left(Instant::now()), None);
@@ -1059,10 +896,7 @@ mod tests {
         }
         let took = sent.elapsed();
         assert!(took <= frame_max, "committed after {took:?}");
-        assert!(
-            took + Duration::from_millis(50) >= frame_max - COMMIT_GUARD,
-            "committed too early: {took:?}"
-        );
+        assert!(took + Duration::from_millis(50) >= frame_max - COMMIT_GUARD, "committed too early: {took:?}");
         drop(tx);
         h.join().unwrap();
         fs::remove_dir_all(&dir).ok();
@@ -1078,20 +912,13 @@ mod tests {
         let raw = "{\"version\":1,\t\"messages\":[\r\n\t{\"sequenceNumber\":5,\"s\":\"a b\"}\n]}";
         let before: serde_json::Value = serde_json::from_str(raw).unwrap();
         let mut w = FeedWriter::new(dir.clone(), 3, Duration::from_secs(60), None);
-        w.accept(&Line {
-            raw: raw.into(),
-            ..line(t0, 5)
-        })
-        .unwrap();
+        w.accept(&Line { raw: raw.into(), ..line(t0, 5) }).unwrap();
         w.commit().unwrap();
         let text = decode_all_frames(&list_feed_files(&dir)[0]);
         let row = text.lines().next().unwrap();
         let cols: Vec<&str> = row.split('\t').collect();
         assert_eq!(cols.len(), 4, "{row:?}");
-        assert_eq!(
-            cols[3],
-            "{\"version\":1,\"messages\":[{\"sequenceNumber\":5,\"s\":\"a b\"}]}"
-        );
+        assert_eq!(cols[3], "{\"version\":1,\"messages\":[{\"sequenceNumber\":5,\"s\":\"a b\"}]}");
         let after: serde_json::Value = serde_json::from_str(cols[3]).unwrap();
         assert_eq!(before, after);
         fs::remove_dir_all(&dir).ok();
@@ -1114,18 +941,9 @@ mod tests {
         env.seq_max = 110;
         env.intra_gaps = vec![Gap { from: 107, to: 109 }];
         w.accept(&env).unwrap();
-        let conf = Line {
-            seq_first: 0,
-            seq_last: 0,
-            seq_max: 0,
-            raw: "{\"conf\":1}".into(),
-            ..line(t0 + 4, 0)
-        };
+        let conf = Line { seq_first: 0, seq_last: 0, seq_max: 0, raw: "{\"conf\":1}".into(), ..line(t0 + 4, 0) };
         w.accept(&conf).unwrap();
-        assert!(
-            !dir.join(GAPS_FILE).exists(),
-            "gaps must wait for fsync of data"
-        );
+        assert!(!dir.join(GAPS_FILE).exists(), "gaps must wait for fsync of data");
         w.commit().unwrap();
         assert_eq!(read_state(&dir), Some(110));
         assert_eq!(
@@ -1146,10 +964,7 @@ mod tests {
         let rows: Vec<&str> = h12.lines().collect();
         assert_eq!(rows.len(), 5);
         assert!(rows[3].ends_with("\t0\t0\t{\"conf\":1}"));
-        assert_eq!(
-            valid_prefix_len(&fs::read(&files[0]).unwrap()),
-            fs::metadata(&files[0]).unwrap().len() as usize
-        );
+        assert_eq!(valid_prefix_len(&fs::read(&files[0]).unwrap()), fs::metadata(&files[0]).unwrap().len() as usize);
         assert_eq!(max_seq_in_file(&files[1]).unwrap(), Some(112));
         fs::remove_dir_all(&dir).ok();
     }

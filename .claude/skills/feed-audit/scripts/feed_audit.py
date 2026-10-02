@@ -133,11 +133,11 @@ def frame_len(buf, pos):
     n = len(buf)
     if pos + 4 > n:
         return None, "incomplete" if buf[pos:] == ZSTD_MAGIC.to_bytes(4, "little")[: n - pos] else "invalid"
-    magic = int.from_bytes(buf[pos:pos + 4], "little")
+    magic = int.from_bytes(buf[pos : pos + 4], "little")
     if 0x184D2A50 <= magic <= 0x184D2A5F:  # skippable frame
         if pos + 8 > n:
             return None, "incomplete"
-        end = pos + 8 + int.from_bytes(buf[pos + 4:pos + 8], "little")
+        end = pos + 8 + int.from_bytes(buf[pos + 4 : pos + 8], "little")
         return (end - pos, None) if end <= n else (None, "incomplete")
     if magic != ZSTD_MAGIC:
         return None, "invalid"
@@ -189,7 +189,7 @@ def hour_of(path):
     """'YYYYMMDD-HH' from feed-YYYYMMDD-HH.tsv.zst, else None."""
     name = os.path.basename(path)
     if name.startswith("feed-") and name.endswith(".tsv.zst"):
-        return name[len("feed-"):-len(".tsv.zst")]
+        return name[len("feed-") : -len(".tsv.zst")]
     return None
 
 
@@ -257,12 +257,11 @@ def classify_seq0(raw):
 
 
 def rpc_blocks(url, numbers):
-    calls = [
-        {"jsonrpc": "2.0", "id": n, "method": "eth_getBlockByNumber", "params": [hex(n), False]}
-        for n in numbers
-    ]
+    calls = [{"jsonrpc": "2.0", "id": n, "method": "eth_getBlockByNumber", "params": [hex(n), False]} for n in numbers]
     req = urllib.request.Request(
-        url, data=json.dumps(calls).encode(), headers={"content-type": "application/json", "user-agent": "hoodchain-feed-audit/1"}
+        url,
+        data=json.dumps(calls).encode(),
+        headers={"content-type": "application/json", "user-agent": "hoodchain-feed-audit/1"},
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         resp = json.load(r)
@@ -284,14 +283,26 @@ def main():
     ap.add_argument("--feed-root", help="recorder --out-dir (for gaps.tsv, last_seq.txt, connections.tsv)")
     ap.add_argument("--rpc-sample", type=int, default=0, help="blocks to compare with RPC (0 = none)")
     ap.add_argument("--rpc-url", default=os.environ.get("RPC_URL", PUBLIC_RPC_URL))
-    ap.add_argument("--session-gap-s", type=float, default=30.0,
-                    help="a pause between neighbouring lines longer than this starts a new session (default 30)")
-    ap.add_argument("--current-hour", default=None,
-                    help="YYYYMMDD-HH treated as the open hour (default: hour of --now)")
-    ap.add_argument("--now", default=None,
-                    help="audit time, YYYY-MM-DDTHH:MM:SSZ (default: real UTC time); for tests and old records")
-    ap.add_argument("--frame-secs", type=float, default=60.0,
-                    help="recorder --frame-secs (default 60): bounds how long the previous hour's frame may stay open")
+    ap.add_argument(
+        "--session-gap-s",
+        type=float,
+        default=30.0,
+        help="a pause between neighbouring lines longer than this starts a new session (default 30)",
+    )
+    ap.add_argument(
+        "--current-hour", default=None, help="YYYYMMDD-HH treated as the open hour (default: hour of --now)"
+    )
+    ap.add_argument(
+        "--now",
+        default=None,
+        help="audit time, YYYY-MM-DDTHH:MM:SSZ (default: real UTC time); for tests and old records",
+    )
+    ap.add_argument(
+        "--frame-secs",
+        type=float,
+        default=60.0,
+        help="recorder --frame-secs (default 60): bounds how long the previous hour's frame may stay open",
+    )
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     a = ap.parse_args()
 
@@ -363,11 +374,17 @@ def main():
         if tail_bytes:
             if tail == "incomplete" and hour_of(path) == current_hour:
                 open_tails.append((path, tail_bytes))
-            elif (tail == "incomplete" and hour_of(path) == prev_hour and prev_grace
-                  and not has_complete_frame(hour_file(path, current_hour))):
+            elif (
+                tail == "incomplete"
+                and hour_of(path) == prev_hour
+                and prev_grace
+                and not has_complete_frame(hour_file(path, current_hour))
+            ):
                 prev_open_tails.append((path, tail_bytes))
             elif tail == "incomplete":
-                fails.append("torn zstd tail in closed hour: %s (%d bytes after %d complete frames)" % (path, tail_bytes, frames))
+                fails.append(
+                    "torn zstd tail in closed hour: %s (%d bytes after %d complete frames)" % (path, tail_bytes, frames)
+                )
             else:
                 fails.append("garbage after the last complete zstd frame: %s (%d bytes)" % (path, tail_bytes))
         if end == 0:
@@ -389,11 +406,7 @@ def main():
                     ns_backwards += 1
                 # session bookkeeping (all lines, pings included)
                 conn_idx = bisect.bisect_right(connected, ns) - 1 if connected else -1
-                new_session = (
-                    cur is None
-                    or conn_idx != cur["conn"]
-                    or (last_ns is not None and ns - last_ns > gap_ns)
-                )
+                new_session = cur is None or conn_idx != cur["conn"] or (last_ns is not None and ns - last_ns > gap_ns)
                 if new_session:
                     cur = {"conn": conn_idx, "first": ns, "last": ns, "blocks": 0}
                     sessions.append(cur)
@@ -449,7 +462,10 @@ def main():
         for p, b in open_tails:
             print("open frame of current hour %s: %s, %d bytes (not audited)" % (current_hour, p, b), file=sys.stderr)
         for p, b in prev_open_tails:
-            print("possibly open frame of previous hour %s: %s, %d bytes (not audited)" % (prev_hour, p, b), file=sys.stderr)
+            print(
+                "possibly open frame of previous hour %s: %s, %d bytes (not audited)" % (prev_hour, p, b),
+                file=sys.stderr,
+            )
         for f in fails:
             print("FAIL  " + f, file=sys.stderr)
         print("no blocks found", file=sys.stderr)
@@ -499,7 +515,7 @@ def main():
         pick = sorted(pick)
         try:
             res = rpc_blocks(a.rpc_url, pick)
-        except Exception as e:  # noqa: BLE001 - report, don't crash the audit
+        except Exception as e:  # report, don't crash the audit
             fails.append("rpc check failed: %s" % e)
             res = None
         hash_bad, l1_bad = [], []
@@ -531,9 +547,14 @@ def main():
         "files": len(files),
         "ignored_inputs": len(ignored),
         "zstd_frames": frames_total,
-        "open_tail": ["%s: %d bytes (open frame of current hour %s, not audited)" % (p, b, current_hour) for p, b in open_tails]
-        + ["%s: %d bytes (previous hour %s, frame may still be open: audit before %sZ and no complete frame in hour %s yet; not audited)"
-           % (p, b, prev_hour, grace_until.strftime("%Y-%m-%dT%H:%M:%S"), current_hour) for p, b in prev_open_tails],
+        "open_tail": [
+            "%s: %d bytes (open frame of current hour %s, not audited)" % (p, b, current_hour) for p, b in open_tails
+        ]
+        + [
+            "%s: %d bytes (previous hour %s, frame may still be open: audit before %sZ and no complete frame in hour %s yet; not audited)"
+            % (p, b, prev_hour, grace_until.strftime("%Y-%m-%dT%H:%M:%S"), current_hour)
+            for p, b in prev_open_tails
+        ],
         "lines": lines,
         "envelopes": envelopes,
         "seq0_lines": dict(sorted(seq0.items())),

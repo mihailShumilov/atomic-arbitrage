@@ -80,10 +80,7 @@ pub fn intra_envelope_gaps(seqs: &[u64]) -> (Vec<Gap>, u32) {
     for w in seqs.windows(2) {
         let (a, b) = (w[0], w[1]);
         if b > a + 1 {
-            gaps.push(Gap {
-                from: a + 1,
-                to: b - 1,
-            });
+            gaps.push(Gap { from: a + 1, to: b - 1 });
         } else if b <= a {
             disorder += 1;
         }
@@ -111,16 +108,7 @@ pub fn route_text(recv_ns: u128, raw: String) -> Line {
     let seqs: Vec<u64> = env.messages.iter().map(|m| m.sequence_number).collect();
     let (intra_gaps, intra_disorder) = intra_envelope_gaps(&seqs);
     let seq_max = seqs.iter().copied().max().unwrap_or(seq_last);
-    Line {
-        recv_ns,
-        seq_first,
-        seq_last,
-        seq_max,
-        intra_gaps,
-        intra_disorder,
-        kind3_ts,
-        raw,
-    }
+    Line { recv_ns, seq_first, seq_last, seq_max, intra_gaps, intra_disorder, kind3_ts, raw }
 }
 
 /// A frame that is not valid UTF-8 text: binary, control frames, or a text
@@ -154,10 +142,7 @@ mod tests {
     #[test]
     fn contiguous_envelope_has_no_gaps() {
         let l = route_text(1, envelope(&[74755960, 74755961, 74755962]));
-        assert_eq!(
-            (l.seq_first, l.seq_last, l.seq_max),
-            (74755960, 74755962, 74755962)
-        );
+        assert_eq!((l.seq_first, l.seq_last, l.seq_max), (74755960, 74755962, 74755962));
         assert!(l.intra_gaps.is_empty());
         assert_eq!(l.intra_disorder, 0);
     }
@@ -177,10 +162,7 @@ mod tests {
     fn gap_inside_envelope_is_reported() {
         let l = route_text(1, envelope(&[100, 101, 105, 106, 108]));
         assert_eq!((l.seq_first, l.seq_last), (100, 108));
-        assert_eq!(
-            l.intra_gaps,
-            vec![Gap { from: 102, to: 104 }, Gap { from: 107, to: 107 }]
-        );
+        assert_eq!(l.intra_gaps, vec![Gap { from: 102, to: 104 }, Gap { from: 107, to: 107 }]);
         assert_eq!(l.intra_disorder, 0);
     }
 
@@ -217,9 +199,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&l.raw).unwrap();
         assert_eq!(v["recorderFrame"]["opcode"], "text");
         let b64 = v["recorderFrame"]["payloadBase64"].as_str().unwrap();
-        let back = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .unwrap();
+        let back = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
         assert_eq!(back, text.as_bytes()); // byte-exact, CR/LF/TAB included
         assert!(!l.raw.contains(['\n', '\r', '\t']));
         // Truncated envelope (not valid JSON) is wrapped, too.
@@ -240,10 +220,7 @@ mod tests {
     fn opaque_frames_are_base64_wrapped() {
         let l = route_opaque(9, "binary", &[0, 255, 10, 9]);
         assert_eq!((l.seq_first, l.seq_last), (0, 0));
-        assert_eq!(
-            l.raw,
-            r#"{"recorderFrame":{"opcode":"binary","payloadBase64":"AP8KCQ=="}}"#
-        );
+        assert_eq!(l.raw, r#"{"recorderFrame":{"opcode":"binary","payloadBase64":"AP8KCQ=="}}"#);
         // The wrapper is valid JSON and parses as an envelope without messages.
         let env: FeedEnvelope = serde_json::from_str(&l.raw).unwrap();
         assert!(env.seq_range().is_none());

@@ -12,8 +12,24 @@ async fn logs_window_shrinks_and_grows_and_covers_every_block() {
     let m = start(Behavior { logs_max_range: Some(30), ..Default::default() }).await;
     let d = scratch("logs");
     let out = d.join("logs");
-    let a = args(&["--rpc-url", &m.url, "--mode", "logs", "--from", "1000", "--to", "1099", "--rps", "0",
-                   "--logs-window", "100", "--logs-window-max", "1000", "--logs-out-dir", out.to_str().unwrap()]);
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--mode",
+        "logs",
+        "--from",
+        "1000",
+        "--to",
+        "1099",
+        "--rps",
+        "0",
+        "--logs-window",
+        "100",
+        "--logs-window-max",
+        "1000",
+        "--logs-out-dir",
+        out.to_str().unwrap(),
+    ]);
     let stats = Arc::new(Stats::default());
     enricher::run(&a, stats.clone()).await.unwrap();
 
@@ -50,8 +66,22 @@ async fn logs_custom_topic_filter() {
     let d = scratch("logs-topic");
     let out = d.join("logs");
     let t = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
-    let a = args(&["--rpc-url", &m.url, "--mode", "logs", "--from", "1", "--to", "3", "--rps", "0",
-                   "--topic0", t, "--logs-out-dir", out.to_str().unwrap()]);
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--mode",
+        "logs",
+        "--from",
+        "1",
+        "--to",
+        "3",
+        "--rps",
+        "0",
+        "--topic0",
+        t,
+        "--logs-out-dir",
+        out.to_str().unwrap(),
+    ]);
     enricher::run(&a, Arc::new(Stats::default())).await.unwrap();
     let calls = m.calls_of("eth_getLogs");
     assert_eq!(calls.len(), 1);

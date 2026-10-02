@@ -15,8 +15,20 @@ async fn gaps_fill_once_and_skip_closed_ranges() {
     let gaps = d.join("gaps.tsv");
     // Recorder format: from \t to \t recv_ns. Overlapping gaps get merged.
     std::fs::write(&gaps, "100\t104\t1\n200\t202\t2\n103\t105\t3\n").unwrap();
-    let base = ["--rpc-url", &m.url, "--gaps", gaps.to_str().unwrap(), "--rps", "0", "--batch", "2",
-                "--chunk", "4", "--out-dir", out.to_str().unwrap()];
+    let base = [
+        "--rpc-url",
+        &m.url,
+        "--gaps",
+        gaps.to_str().unwrap(),
+        "--rps",
+        "0",
+        "--batch",
+        "2",
+        "--chunk",
+        "4",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ];
 
     enricher::run(&args(&base), Arc::new(Stats::default())).await.unwrap();
     let mut got = m.blocks_requested();
@@ -69,8 +81,14 @@ async fn gaps_dry_run_and_budget_make_no_calls() {
 #[tokio::test]
 async fn missing_gaps_file_is_an_error() {
     let d = scratch("gaps-missing");
-    let a = args(&["--rpc-url", "http://127.0.0.1:9", "--gaps", d.join("nope.tsv").to_str().unwrap(),
-                   "--out-dir", d.join("b").to_str().unwrap()]);
+    let a = args(&[
+        "--rpc-url",
+        "http://127.0.0.1:9",
+        "--gaps",
+        d.join("nope.tsv").to_str().unwrap(),
+        "--out-dir",
+        d.join("b").to_str().unwrap(),
+    ]);
     assert!(enricher::run(&a, Arc::new(Stats::default())).await.is_err());
 }
 
@@ -83,8 +101,18 @@ async fn unterminated_last_gaps_line_is_ignored_until_complete() {
     let d = scratch("gaps-torn");
     let out = d.join("blocks");
     let gaps = d.join("gaps.tsv");
-    let base = ["--rpc-url", &m.url, "--gaps", gaps.to_str().unwrap(), "--rps", "0", "--batch", "5",
-                "--out-dir", out.to_str().unwrap()];
+    let base = [
+        "--rpc-url",
+        &m.url,
+        "--gaps",
+        gaps.to_str().unwrap(),
+        "--rps",
+        "0",
+        "--batch",
+        "5",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ];
     for tail in ["300", "300\t", "300\t302", "300\t302\t17908"] {
         std::fs::write(&gaps, format!("100\t102\t1\n{tail}")).unwrap();
         enricher::run(&args(&base), Arc::new(Stats::default())).await.unwrap();

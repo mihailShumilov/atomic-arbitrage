@@ -34,9 +34,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::{rustls, TlsConnector};
 use yawc::close::CloseCode;
-use yawc::{
-    frame::OpCode, CompressionLevel, Frame, HttpRequest, MaybeTlsStream, Options, WebSocket,
-};
+use yawc::{frame::OpCode, CompressionLevel, Frame, HttpRequest, MaybeTlsStream, Options, WebSocket};
 
 const FEED_URL: &str = "wss://feed.mainnet.chain.robinhood.com";
 const HEAD_CAP: usize = 16 * 1024;
@@ -73,62 +71,40 @@ struct Args {
 }
 
 fn now_ns() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 
 fn utc(ns: u128) -> String {
-    chrono::DateTime::from_timestamp_nanos(ns as i64)
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string()
+    chrono::DateTime::from_timestamp_nanos(ns as i64).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 fn clean(s: &str) -> String {
-    s.replace('\t', " ")
-        .replace("\r\n", " | ")
-        .replace(['\n', '\r'], " ")
+    s.replace('\t', " ").replace("\r\n", " | ").replace(['\n', '\r'], " ")
 }
 
 // ------------------------------------------------------------ safety rails ---
 
-const LOG_HEADER: &str =
-    "# ts_utc\tts_unix_ns\tevent\tdepth\trequested\ttip\thttp_status\tretry_after\tdetail";
+const LOG_HEADER: &str = "# ts_utc\tts_unix_ns\tevent\tdepth\trequested\ttip\thttp_status\tretry_after\tdetail";
 
 fn check_rails(args: &Args, log: &PathBuf) -> Result<()> {
     let now = now_ns();
     if let Ok(text) = std::fs::read_to_string(log) {
-        let rows: Vec<Vec<&str>> = text
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-            .map(|l| l.split('\t').collect())
-            .collect();
+        let rows: Vec<Vec<&str>> =
+            text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).map(|l| l.split('\t').collect()).collect();
         for r in &rows {
             if matches!(r.get(6), Some(&"403") | Some(&"429")) {
                 bail!("probe log has a {} row; stop, do not retry: {r:?}", r[6]);
             }
         }
-        let attempts: Vec<&Vec<&str>> = rows
-            .iter()
-            .filter(|r| r.get(2) == Some(&"attempt"))
-            .collect();
+        let attempts: Vec<&Vec<&str>> = rows.iter().filter(|r| r.get(2) == Some(&"attempt")).collect();
         if attempts.len() >= args.max_attempts {
-            bail!(
-                "already {} attempts in the probe log (cap {})",
-                attempts.len(),
-                args.max_attempts
-            );
+            bail!("already {} attempts in the probe log (cap {})", attempts.len(), args.max_attempts);
         }
         if let Some(last) = attempts.last() {
             let t: u128 = last[1].parse().unwrap_or(0);
             let gap = now.saturating_sub(t);
             if gap < args.min_gap_secs as u128 * 1_000_000_000 {
-                bail!(
-                    "last probe attempt {:.0} s ago, need >= {} s",
-                    gap as f64 / 1e9,
-                    args.min_gap_secs
-                );
+                bail!("last probe attempt {:.0} s ago, need >= {} s", gap as f64 / 1e9, args.min_gap_secs);
             }
         }
     }
@@ -159,21 +135,9 @@ fn check_rails(args: &Args, log: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn log_row(
-    log: &PathBuf,
-    event: &str,
-    args: &Args,
-    requested: u64,
-    status: &str,
-    retry: &str,
-    detail: &str,
-) {
+fn log_row(log: &PathBuf, event: &str, args: &Args, requested: u64, status: &str, retry: &str, detail: &str) {
     let fresh = !log.exists();
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .expect("open probe log");
+    let mut f = OpenOptions::new().create(true).append(true).open(log).expect("open probe log");
     if fresh {
         let _ = writeln!(f, "{LOG_HEADER}");
     }
@@ -203,11 +167,7 @@ struct HeadTap<S> {
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for HeadTap<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let r = Pin::new(&mut self.inner).poll_read(cx, buf);
         if self.capturing {
@@ -228,11 +188,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for HeadTap<S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for HeadTap<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        b: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, b)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -244,19 +200,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for HeadTap<S> {
 }
 
 fn head_text(buf: &[u8]) -> String {
-    let end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(buf.len());
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
 fn head_field(head: &str, name: &str) -> Option<String> {
     head.split("\r\n").skip(1).find_map(|l| {
         let (k, v) = l.split_once(':')?;
-        k.trim()
-            .eq_ignore_ascii_case(name)
-            .then(|| v.trim().to_string())
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
     })
 }
 
@@ -265,12 +216,10 @@ fn tls_connector() -> Result<TlsConnector> {
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert);
     }
-    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(TlsConnector::from(Arc::new(cfg)))
 }
@@ -285,8 +234,7 @@ async fn main() -> Result<()> {
     check_rails(&args, &log)?;
 
     let requested = args.tip.checked_sub(args.depth).context("depth > tip")?;
-    let sent_headers =
-        format!("Arbitrum-Feed-Client-Version: 2; Arbitrum-Requested-Sequence-Number: {requested}");
+    let sent_headers = format!("Arbitrum-Feed-Client-Version: 2; Arbitrum-Requested-Sequence-Number: {requested}");
     log_row(&log, "attempt", &args, requested, "-", "-", &sent_headers);
 
     let url: url::Url = FEED_URL.parse()?;
@@ -304,72 +252,32 @@ async fn main() -> Result<()> {
     let stream = match stream {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            log_row(
-                &log,
-                "failed",
-                &args,
-                requested,
-                "-",
-                "-",
-                &format!("tcp/tls: {e}"),
-            );
+            log_row(&log, "failed", &args, requested, "-", "-", &format!("tcp/tls: {e}"));
             bail!("tcp/tls: {e}");
         }
         Err(_) => {
-            log_row(
-                &log,
-                "failed",
-                &args,
-                requested,
-                "-",
-                "-",
-                "tcp/tls timeout",
-            );
+            log_row(&log, "failed", &args, requested, "-", "-", "tcp/tls timeout");
             bail!("tcp/tls timeout");
         }
     };
     let head_buf = Arc::new(Mutex::new(Vec::new()));
-    let tap = HeadTap {
-        inner: stream,
-        head: head_buf.clone(),
-        capturing: true,
-    };
+    let tap = HeadTap { inner: stream, head: head_buf.clone(), capturing: true };
     let req = HttpRequest::builder()
         .header("Arbitrum-Feed-Client-Version", "2")
         .header("Arbitrum-Requested-Sequence-Number", requested.to_string());
     let opts = Options::default().with_compression_level(CompressionLevel::fast());
-    let hs = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        WebSocket::handshake_with_request(url, tap, opts, req),
-    )
-    .await;
+    let hs = tokio::time::timeout(CONNECT_TIMEOUT, WebSocket::handshake_with_request(url, tap, opts, req)).await;
     let head = head_text(&head_buf.lock().map(|h| h.clone()).unwrap_or_default());
     let status = head.split_whitespace().nth(1).unwrap_or("-").to_string();
     let retry = head_field(&head, "retry-after").unwrap_or_else(|| "-".into());
     let mut ws = match hs {
         Ok(Ok(ws)) => ws,
         Ok(Err(e)) => {
-            log_row(
-                &log,
-                "failed",
-                &args,
-                requested,
-                &status,
-                &retry,
-                &format!("upgrade: {e}; head: {head}"),
-            );
+            log_row(&log, "failed", &args, requested, &status, &retry, &format!("upgrade: {e}; head: {head}"));
             bail!("upgrade failed: {e}; status {status}, Retry-After {retry}");
         }
         Err(_) => {
-            log_row(
-                &log,
-                "failed",
-                &args,
-                requested,
-                &status,
-                &retry,
-                &format!("upgrade timeout; head: {head}"),
-            );
+            log_row(&log, "failed", &args, requested, &status, &retry, &format!("upgrade timeout; head: {head}"));
             bail!("upgrade timeout");
         }
     };
@@ -395,27 +303,25 @@ async fn main() -> Result<()> {
     writeln!(out, "# recv_unix_ns\tfirst_seq\tlast_seq\tn_msgs\tpayload (text frames as received; other opcodes as recorderFrame base64)")?;
 
     let started = Instant::now();
-    let (mut envelopes, mut msgs, mut first_seq, mut last_seq, mut max_per_env) =
-        (0u64, 0u64, 0u64, 0u64, 0usize);
+    let (mut envelopes, mut msgs, mut first_seq, mut last_seq, mut max_per_env) = (0u64, 0u64, 0u64, 0u64, 0usize);
     let mut end_reason = String::from("max_secs");
     loop {
         let left = Duration::from_secs(args.max_secs).saturating_sub(started.elapsed());
         if left.is_zero() {
             break;
         }
-        let frame =
-            match tokio::time::timeout(left.min(Duration::from_secs(15)), ws.next_frame()).await {
-                Err(_) if left > Duration::from_secs(15) => {
-                    end_reason = "idle 15s".into();
-                    break;
-                }
-                Err(_) => break,
-                Ok(Err(e)) => {
-                    end_reason = format!("stream ended: {e}");
-                    break;
-                }
-                Ok(Ok(f)) => f,
-            };
+        let frame = match tokio::time::timeout(left.min(Duration::from_secs(15)), ws.next_frame()).await {
+            Err(_) if left > Duration::from_secs(15) => {
+                end_reason = "idle 15s".into();
+                break;
+            }
+            Err(_) => break,
+            Ok(Err(e)) => {
+                end_reason = format!("stream ended: {e}");
+                break;
+            }
+            Ok(Ok(f)) => f,
+        };
         let recv = now_ns();
         match frame.opcode() {
             OpCode::Text => {
@@ -449,10 +355,12 @@ async fn main() -> Result<()> {
             op => {
                 let name = format!("{op:?}").to_lowercase();
                 let b64 = base64::engine::general_purpose::STANDARD.encode(frame.payload());
-                writeln!(out, "{recv}\t0\t0\t0\t{{\"recorderFrame\":{{\"opcode\":\"{name}\",\"payloadBase64\":\"{b64}\"}}}}")?;
+                writeln!(
+                    out,
+                    "{recv}\t0\t0\t0\t{{\"recorderFrame\":{{\"opcode\":\"{name}\",\"payloadBase64\":\"{b64}\"}}}}"
+                )?;
                 if op == OpCode::Close {
-                    end_reason =
-                        format!("server close code={:?}", frame.close_code().map(u16::from));
+                    end_reason = format!("server close code={:?}", frame.close_code().map(u16::from));
                     break;
                 }
             }
@@ -468,11 +376,8 @@ async fn main() -> Result<()> {
     let deadline = tokio::time::Instant::now() + CLOSE_REPLY_WAIT;
     let mut close_outcome = "send_failed".to_string();
     if !end_reason.starts_with("server close") && !end_reason.starts_with("stream ended") {
-        if let Ok(Ok(())) = tokio::time::timeout_at(
-            deadline,
-            ws.send(Frame::close(CloseCode::Normal, b"probe done")),
-        )
-        .await
+        if let Ok(Ok(())) =
+            tokio::time::timeout_at(deadline, ws.send(Frame::close(CloseCode::Normal, b"probe done"))).await
         {
             close_outcome = "no_reply".into();
             while let Ok(r) = tokio::time::timeout_at(deadline, ws.next_frame()).await {
@@ -483,8 +388,7 @@ async fn main() -> Result<()> {
                         let b64 = base64::engine::general_purpose::STANDARD.encode(f.payload());
                         writeln!(out, "{recv}\t0\t0\t0\t{{\"recorderFrame\":{{\"opcode\":\"{name}\",\"payloadBase64\":\"{b64}\"}}}}")?;
                         if f.opcode() == OpCode::Close {
-                            close_outcome =
-                                format!("server_replied code={:?}", f.close_code().map(u16::from));
+                            close_outcome = format!("server_replied code={:?}", f.close_code().map(u16::from));
                             break;
                         }
                     }

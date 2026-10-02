@@ -173,7 +173,10 @@ fn synthetic_registry_observed_entry() {
 
 #[test]
 fn synthetic_registry_token_mismatch() {
-    let r = decode(77312169, &weth_registry(address!("00000000000000000000000000000000000000ee"), RegistryStatus::Verified));
+    let r = decode(
+        77312169,
+        &weth_registry(address!("00000000000000000000000000000000000000ee"), RegistryStatus::Verified),
+    );
     assert_eq!(r.inflows[0].token.as_ref().unwrap().l2_token_matches_registry, Some(false));
     assert_eq!(r.counters.token_registry_mismatch, 1);
 }

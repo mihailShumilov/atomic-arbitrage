@@ -25,10 +25,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::{rustls, TlsConnector};
 use tracing::{info, warn};
 use yawc::close::CloseCode;
-use yawc::{
-    frame::OpCode, CompressionLevel, Frame, HttpRequest, MaybeTlsStream, Options, WebSocket,
-    WebSocketError,
-};
+use yawc::{frame::OpCode, CompressionLevel, Frame, HttpRequest, MaybeTlsStream, Options, WebSocket, WebSocketError};
 
 use crate::backoff::{parse_retry_after, EndKind};
 use crate::resume::Backlog;
@@ -44,10 +41,7 @@ pub const CLOSE_REPLY_WAIT: Duration = Duration::from_secs(2);
 const CLOSE_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 
 pub fn now_ns() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 
 /// TLS with the OS certificate store (works on normal servers and behind
@@ -57,16 +51,11 @@ pub fn tls_connector() -> Result<TlsConnector> {
     for cert in rustls_native_certs::load_native_certs().certs {
         let _ = roots.add(cert);
     }
-    anyhow::ensure!(
-        !roots.is_empty(),
-        "no OS root certificates found (install ca-certificates)"
-    );
-    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    anyhow::ensure!(!roots.is_empty(), "no OS root certificates found (install ca-certificates)");
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     // WebSocket upgrade over HTTP/2 through Cloudflare returned 520 in tests.
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(TlsConnector::from(Arc::new(cfg)))
@@ -85,23 +74,12 @@ pub struct HeadTap<S> {
 impl<S> HeadTap<S> {
     pub fn new(inner: S) -> (Self, Arc<Mutex<Vec<u8>>>) {
         let head = Arc::new(Mutex::new(Vec::new()));
-        (
-            Self {
-                inner,
-                head: head.clone(),
-                capturing: true,
-            },
-            head,
-        )
+        (Self { inner, head: head.clone(), capturing: true }, head)
     }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for HeadTap<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let r = Pin::new(&mut self.inner).poll_read(cx, buf);
         if self.capturing {
@@ -122,11 +100,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for HeadTap<S> {
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for HeadTap<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        b: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, b)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -156,28 +130,16 @@ pub struct HttpHead {
 }
 
 pub fn parse_http_head(bytes: &[u8]) -> HttpHead {
-    let end = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(bytes.len());
+    let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(bytes.len());
     let text = String::from_utf8_lossy(&bytes[..end]);
     let mut lines = text.split("\r\n");
     let status_line = lines.next().unwrap_or("").trim().to_string();
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok());
+    let status = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok());
     let retry_after = lines.find_map(|l| {
         let (k, v) = l.split_once(':')?;
-        k.trim()
-            .eq_ignore_ascii_case("retry-after")
-            .then(|| v.trim().to_string())
+        k.trim().eq_ignore_ascii_case("retry-after").then(|| v.trim().to_string())
     });
-    HttpHead {
-        status,
-        retry_after,
-        status_line,
-    }
+    HttpHead { status, retry_after, status_line }
 }
 
 // ------------------------------------------------------------- connection ---
@@ -251,22 +213,16 @@ type FeedWs = WebSocket<HeadTap<MaybeTlsStream<TcpStream>>>;
 fn handshake_request(requested: Option<u64>) -> yawc::HttpRequestBuilder {
     let b = HttpRequest::builder();
     match requested {
-        Some(n) => b
-            .header("Arbitrum-Feed-Client-Version", "2")
-            .header("Arbitrum-Requested-Sequence-Number", n.to_string()),
+        Some(n) => {
+            b.header("Arbitrum-Feed-Client-Version", "2").header("Arbitrum-Requested-Sequence-Number", n.to_string())
+        }
         None => b,
     }
 }
 
 /// Connect and upgrade. On failure returns a classified [`ConnEnd`].
-async fn connect(
-    url_str: &str,
-    tls: &TlsConnector,
-    requested: Option<u64>,
-) -> std::result::Result<FeedWs, ConnEnd> {
-    let url: url::Url = url_str
-        .parse()
-        .map_err(|e| ConnEnd::failed(EndKind::NetError, format!("bad url: {e}")))?;
+async fn connect(url_str: &str, tls: &TlsConnector, requested: Option<u64>) -> std::result::Result<FeedWs, ConnEnd> {
+    let url: url::Url = url_str.parse().map_err(|e| ConnEnd::failed(EndKind::NetError, format!("bad url: {e}")))?;
     let host = url.host_str().unwrap_or_default().to_string();
     let port = url.port_or_known_default().unwrap_or(443);
     let res = tokio::time::timeout(CONNECT_TIMEOUT, async {
@@ -280,10 +236,8 @@ async fn connect(
         } else {
             let name = ServerName::try_from(host.clone())
                 .map_err(|e| ConnEnd::failed(EndKind::NetError, format!("server name: {e}")))?;
-            let tls_stream = tls
-                .connect(name, tcp)
-                .await
-                .map_err(|e| ConnEnd::failed(EndKind::NetError, format!("tls: {e}")))?;
+            let tls_stream =
+                tls.connect(name, tcp).await.map_err(|e| ConnEnd::failed(EndKind::NetError, format!("tls: {e}")))?;
             MaybeTlsStream::Tls(tls_stream)
         };
         let (tap, head) = HeadTap::new(stream);
@@ -315,10 +269,7 @@ async fn connect(
             Err(ConnEnd {
                 kind,
                 http_status: status,
-                retry_after: head
-                    .retry_after
-                    .as_deref()
-                    .and_then(|v| parse_retry_after(v, now_unix)),
+                retry_after: head.retry_after.as_deref().and_then(|v| parse_retry_after(v, now_unix)),
                 retry_after_raw: head.retry_after.clone(),
                 session: Duration::ZERO,
                 envelopes: 0,
@@ -327,10 +278,9 @@ async fn connect(
                 backlog: None,
             })
         }
-        Err(_) => Err(ConnEnd {
-            http_status: head.status,
-            ..ConnEnd::failed(EndKind::NetError, "upgrade timeout".into())
-        }),
+        Err(_) => {
+            Err(ConnEnd { http_status: head.status, ..ConnEnd::failed(EndKind::NetError, "upgrade timeout".into()) })
+        }
     }
 }
 
@@ -351,27 +301,16 @@ fn route_frame(frame: &Frame, recv_ns: u128) -> (Line, Option<String>) {
     match op {
         OpCode::Text => match std::str::from_utf8(frame.payload()) {
             Ok(s) => (route_text(recv_ns, s.to_owned()), None),
-            Err(_) => (
-                route_opaque(recv_ns, "text_invalid_utf8", frame.payload()),
-                None,
-            ),
+            Err(_) => (route_opaque(recv_ns, "text_invalid_utf8", frame.payload()), None),
         },
         other => {
             let mut close = None;
             if other == OpCode::Close {
                 let code = frame.close_code().map(u16::from);
-                let reason = frame
-                    .close_reason()
-                    .ok()
-                    .flatten()
-                    .unwrap_or("")
-                    .to_string();
+                let reason = frame.close_reason().ok().flatten().unwrap_or("").to_string();
                 close = Some(format!("close frame code={code:?} reason={reason:?}"));
             }
-            (
-                route_opaque(recv_ns, opcode_name(other), frame.payload()),
-                close,
-            )
+            (route_opaque(recv_ns, opcode_name(other), frame.payload()), close)
         }
     }
 }
@@ -416,13 +355,7 @@ pub struct Sink<'a> {
 
 impl<'a> Sink<'a> {
     pub fn new(tx: &'a SyncSender<Line>, last_seq: &'a mut Option<u64>, backlog: Backlog) -> Self {
-        Self {
-            tx,
-            last_seq,
-            backlog,
-            envelopes: 0,
-            backlog_ready: false,
-        }
+        Self { tx, last_seq, backlog, envelopes: 0, backlog_ready: false }
     }
 
     /// Hand one line to the writer. Err if the writer is gone.
@@ -431,13 +364,7 @@ impl<'a> Sink<'a> {
             // Same rule as FeedWriter::accept: a frame whose seqs are all
             // <= last_seq is skipped there (dup_skipped).
             let stale = self.last_seq.is_some_and(|l| line.seq_max <= l);
-            if self.backlog.observe(
-                line.recv_ns,
-                line.seq_first,
-                line.seq_max,
-                line.kind3_ts,
-                stale,
-            ) {
+            if self.backlog.observe(line.recv_ns, line.seq_first, line.seq_max, line.kind3_ts, stale) {
                 self.backlog_ready = true;
             }
             self.envelopes += 1;
@@ -456,22 +383,14 @@ impl<'a> Sink<'a> {
 async fn close_gracefully(ws: &mut FeedWs, sink: &mut Sink<'_>, reason: &str) -> CloseOutcome {
     let t0 = Instant::now();
     let deadline = tokio::time::Instant::now() + CLOSE_REPLY_WAIT;
-    let sent = tokio::time::timeout_at(
-        deadline,
-        ws.send(Frame::close(CloseCode::Normal, reason.as_bytes())),
-    )
-    .await;
+    let sent = tokio::time::timeout_at(deadline, ws.send(Frame::close(CloseCode::Normal, reason.as_bytes()))).await;
     let mut out = match sent {
-        Err(_) => CloseOutcome {
-            reason: "send_failed",
-            took: t0.elapsed(),
-            detail: "timeout sending close frame".into(),
-        },
-        Ok(Err(e)) => CloseOutcome {
-            reason: "send_failed",
-            took: t0.elapsed(),
-            detail: format!("sending close frame: {e}"),
-        },
+        Err(_) => {
+            CloseOutcome { reason: "send_failed", took: t0.elapsed(), detail: "timeout sending close frame".into() }
+        }
+        Ok(Err(e)) => {
+            CloseOutcome { reason: "send_failed", took: t0.elapsed(), detail: format!("sending close frame: {e}") }
+        }
         Ok(Ok(())) => loop {
             match tokio::time::timeout_at(deadline, ws.next_frame()).await {
                 Err(_) => {
@@ -494,11 +413,7 @@ async fn close_gracefully(ws: &mut FeedWs, sink: &mut Sink<'_>, reason: &str) ->
                     // If the writer is gone there is nowhere to put it.
                     let _ = sink.push(line);
                     if let Some(c) = close {
-                        break CloseOutcome {
-                            reason: "server_replied",
-                            took: t0.elapsed(),
-                            detail: c,
-                        };
+                        break CloseOutcome { reason: "server_replied", took: t0.elapsed(), detail: c };
                     }
                 }
             }
@@ -611,11 +526,7 @@ pub async fn run_connection(
                     reason = outcome.reason, took_ms = outcome.took.as_millis() as u64,
                     detail = %outcome.detail, "client close handshake done"
                 );
-                let mut e = end(
-                    EndKind::BlockIdle,
-                    format!("no block (seq > 0) for {block_idle:?}"),
-                    sink,
-                );
+                let mut e = end(EndKind::BlockIdle, format!("no block (seq > 0) for {block_idle:?}"), sink);
                 e.client_close = Some(Box::new(outcome));
                 return e;
             }
@@ -669,7 +580,8 @@ pub async fn run_connection(
 
 // -------------------------------------------------------- connections.tsv ---
 
-pub const CONNECTIONS_HEADER: &str = "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail";
+pub const CONNECTIONS_HEADER: &str =
+    "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail";
 
 /// One row of connections.tsv. `None` fields are written as `-`.
 #[derive(Debug, Default)]
@@ -706,9 +618,7 @@ pub struct ConnLog {
 
 impl ConnLog {
     pub fn new(out: &Path) -> Self {
-        Self {
-            path: out.join(CONNECTIONS_FILE),
-        }
+        Self { path: out.join(CONNECTIONS_FILE) }
     }
 
     pub fn event(&self, e: ConnEvent<'_>) {
@@ -736,10 +646,7 @@ impl ConnLog {
         );
         let res = (|| -> std::io::Result<()> {
             let new = !self.path.exists();
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
+            let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
             if new {
                 writeln!(f, "{CONNECTIONS_HEADER}")?;
             }
@@ -806,10 +713,7 @@ pub fn parse_last_session(text: &str) -> Option<LogSession> {
     let mut out: Option<LogSession> = None;
     for (ns, event) in text.lines().filter_map(row_ns_event) {
         if event == "connected" {
-            out = Some(LogSession {
-                connected_ns: ns,
-                last_row_ns: None,
-            });
+            out = Some(LogSession { connected_ns: ns, last_row_ns: None });
         } else if let Some(s) = out.as_mut() {
             s.last_row_ns = Some(ns);
         }
@@ -835,10 +739,7 @@ pub fn parse_pause_row(line: &str) -> Option<PendingPause> {
     let ts: u128 = c[1].parse().ok()?;
     let pause: f64 = c[6].parse().ok()?;
     let strikes: u32 = c[9].parse().unwrap_or(0);
-    Some(PendingPause {
-        not_before_ns: ts + (pause * 1e9) as u128,
-        strikes,
-    })
+    Some(PendingPause { not_before_ns: ts + (pause * 1e9) as u128, strikes })
 }
 
 #[cfg(test)]
@@ -871,32 +772,17 @@ mod tests {
         assert_eq!(c(403), EndKind::Forbidden);
         assert_eq!(c(404), EndKind::Forbidden);
         assert_eq!(c(520), EndKind::HttpError);
-        assert_eq!(
-            classify_upgrade_error(&WebSocketError::InvalidUpgradeHeader, &none),
-            EndKind::Forbidden
-        );
-        assert_eq!(
-            classify_upgrade_error(&WebSocketError::ConnectionClosed, &none),
-            EndKind::NetError
-        );
+        assert_eq!(classify_upgrade_error(&WebSocketError::InvalidUpgradeHeader, &none), EndKind::Forbidden);
+        assert_eq!(classify_upgrade_error(&WebSocketError::ConnectionClosed, &none), EndKind::NetError);
     }
 
     #[test]
     fn pause_survives_restart_via_connections_log() {
-        let dir = std::env::temp_dir().join(format!(
-            "recorder-connlog-{}-{}",
-            std::process::id(),
-            now_ns()
-        ));
+        let dir = std::env::temp_dir().join(format!("recorder-connlog-{}-{}", std::process::id(), now_ns()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = ConnLog::new(&dir);
         assert_eq!(log.last_pause(), None);
-        log.event(ConnEvent {
-            event: "connected",
-            reason: "-",
-            http_status: Some(101),
-            ..Default::default()
-        });
+        log.event(ConnEvent { event: "connected", reason: "-", http_status: Some(101), ..Default::default() });
         assert_eq!(log.last_pause(), None);
         let before = now_ns();
         log.event(ConnEvent {
@@ -910,18 +796,11 @@ mod tests {
             strikes: Some(1),
             detail: "upgrade: Invalid status code: 403;\tHTTP/1.1 403 Forbidden",
         });
-        log.event(ConnEvent {
-            event: "shutdown",
-            reason: "SIGTERM",
-            ..Default::default()
-        });
+        log.event(ConnEvent { event: "shutdown", reason: "SIGTERM", ..Default::default() });
         let p = log.last_pause().unwrap();
         assert_eq!(p.strikes, 1);
         let wait = p.not_before_ns - before;
-        assert!(
-            (3_599_000_000_000..=3_601_000_000_000).contains(&wait),
-            "{wait}"
-        );
+        assert!((3_599_000_000_000..=3_601_000_000_000).contains(&wait), "{wait}");
         let text = std::fs::read_to_string(dir.join(CONNECTIONS_FILE)).unwrap();
         assert!(text.starts_with(CONNECTIONS_HEADER));
         assert!(text.lines().all(|l| l.split('\t').count() == 11), "{text}");
@@ -937,15 +816,8 @@ mod tests {
         assert_eq!(parse_connected_row(old), Some(1790772741202619000));
         assert_eq!(parse_connected_row(new), Some(1790776652226292000));
         assert_eq!(parse_connected_row(CONNECTIONS_HEADER), None);
-        assert_eq!(
-            parse_connected_row("2026-09-30T14:03:00.329Z\t1790776980329123000\tshutdown\tSIGTERM"),
-            None
-        );
-        let dir = std::env::temp_dir().join(format!(
-            "recorder-connlog2-{}-{}",
-            std::process::id(),
-            now_ns()
-        ));
+        assert_eq!(parse_connected_row("2026-09-30T14:03:00.329Z\t1790776980329123000\tshutdown\tSIGTERM"), None);
+        let dir = std::env::temp_dir().join(format!("recorder-connlog2-{}-{}", std::process::id(), now_ns()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = ConnLog::new(&dir);
         assert_eq!(log.last_connected_ns(), None);
@@ -964,10 +836,7 @@ mod tests {
         let (mut server, client) = tokio::io::duplex(64);
         let (mut tap, head) = HeadTap::new(client);
         tokio::spawn(async move {
-            server
-                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\n\r\nbody")
-                .await
-                .unwrap();
+            server.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\n\r\nbody").await.unwrap();
         });
         let mut out = Vec::new();
         tap.read_to_end(&mut out).await.unwrap();

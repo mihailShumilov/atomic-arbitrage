@@ -10,11 +10,26 @@ use enricher::stats::Stats;
 
 #[tokio::test]
 async fn retries_after_429_honouring_retry_after() {
-    let m = start(Behavior { http_429_first: 2, retry_after: Some("1"), rpc_rate_limit_next: 1, ..Default::default() }).await;
+    let m = start(Behavior { http_429_first: 2, retry_after: Some("1"), rpc_rate_limit_next: 1, ..Default::default() })
+        .await;
     let d = scratch("retry-ok");
     let out = d.join("blocks");
-    let a = args(&["--rpc-url", &m.url, "--from", "100", "--to", "109", "--batch", "10", "--rps", "0",
-                   "--backoff-ms", "10", "--out-dir", out.to_str().unwrap()]);
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "100",
+        "--to",
+        "109",
+        "--batch",
+        "10",
+        "--rps",
+        "0",
+        "--backoff-ms",
+        "10",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
     let stats = Arc::new(Stats::default());
     let t = Instant::now();
     enricher::run(&a, stats.clone()).await.unwrap();
@@ -45,8 +60,22 @@ async fn gives_up_with_clear_error_and_writes_nothing() {
     let m = start(Behavior { always_429: true, ..Default::default() }).await;
     let d = scratch("retry-fail");
     let out = d.join("blocks");
-    let a = args(&["--rpc-url", &m.url, "--from", "5", "--to", "9", "--rps", "0", "--max-attempts", "3",
-                   "--backoff-ms", "5", "--out-dir", out.to_str().unwrap()]);
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "5",
+        "--to",
+        "9",
+        "--rps",
+        "0",
+        "--max-attempts",
+        "3",
+        "--backoff-ms",
+        "5",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
     let stats = Arc::new(Stats::default());
     let err = enricher::run(&a, stats.clone()).await.unwrap_err();
     let msg = format!("{err:#}");
@@ -63,8 +92,22 @@ async fn rps_limit_counts_calls_not_requests() {
     let d = scratch("rps");
     let out = d.join("blocks");
     // 4 batches × 2 calls at 5 calls/s: slots at 0, 0.4, 0.8, 1.2 s.
-    let a = args(&["--rpc-url", &m.url, "--from", "1", "--to", "4", "--batch", "1", "--concurrency", "4",
-                   "--rps", "5", "--out-dir", out.to_str().unwrap()]);
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "1",
+        "--to",
+        "4",
+        "--batch",
+        "1",
+        "--concurrency",
+        "4",
+        "--rps",
+        "5",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
     let t = Instant::now();
     enricher::run(&a, Arc::new(Stats::default())).await.unwrap();
     assert!(t.elapsed() >= Duration::from_millis(1180), "{:?}", t.elapsed());
@@ -77,8 +120,26 @@ async fn call_budget_is_never_exceeded() {
     let d = scratch("budget");
     let out = d.join("blocks");
     // Each attempt = 10 blocks = 20 calls; the 3rd attempt would make 60 > 50.
-    let a = args(&["--rpc-url", &m.url, "--from", "1", "--to", "10", "--batch", "10", "--rps", "0",
-                   "--backoff-ms", "5", "--max-attempts", "8", "--max-calls", "50", "--out-dir", out.to_str().unwrap()]);
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "1",
+        "--to",
+        "10",
+        "--batch",
+        "10",
+        "--rps",
+        "0",
+        "--backoff-ms",
+        "5",
+        "--max-attempts",
+        "8",
+        "--max-calls",
+        "50",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
     let stats = Arc::new(Stats::default());
     let err = enricher::run(&a, stats.clone()).await.unwrap_err();
     assert!(format!("{err:#}").contains("call budget exhausted"), "{err:#}");
