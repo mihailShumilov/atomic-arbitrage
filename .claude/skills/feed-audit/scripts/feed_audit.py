@@ -24,6 +24,8 @@ Checks:
   - optional: --rpc-sample N blocks compared with eth_getBlockByNumber
     (blockHash; l1BlockNumber vs feed header.blockNumber, see chain-facts.md:
     equal for kind 3, running max of header.blockNumber for delayed kinds).
+    The sample is drawn with --seed (default: time_ns) and the seed is printed
+    in rpc.seed, so a run can be repeated with the same blocks.
 
 Rates (blocks/s, MB/h) are computed over session time: the recording is cut
 into sessions at `connected` events of <feed-root>/connections.tsv (if it
@@ -59,6 +61,7 @@ import random
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 
 PUBLIC_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
@@ -577,16 +580,26 @@ def check_feed_root(t, feed_root):
     return gaps_file
 
 
-def check_rpc(t, url, sample):
-    """Compare a sample of blocks with eth_getBlockByNumber (one batch call)."""
-    blocks = t.blocks
+def rpc_pick(blocks, sample, seed):
+    """Sorted seqs to compare with RPC: first, last, some delayed (kind != 3), the rest random.
+
+    Deterministic for a given seed (random.Random(seed), not the global generator).
+    """
+    rng = random.Random(seed)
     seqs = sorted(blocks)
     pick = {seqs[0], seqs[-1]}
     delayed = [s for s in seqs if blocks[s][2] != 3]
-    pick.update(random.sample(delayed, min(len(delayed), max(1, sample // 4))))
+    pick.update(rng.sample(delayed, min(len(delayed), max(1, sample // 4))))
     rest = [s for s in seqs if s not in pick]
-    pick.update(random.sample(rest, min(len(rest), max(0, sample - len(pick)))))
-    pick = sorted(pick)
+    pick.update(rng.sample(rest, min(len(rest), max(0, sample - len(pick)))))
+    return sorted(pick)
+
+
+def check_rpc(t, url, sample, seed):
+    """Compare a sample of blocks with eth_getBlockByNumber (one batch call)."""
+    blocks = t.blocks
+    first = min(blocks)
+    pick = rpc_pick(blocks, sample, seed)
     try:
         res = rpc_blocks(url, pick)
     except Exception as e:  # report, don't crash the audit
@@ -602,13 +615,13 @@ def check_rpc(t, url, sample):
         # kind 3: header.blockNumber == l1BlockNumber. Delayed kinds carry the
         # inbox L1 block; RPC reports the running max (verified 2026-09-30).
         expected = l1 if kind == 3 else run_max
-        if rl1 != expected and not (kind != 3 and s == seqs[0]):
+        if rl1 != expected and not (kind != 3 and s == first):
             l1_bad.append((s, kind, l1, run_max, rl1))
     if hash_bad:
         t.fails.append("blockHash differs from RPC for %s" % hash_bad)
     if l1_bad:
         t.warns.append("l1BlockNumber model mismatch (seq, kind, header, running max, rpc): %s" % l1_bad)
-    return {"sampled": len(pick) if res else 0, "hash_mismatch": hash_bad, "l1_mismatch": l1_bad}
+    return {"seed": seed, "sampled": len(pick) if res else 0, "hash_mismatch": hash_bad, "l1_mismatch": l1_bad}
 
 
 def build_summary(scanner, n_files, n_ignored, gaps_file, rpc):
@@ -710,6 +723,12 @@ def parse_args(argv):
     ap.add_argument("--rpc-sample", type=int, default=0, help="blocks to compare with RPC (0 = none)")
     ap.add_argument("--rpc-url", default=os.environ.get("RPC_URL", PUBLIC_RPC_URL))
     ap.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="seed of the RPC sample (default: time_ns); printed in rpc.seed when given or when --rpc-sample > 0",
+    )
+    ap.add_argument(
         "--session-gap-s",
         type=float,
         default=30.0,
@@ -773,7 +792,11 @@ def main(argv=None):
     if no_hash:
         t.warns.append("%d blocks without blockHash" % no_hash)
     gaps_file = check_feed_root(t, a.feed_root)
-    rpc = check_rpc(t, a.rpc_url, a.rpc_sample) if a.rpc_sample > 0 else {}
+    # Default output is unchanged: without --seed and without a sample, rpc stays {}.
+    if a.rpc_sample > 0:
+        rpc = check_rpc(t, a.rpc_url, a.rpc_sample, a.seed if a.seed is not None else time.time_ns())
+    else:
+        rpc = {} if a.seed is None else {"seed": a.seed}
 
     summary = build_summary(scanner, len(files), len(ignored), gaps_file, rpc)
     if a.json:

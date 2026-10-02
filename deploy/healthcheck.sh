@@ -79,14 +79,30 @@ fi
 
 notify() { "$HC_NOTIFY" "$@"; }
 
+# write_state FILE CONTENT: atomic replace (temp file in the same dir + mv), so
+# a full disk or a kill never leaves an empty or half-written state file (an
+# empty gaps.offset would replay all of gaps.tsv; an empty .alert would lose
+# the title of the "восстановлено" message). On failure the old file stays.
+write_state() {
+    local f=$1 tmp="$1.tmp.$$"
+    if printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$f"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    log "cannot write state file $f"
+    rc=1
+    return 1
+}
+
 # raise KEY TITLE BODY — notify once while the condition holds.
 raise() {
     local key=$1 title=$2 body=$3 f="$HC_STATE_DIR/$1.alert"
     summary+=("$key=BAD")
     [[ -e $f ]] && return 0
     if notify alert "$title" "$body"; then
-        printf '%s\n' "$title" > "$f"
-        log "alert sent: $key: $title"
+        # Logged only once the state is stored; otherwise write_state logged the
+        # failure, set rc=1, and the alert is sent again next run.
+        write_state "$f" "$title" && log "alert sent: $key: $title"
     else
         log "notify failed for $key, will retry next run"
         rc=1
@@ -250,14 +266,13 @@ n_lines=0
 [[ -r $gaps ]] && n_lines=$(wc -l < "$gaps")
 if [[ ! -e $off_file ]]; then
     # First run (or wiped state): do not replay history.
-    echo "$n_lines" > "$off_file"
-    log "gaps: initialised offset at $n_lines rows"
+    write_state "$off_file" "$n_lines" && log "gaps: initialised offset at $n_lines rows"
 else
     off=$(tr -dc '0-9' < "$off_file")
     off=${off:-0}
     if (( n_lines < off )); then
         log "gaps.tsv shrank ($off -> $n_lines rows), resetting offset"
-        echo "$n_lines" > "$off_file"
+        write_state "$off_file" "$n_lines"
     elif (( n_lines > off )); then
         new=$(tail -n +"$((off + 1))" "$gaps" | head -n "$((n_lines - off))")
         read -r g_n g_blocks g_max < <(awk -F'\t' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
@@ -269,8 +284,7 @@ else
         listing=$(awk -F'\t' '$1 ~ /^[0-9]+$/ { printf "%s..%s (%d)\n", $1, $2, $2 - $1 + 1 }' <<< "$new" | head -n 10)
         if notify "$level" "новые дыры в фиде: $g_n шт., $g_blocks блоков (~$mins мин), самая длинная $g_max (~$max_mins мин)" \
             "$listing"$'\n'"Дозаливка: enricher --gaps (enricher-gaps.timer)."; then
-            echo "$n_lines" > "$off_file"
-            log "gaps: notified $g_n new rows"
+            write_state "$off_file" "$n_lines" && log "gaps: notified $g_n new rows"
         else
             log "notify failed for new gaps, will retry next run"
             rc=1
@@ -383,15 +397,14 @@ if [[ $HC_CHECK_RAID == 1 && -r $HC_MDSTAT ]]; then
         if [[ -n $new_keys ]]; then
             if notify info "RAID: идёт синхронизация: $raid_sync_txt" \
                 "Новая: $(paste -sd ' ' <<< "$new_keys"). Действий не нужно, если это начальная сборка, ежемесячная проверка или замена диска; сервер не перезагружать до конца. cat /proc/mdstat"; then
-                printf '%s\n' "$sync_keys" > "$keys_file"
-                log "raid: sync notified: $(paste -sd ' ' <<< "$new_keys")"
+                write_state "$keys_file" "$sync_keys" && log "raid: sync notified: $(paste -sd ' ' <<< "$new_keys")"
             else
                 log "notify failed for raid sync, will retry next run"
                 rc=1
             fi
         elif [[ $sync_keys != "$old_keys" ]]; then
             # Some syncs ended: forget them silently (no "finished" spam).
-            printf '%s\n' "$sync_keys" > "$keys_file"
+            write_state "$keys_file" "$sync_keys"
         fi
     else
         summary+=("raid=none")

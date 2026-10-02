@@ -10,32 +10,22 @@
 # the output smartd would log as "unexpected output" must be empty.
 #
 #   bash deploy/test/test-smartd-event.sh     (Linux, bash 4+)
-# check() evals its single-quoted expression later (SC2016); rc and out are
-# read there too (SC2034).
+# check() (lib.sh) evals its single-quoted expression later (SC2016); rc and
+# out are read there too (SC2034).
 # shellcheck disable=SC2016,SC2034
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$HERE/lib.sh"
 H=$HERE/../smartd-event.sh
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/bin"
+t_init
+t_shim_logger
+t_fake_notify --noisy
+export SMARTD_EVENT_NOTIFY=$T/bin/fake-notify
 
-cat > "$T/bin/logger" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$T_LOG"
-EOF
-cat > "$T/bin/fake-notify" <<'EOF'
-#!/usr/bin/env bash
-[[ ${FAKE_NOTIFY_FAIL:-0} == 1 ]] && { echo "fake notify failed" >&2; exit 1; }
-echo "notify.sh would print nothing, this goes to stdout"
-printf '%s|%s|%s\n' "$1" "$2" "${3//$'\n'/ / }" >> "$T_N"
-EOF
-chmod +x "$T/bin/"*
-export PATH="$T/bin:$PATH" T_LOG=$T/log T_N=$T/n SMARTD_EVENT_NOTIFY=$T/bin/fake-notify
-
-pass=0 fail=0
-check() { if eval "$2"; then pass=$((pass + 1)); echo "PASS  $1"; else fail=$((fail + 1)); echo "FAIL  $1"; sed 's/^/      n: /' "$T_N" 2> /dev/null; sed 's/^/      log: /' "$T_LOG" 2> /dev/null; printf '      out: %s\n' "$out"; fi; }
+out=""
+t_diag() { sed 's/^/      n: /' "$T_N" 2> /dev/null; sed 's/^/      log: /' "$T_LOG" 2> /dev/null; printf '      out: %s\n' "$out"; }
 
 # ev FAILTYPE MESSAGE [PREVCNT] [NEXTDAYS]: run the hook with smartd's environment.
 ev() {
@@ -111,5 +101,4 @@ else
     echo "SKIP  smartd_warning.sh not installed ($W)"
 fi
 
-echo "result: $pass passed, $fail failed"
-(( fail == 0 ))
+t_result

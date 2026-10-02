@@ -4,14 +4,21 @@
 # appends "LEVEL|TITLE" to a file, so every notification can be counted.
 #
 #   bash deploy/test/test-healthcheck.sh     (Linux with GNU coreutils, bash 4+)
+#
+# Harness from lib.sh (t_init, check, t_result). The notifier here is its own
+# fake: it logs "LEVEL|TITLE" for expect() and the raw body separately.
+# check() evals its single-quoted expression later (SC2016); the variables
+# it reads there look unused (SC2034).
+# shellcheck disable=SC2016,SC2034
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$HERE/lib.sh"
 HC=$HERE/../healthcheck.sh
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+t_init
 
-mkdir -p "$T/feed" "$T/blocks" "$T/state" "$T/bin" "$T/backup"
+mkdir -p "$T/feed" "$T/blocks" "$T/state" "$T/backup"
 NLOG=$T/notify.log
 : > "$NLOG"
 
@@ -41,9 +48,12 @@ cat > "$T/bin/fake-notify" <<'EOF'
 [[ ${FAKE_NOTIFY_FAIL:-0} == 1 ]] && exit 1
 printf '%s|%s\n' "$1" "$2" >> "$NLOG"
 printf '%s|%s|%s\n' "$1" "$2" "${3:-}" >> "$NLOG.body"
+# Task 028: the state dir turns read-only right after a delivered notification.
+[[ ${FAKE_NOTIFY_LOCK_STATE:-0} == 1 ]] && chmod a-w "$HC_STATE_DIR"
+exit 0
 EOF
 chmod +x "$T/bin/"*
-export PATH="$T/bin:$PATH" NLOG
+export NLOG
 
 export HC_CONFIG=/nonexistent HC_FEED_DIR=$T/feed HC_BLOCKS_DIR=$T/blocks HC_DATA_DIR=$T \
     HC_STATE_DIR=$T/state HC_NOTIFY=$T/bin/fake-notify HC_BACKUP_MARKER=$T/backup/last_ok \
@@ -63,10 +73,11 @@ echo 76600000 > "$T/feed/last_seq.txt"
 : > "$T/feed/gaps.tsv"
 printf '# from\tto\tfile\tfilled_unix_s\n' > "$T/blocks/filled.tsv"
 
-pass=0
-fail=0
 seen=0
-run() { bash "$HC" > "$T/last.out" 2>&1 || true; }
+run() { bash "$HC" > "$T/last.out" 2>&1; hc_rc=$?; }
+# check (lib.sh) evals EXPR, so single quotes in callers are intended; on FAIL
+# it prints the last healthcheck summary line and the last notification body.
+t_diag() { echo "      last: $(tail -n 1 "$T/last.out")"; echo "      body: $(tail -n 1 "$NLOG.body" 2> /dev/null)"; }
 # expect N DESC [REGEX]: exactly N new notifications since the last expect,
 # and each of them matches REGEX.
 expect() {
@@ -124,9 +135,14 @@ run; expect 1 "429: recovered" '^ok\|восстановлено'
 printf '76600001\t76601200\t%s\n' "$(ns "$now")" >> "$T/feed/gaps.tsv"
 run; expect 1 "new gap 1200 blocks (~2 min): one INFO" '^info\|новые дыры в фиде: 1 шт., 1200 блоков'
 run; expect 0 "new gap: no repeat"
+ino_before=$(stat -c %i "$T/state/gaps.offset")
 printf '76700000\t76703999\t%s\n76710000\t76710009\t%s\n' "$(ns "$now")" "$(ns "$now")" >> "$T/feed/gaps.tsv"
 run; expect 1 "two new gaps, one >= 5 min: one ALERT for the batch" '^alert\|новые дыры в фиде: 2 шт., 4010 блоков.*самая длинная 4000'
 run; expect 0 "two new gaps: no repeat"
+# Task 028: state files are replaced atomically (temp file + mv -> new inode).
+check "state: gaps.offset = 3, replaced by rename (new inode), no temp file left" \
+    '[[ $(cat "$T/state/gaps.offset") == 3 && $(stat -c %i "$T/state/gaps.offset") != "$ino_before" ]] &&
+     [[ -z $(find "$T/state" -name "*.tmp.*") ]]'
 
 # ------------------------------------------------ 3b. backfill lag + filled ---
 printf '76500000\t76500999\t%s\n' "$(ns $((now - 25 * 3600)))" >> "$T/feed/gaps.tsv"
@@ -180,11 +196,7 @@ export HC_BACKUP_MAX_AGE_H=0
 # --------------------------------------------- 9. notifier down -> retried ---
 export FAKE_NOTIFY_FAIL=1 FAKE_DF_PCT=81
 run; expect 0 "notifier failing: nothing delivered"
-if grep -q 'notify failed for disk' "$T/last.out"; then
-    echo "PASS  notifier failure logged"; pass=$((pass + 1))
-else
-    echo "FAIL  notifier failure not logged"; fail=$((fail + 1))
-fi
+check "notifier failure logged" 'grep -q "notify failed for disk" "$T/last.out"'
 export FAKE_NOTIFY_FAIL=0
 run; expect 1 "notifier back: the pending alert is delivered once" '^alert\|диск заполнен на 81%'
 export FAKE_DF_PCT=40
@@ -213,11 +225,7 @@ conn_full 196 backlog session_ended 101 - - 0.300 25 - 'requested=77170000 last_
 conn_full 196 client_close send_failed 101 - - 1.000 25 - 'sent close 1000, waited 0 ms; close 1000 "recorder writer gone": sending close frame: broken pipe'
 fresh
 run; expect 0 "009 rows (connected requested=/mode=, backlog, client_close, idle_timeout): silent"
-if grep -q 'ban=ok' "$T/last.out" && grep -q 'reconnects=ok' "$T/last.out"; then
-    echo "PASS  009 rows: ban=ok reconnects=ok"; pass=$((pass + 1))
-else
-    echo "FAIL  009 rows: summary $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
-fi
+check "009 rows: ban=ok reconnects=ok" 'grep -q "ban=ok" "$T/last.out" && grep -q "reconnects=ok" "$T/last.out"'
 # Planned restart: shutdown + client_close, then the min-interval wait.
 conn_full 100 shutdown SIGTERM - - - - - - -
 conn_full 100 client_close server_replied 101 - - 97.000 970 - 'sent close 1000, waited 146 ms; close 1000 "recorder shutdown": close frame code=Some(1000) reason="recorder shutdown"'
@@ -253,44 +261,24 @@ mkdir -p "$hour_dir"
 touch -d "@$now" "$hour_file"
 touch -d "@$((now - 600))" "$T/feed/last_seq.txt"
 run; expect 1 "hour file fresh, last_seq.txt 600 s old: ALERT" '^alert\|фид молчит'
-if tail -n 1 "$NLOG.body" | grep -q 'только ping'; then
-    echo "PASS  ping-only hint in the alert body"; pass=$((pass + 1))
-else
-    echo "FAIL  ping-only hint missing: $(tail -n 1 "$NLOG.body")"; fail=$((fail + 1))
-fi
-if grep -q 'feed_src=last_seq.txt' "$T/last.out"; then
-    echo "PASS  feed_src=last_seq.txt in summary"; pass=$((pass + 1))
-else
-    echo "FAIL  feed_src: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
-fi
+check "ping-only hint in the alert body" 'tail -n 1 "$NLOG.body" | grep -q "только ping"'
+check "feed_src=last_seq.txt in summary" 'grep -q "feed_src=last_seq.txt" "$T/last.out"'
 run; expect 0 "hour file fresh, last_seq.txt old: no repeat"
 fresh
 run; expect 1 "last_seq.txt fresh again: recovered" '^ok\|восстановлено: фид молчит'
 # Task 014 item 3: the hour file is still fresh here (as always while blocks
 # arrive), and the "recovered" text used to carry the ping-only hint.
 rec_body=$(tail -n 1 "$NLOG.body")
-if [[ $rec_body != *'только ping'* && $rec_body != *'блоков нет'* && $rec_body == *'last_seq.txt обновлялся'* ]]; then
-    echo "PASS  recovered text: no ping-only hint, says last_seq.txt was updated"; pass=$((pass + 1))
-else
-    echo "FAIL  recovered text: $rec_body"; fail=$((fail + 1))
-fi
+check "recovered text: no ping-only hint, says last_seq.txt was updated" '[[ $rec_body != *"только ping"* && $rec_body != *"блоков нет"* && $rec_body == *"last_seq.txt обновлялся"* ]]'
 # No last_seq.txt (first minutes after the very first start): hour file used.
 mv "$T/feed/last_seq.txt" "$T/last_seq.saved"
 run; expect 0 "no last_seq.txt, hour file fresh: healthy (fallback)"
-if grep -q 'feed_src=hour_file' "$T/last.out" && grep -q 'feed=ok' "$T/last.out"; then
-    echo "PASS  fallback: feed_src=hour_file feed=ok"; pass=$((pass + 1))
-else
-    echo "FAIL  fallback: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
-fi
+check "fallback: feed_src=hour_file feed=ok" 'grep -q "feed_src=hour_file" "$T/last.out" && grep -q "feed=ok" "$T/last.out"'
 touch -d "@$((now - 600))" "$hour_file"
 run; expect 1 "no last_seq.txt, hour file 600 s old: ALERT" '^alert\|фид молчит'
 rm -f "$hour_file"
 run; expect 0 "no last_seq.txt, no hour files: still the same alert"
-if grep -q 'feed_age_s=-1' "$T/last.out"; then
-    echo "PASS  nothing at all: feed_age_s=-1"; pass=$((pass + 1))
-else
-    echo "FAIL  nothing at all: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
-fi
+check "nothing at all: feed_age_s=-1" 'grep -q "feed_age_s=-1" "$T/last.out"'
 mv "$T/last_seq.saved" "$T/feed/last_seq.txt"
 fresh
 run; expect 1 "last_seq.txt back and fresh: recovered" '^ok\|восстановлено: фид молчит'
@@ -308,11 +296,7 @@ conn_full 38 connected - 101 - - - - 0 'wss://feed.mainnet.chain.robinhood.com r
 conn_full 37 backlog "done" 101 - - 0.500 300 - 'requested=77173000 last_seq_before=77172999 first_seq=77173000 first_minus_requested=0 backlog_blocks=300 complete=true'
 fresh
 run; expect 0 "012 block_idle reconnect rows: silent"
-if grep -q 'ban=ok' "$T/last.out" && grep -q 'reconnects=ok' "$T/last.out"; then
-    echo "PASS  block_idle rows: ban=ok reconnects=ok"; pass=$((pass + 1))
-else
-    echo "FAIL  block_idle rows: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
-fi
+check "block_idle rows: ban=ok reconnects=ok" 'grep -q "ban=ok" "$T/last.out" && grep -q "reconnects=ok" "$T/last.out"'
 
 # ------------------- 15. final task 012 recorder rows (mock run, 2026-10-01) ---
 # Rows copied from the task 012 mock runs of the final recorder binary
@@ -334,11 +318,7 @@ conn_full 83 client_close server_replied 101 - - 0.326 3 - 'sent close 1000, wai
 conn_full 82 startup_wait min_connect_interval - - 79.510 - - 0 'previous session ended 40.490s ago (end=data_mtime), min interval 120s'
 fresh
 run; expect 0 "012 mock rows (block_idle, SIGTERM, startup_wait new detail): silent"
-if grep -q 'ban=ok' "$T/last.out" && grep -q 'reconnects=ok' "$T/last.out" && grep -q 'writer=ok' "$T/last.out"; then
-    echo "PASS  012 mock rows: ban=ok reconnects=ok writer=ok"; pass=$((pass + 1))
-else
-    echo "FAIL  012 mock rows: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
-fi
+check "012 mock rows: ban=ok reconnects=ok writer=ok" 'grep -q "ban=ok" "$T/last.out" && grep -q "reconnects=ok" "$T/last.out" && grep -q "writer=ok" "$T/last.out"'
 # Writer error: shutdown writer_error, client_close "recorder writer error",
 # no `disconnected`, exit 2; then systemd restarts it and the min-interval
 # wait follows. Not a ban, but its own `writer` alert.
@@ -348,11 +328,7 @@ conn_full 41 backlog session_ended 101 - - 0.000 1 - 'requested=- last_seq_befor
 conn_full 41 client_close server_replied 101 - - 0.000 1 - 'sent close 1000, waited 0 ms; close 1000 "recorder writer error": close frame code=Some(1000) reason=""'
 conn_full 40 startup_wait min_connect_interval - - 79.510 - - 0 'previous session ended 40.490s ago (end=data_mtime), min interval 120s'
 run; expect 1 "shutdown writer_error: one writer alert, no ban" '^alert\|recorder: ошибка записи на диск \(1 за 60 мин\)'
-if tail -n 1 "$NLOG.body" | grep -q 'Not a directory' && grep -q 'ban=ok' "$T/last.out"; then
-    echo "PASS  writer alert body has the error text; ban=ok"; pass=$((pass + 1))
-else
-    echo "FAIL  writer alert: $(tail -n 1 "$NLOG.body") / $(tail -n 1 "$T/last.out")"; fail=$((fail + 1))
-fi
+check "writer alert body has the error text; ban=ok" 'tail -n 1 "$NLOG.body" | grep -q "Not a directory" && grep -q "ban=ok" "$T/last.out"'
 conn_full 39 writer_error final_commit - - - - - - 'No space left on device (os error 28)'
 run; expect 0 "writer_error final_commit while raised: no repeat"
 conn_full 1 connected - 101 - - - - 0 'ws://127.0.0.1:60021/ requested=501 mode=header'
@@ -393,16 +369,10 @@ md_set() { # ARRAY NEW_STATUS_LINE (e.g. "[2/1] [U_]") [EXTRA_LINE]
         { print }' "$T/mdstat" > "$T/mdstat.new" && mv "$T/mdstat.new" "$T/mdstat"
 }
 raid_summary() { grep -o 'raid=[^ ]*' "$T/last.out" | tail -n 1; }
-# chk DESC EXPR: EXPR is eval'ed here, so single quotes in callers are intended.
-chk() {
-    if eval "$2"; then echo "PASS  $1"; pass=$((pass + 1))
-    else echo "FAIL  $1: $(tail -n 1 "$T/last.out")"; fail=$((fail + 1)); fi
-}
 export HC_MDSTAT=$T/mdstat
 md_healthy
 run; expect 0 "raid: 4 healthy arrays: silent"
-# shellcheck disable=SC2016  # eval in chk
-chk "raid=ok in summary" '[[ $(raid_summary) == raid=ok ]]'
+check "raid=ok in summary" '[[ $(raid_summary) == raid=ok ]]'
 
 # Exactly what hood-rec showed at deploy time.
 md_set md3 "[2/2] [UU]" "[================>....]  resync = 81.7% (1439867648/1760449344) finish=56.3min speed=94890K/sec"
@@ -414,8 +384,7 @@ sed -i 's/resync = 81.7% (1439867648\/1760449344) finish=56.3min/resync = 99.1% 
 run; expect 0 "raid: resync progress 99.1%: no repeat"
 md_healthy; md_set md2 "[2/2] [UU]" "[>....................]  resync =  0.4% (8446799/2111699968) finish=370.1min speed=94700K/sec"
 run; expect 0 "raid: md3 done, md2 DELAYED -> running: no new notification"
-# shellcheck disable=SC2016  # eval in chk
-chk "raid_sync in summary" 'grep -q raid_sync=md2_resync_0.4% "$T/last.out"'
+check "raid_sync in summary" 'grep -q raid_sync=md2_resync_0.4% "$T/last.out"'
 md_healthy
 run; expect 0 "raid: all syncs finished: silent (mdadm RebuildFinished reports the end)"
 
@@ -423,15 +392,11 @@ run; expect 0 "raid: all syncs finished: silent (mdadm RebuildFinished reports t
 md_healthy; md_set md2 "[2/1] [U_]"; sed -i 's/sdb3\[1\]/sdb3[1](F)/' "$T/mdstat"
 run; expect 1 "raid: md2 [U_]: one ALERT" '^alert\|RAID деградирован: md2 \[2/1\] \[U_\]$'
 # The body is multi-line (mdstat excerpt + hint): look at the last 6 lines.
-if tail -n 6 "$NLOG.body" | grep -q 'md2 : active raid1 sda3\[0\] sdb3\[1\](F)' &&
-    tail -n 6 "$NLOG.body" | grep -q '\[2/1\] \[U_\]' && tail -n 1 "$NLOG.body" | grep -q 'не перезагружать'; then
-    echo "PASS  raid alert body: mdstat lines and the do-not-reboot hint"; pass=$((pass + 1))
-else
-    echo "FAIL  raid alert body: $(tail -n 6 "$NLOG.body")"; fail=$((fail + 1))
-fi
+check "raid alert body: mdstat lines and the do-not-reboot hint" \
+    'tail -n 6 "$NLOG.body" | grep -q "md2 : active raid1 sda3\[0\] sdb3\[1\](F)" &&
+     tail -n 6 "$NLOG.body" | grep -q "\[2/1\] \[U_\]" && tail -n 1 "$NLOG.body" | grep -q "не перезагружать"'
 run; expect 0 "raid: still degraded: no repeat"
-# shellcheck disable=SC2016  # eval in chk
-chk "raid=BAD in summary" '[[ $(raid_summary) == raid=BAD ]]'
+check "raid=BAD in summary" '[[ $(raid_summary) == raid=BAD ]]'
 # New disk added, recovery onto it: still degraded, one INFO for the recovery.
 md_healthy; md_set md2 "[2/1] [U_]" "[==>..................]  recovery = 12.6% (266083712/2111699968) finish=320.4min speed=96000K/sec"
 run; expect 1 "raid: recovery started on degraded md2: one INFO, no second ALERT" '^info\|RAID: идёт синхронизация: md2 recovery 12.6%, осталось ~321 мин$'
@@ -450,8 +415,7 @@ run; expect 1 "raid: healthy again: recovered" '^ok\|восстановлено:
 # Monthly mdcheck: shown in the summary, never notified.
 md_set md3 "[2/2] [UU]" "[====>................]  check = 22.3% (392580000/1760449344) finish=240.0min speed=95000K/sec"
 run; expect 0 "raid: check 22.3%: no notification"
-# shellcheck disable=SC2016  # eval in chk
-chk "check in summary" 'grep -q raid_sync=md3_check_22.3% "$T/last.out"'
+check "check in summary" 'grep -q raid_sync=md3_check_22.3% "$T/last.out"'
 md_healthy
 
 # Notifier down when a resync starts: retried, delivered once.
@@ -468,8 +432,7 @@ run; expect 0 "raid: md1 done: silent"
 # fix n_arr stayed 0 and the check said raid=none silently.
 printf 'Personalities : [raid1]\nmd127 : inactive sdb3[1](S)\n      2111699968 blocks super 1.2\n\nunused devices: <none>\n' > "$T/mdstat"
 run; expect 1 "raid: only an inactive array: one ALERT" '^alert\|RAID деградирован: md127 inactive$'
-# shellcheck disable=SC2016  # eval in chk
-chk "raid=BAD with only inactive arrays" '[[ $(raid_summary) == raid=BAD ]]'
+check "raid=BAD with only inactive arrays" '[[ $(raid_summary) == raid=BAD ]]'
 run; expect 0 "raid: only inactive: no repeat"
 md_healthy
 run; expect 1 "raid: active arrays back: recovered" '^ok\|восстановлено: RAID деградирован: md127 inactive'
@@ -477,30 +440,25 @@ run; expect 1 "raid: active arrays back: recovered" '^ok\|восстановле
 # No arrays / no file: check skipped.
 printf 'Personalities : \nunused devices: <none>\n' > "$T/mdstat"
 run; expect 0 "raid: mdstat without arrays: silent"
-# shellcheck disable=SC2016  # eval in chk
-chk "raid=none without arrays" '[[ $(raid_summary) == raid=none ]]'
+check "raid=none without arrays" '[[ $(raid_summary) == raid=none ]]'
 export HC_MDSTAT=$T/no-mdstat
 run; expect 0 "raid: no mdstat file: silent"
-# shellcheck disable=SC2016  # eval in chk
-chk "no raid key without /proc/mdstat" '[[ -z $(raid_summary) ]]'
+check "no raid key without /proc/mdstat" '[[ -z $(raid_summary) ]]'
 
 # ----------------------------------------------------------- 17. smartd ---
 # Task 015: healthcheck only checks that smartd runs; SMART warnings come
 # from smartd itself (test-smartd-event.sh).
 smartd_summary() { grep -o 'smartd=[^ ]*' "$T/last.out" | tail -n 1; }
 run; expect 0 "smartd: smartmontools not installed (auto): silent"
-# shellcheck disable=SC2016  # eval in chk
-chk "smartd: no smartd key without smartmontools" '[[ -z $(smartd_summary) ]]'
+check "smartd: no smartd key without smartmontools" '[[ -z $(smartd_summary) ]]'
 printf '#!/bin/sh\n' > "$T/fake-smartd"; chmod +x "$T/fake-smartd"
 export HC_SMARTD_BIN=$T/fake-smartd
 run; expect 0 "smartd: installed and active: silent"
-# shellcheck disable=SC2016  # eval in chk
-chk "smartd=ok in summary" '[[ $(smartd_summary) == smartd=ok ]]'
+check "smartd=ok in summary" '[[ $(smartd_summary) == smartd=ok ]]'
 export FAKE_SMARTD_STATE=failed
 run; expect 1 "smartd: failed: one ALERT" '^alert\|smartd не работает \(systemd: failed\): SMART-мониторинг дисков выключен$'
 run; expect 0 "smartd: still failed: no repeat"
-# shellcheck disable=SC2016  # eval in chk
-chk "smartd=BAD in summary, recorder unit still ok" '[[ $(smartd_summary) == smartd=BAD ]] && grep -q "unit=active" "$T/last.out"'
+check "smartd=BAD in summary, recorder unit still ok" '[[ $(smartd_summary) == smartd=BAD ]] && grep -q "unit=active" "$T/last.out"'
 export FAKE_SMARTD_STATE=inactive
 run; expect 0 "smartd: failed -> inactive: same alert, no repeat"
 export FAKE_SMARTD_STATE=active
@@ -520,9 +478,40 @@ run; expect 1 "smartd: recovered" '^ok\|восстановлено: smartd'
 export HC_CHECK_SMARTD=auto
 unset FAKE_SMARTD_STATE
 
+# ------------------------------------- 18. state write fails (task 028) ---
+# Needs a non-root user (root ignores the read-only dir): in Docker run with
+# --user 1000:1000. The notification goes out, then the state cannot be
+# stored: rc=1, "cannot write state file", no "notified"/"alert sent" line,
+# old state kept, no temp file; the next run re-sends and stores it.
+if (( EUID != 0 )); then
+    off_before=$(cat "$T/state/gaps.offset")
+    printf '76900000\t76900009\t%s\n' "$(ns "$now")" >> "$T/feed/gaps.tsv"
+    export FAKE_DF_PCT=81 FAKE_NOTIFY_LOCK_STATE=1
+    run; expect 2 "state dir read-only after notify: gap INFO and disk ALERT delivered" '^(info\|новые дыры в фиде: 1 шт., 10 блоков|alert\|диск)'
+    check "write failure: rc=1, logged for gaps.offset and disk.alert" \
+        '[[ $hc_rc -eq 1 ]] && grep -q "cannot write state file $T/state/gaps.offset" "$T/last.out" &&
+         grep -q "cannot write state file $T/state/disk.alert" "$T/last.out"'
+    check "write failure: no 'gaps: notified' / 'alert sent' line" \
+        '! grep -q "gaps: notified" "$T/last.out" && ! grep -q "alert sent: disk" "$T/last.out"'
+    check "write failure: old gaps.offset kept, no disk.alert, no temp file" \
+        '[[ $(cat "$T/state/gaps.offset") == "$off_before" && ! -e $T/state/disk.alert ]] &&
+         [[ -z $(find "$T/state" -name "*.tmp.*") ]]'
+    chmod u+w "$T/state"
+    export FAKE_NOTIFY_LOCK_STATE=0
+    run; expect 2 "state writable again: both re-sent (at least once)" '^(info\|новые дыры|alert\|диск)'
+    check "after recovery: rc=0, both logged, offset advanced" \
+        '[[ $hc_rc -eq 0 ]] && grep -q "gaps: notified 1 new rows" "$T/last.out" && grep -q "alert sent: disk" "$T/last.out" &&
+         [[ $(cat "$T/state/gaps.offset") == $((off_before + 1)) ]]'
+    run; expect 0 "after recovery: no repeat"
+    export FAKE_DF_PCT=40
+    run; expect 1 "disk back: recovered" '^ok\|восстановлено: диск'
+else
+    echo "SKIP  state write failure (needs a non-root user: docker run --user 1000:1000)"
+fi
+
 # ------------------------------------------------- 10. everything at once ---
 run; expect 0 "final: healthy, silent"
+check "final: no temp state files left" '[[ -z $(find "$T/state" -name "*.tmp.*") ]]'
 tail -n 1 "$T/last.out"
 
-echo "result: $pass passed, $fail failed"
-(( fail == 0 ))
+t_result

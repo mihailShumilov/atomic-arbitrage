@@ -275,6 +275,8 @@ class Sampler:
         rc, param, status = self.rpc.call("eth_getBlockReceipts", [hex(n)], "receipts", False)
         txs = blk["transactions"]
         bad = None
+        # Same rule as hoodlib.tx_receipt_pairs (count, txHash) plus blockHash; kept
+        # here on purpose: the mismatch is written to the call ledger before Stop.
         if len(rc) != len(txs):
             bad = f"{len(rc)} receipts for {len(txs)} txs"
         elif any(r.get("blockHash") != blk["hash"] or r.get("transactionHash") != t["hash"] for r, t in zip(rc, txs)):

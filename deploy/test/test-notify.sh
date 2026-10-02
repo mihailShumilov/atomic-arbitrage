@@ -4,22 +4,19 @@
 # curl argv or in the log, masking of the token in curl errors, exit codes.
 #
 #   bash deploy/test/test-notify.sh
-# check() evals its single-quoted expression later, so variables in single
-# quotes are intended (SC2016); the variables it uses look unused (SC2034).
+# check() (lib.sh) evals its single-quoted expression later, so variables in
+# single quotes are intended (SC2016); the variables it uses look unused (SC2034).
 # shellcheck disable=SC2016,SC2034
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$HERE/lib.sh"
 N=$HERE/../notify.sh
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/bin"
+t_init
+t_shim_logger
 TOKEN="123456:FAKE-token-for-tests-only"
 
-cat > "$T/bin/logger" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$T_LOG"
-EOF
 cat > "$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$T_ARGV"
@@ -30,11 +27,8 @@ case ${FAKE_CURL:-ok} in
     net_error) url=$(sed -n 's/^url = "\(.*\)"$/\1/p' "$T_STDIN"); echo "curl: (7) Failed to connect to $url"; exit 7 ;;
 esac
 EOF
-chmod +x "$T/bin/"*
-export PATH="$T/bin:$PATH" T_LOG=$T/log T_ARGV=$T/argv T_STDIN=$T/stdin
-
-pass=0 fail=0
-check() { if eval "$2"; then pass=$((pass + 1)); echo "PASS  $1"; else fail=$((fail + 1)); echo "FAIL  $1"; fi; }
+chmod +x "$T/bin/curl"
+export T_ARGV=$T/argv T_STDIN=$T/stdin
 
 # 1. No notify.env: journald only, curl not called.
 : > "$T_LOG"; rm -f "$T_ARGV"
@@ -81,5 +75,4 @@ check "usage: missing title -> exit 2" '[[ $rc -eq 2 ]]'
 bash "$N" panic "t" > /dev/null 2>&1; rc=$?
 check "usage: bad level -> exit 2" '[[ $rc -eq 2 ]]'
 
-echo "result: $pass passed, $fail failed"
-(( fail == 0 ))
+t_result

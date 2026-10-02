@@ -3,14 +3,15 @@
 # "remote" (no network, no credentials). Needs rclone and GNU coreutils.
 #
 #   bash deploy/test/test-backup.sh
-# check() evals its single-quoted expression later, so variables in single
-# quotes are intended (SC2016); the variables it uses look unused (SC2034).
+# check() (lib.sh) evals its single-quoted expression later, so variables in
+# single quotes are intended (SC2016); the variables it uses look unused (SC2034).
 # shellcheck disable=SC2016,SC2034
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$HERE/lib.sh"
 B=$HERE/../backup.sh
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+t_init
 command -v rclone > /dev/null || { echo "SKIP: rclone not installed"; exit 0; }
 
 F=$T/feed; mkdir -p "$F/2026/09/30" "$F/_torn" "$T/blocks" "$T/logs" "$T/remote"
@@ -34,8 +35,6 @@ BACKUP_LOGS_DIR=$T/logs
 BACKUP_MARKER=$T/state/last_ok
 EOT
 export BACKUP_ENV=$T/backup.env
-pass=0 fail=0
-check() { if eval "$2"; then pass=$((pass + 1)); echo "PASS  $1"; else fail=$((fail + 1)); echo "FAIL  $1"; fi; }
 R=$T/remote
 
 bash "$B" > "$T/out1" 2>&1; rc=$?
@@ -71,5 +70,4 @@ printf 'BACKUP_REMOTE=CHANGE-ME:path\n' > "$T/bad.env"
 BACKUP_ENV=$T/bad.env bash "$B" > /dev/null 2>&1; rc=$?
 check "placeholder remote: refuses (exit 2)" '[[ $rc -eq 2 ]]'
 
-echo "result: $pass passed, $fail failed"
-(( fail == 0 )) || { tail -n 20 "$T"/out*; exit 1; }
+t_result || { tail -n 20 "$T"/out*; exit 1; }

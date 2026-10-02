@@ -4,27 +4,18 @@
 # /proc/mdstat is a fake copy. No mdadm, no systemd, no network.
 #
 #   bash deploy/test/test-mdadm-event.sh     (Linux, bash 4+)
-# check() evals its single-quoted expression later (SC2016); rc is read
-# there too (SC2034).
+# check() (lib.sh) evals its single-quoted expression later (SC2016); rc is
+# read there too (SC2034).
 # shellcheck disable=SC2016,SC2034
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$HERE/lib.sh"
 H=$HERE/../mdadm-event.sh
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/bin"
-
-cat > "$T/bin/logger" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$T_LOG"
-EOF
-cat > "$T/bin/fake-notify" <<'EOF'
-#!/usr/bin/env bash
-[[ ${FAKE_NOTIFY_FAIL:-0} == 1 ]] && exit 1
-printf '%s|%s|%s\n' "$1" "$2" "${3//$'\n'/ / }" >> "$T_N"
-EOF
-chmod +x "$T/bin/"*
+t_init
+t_shim_logger
+t_fake_notify
 # Degraded md2 (sdb3 failed), healthy md1: the excerpt must contain md2 only.
 cat > "$T/mdstat" <<'EOF'
 Personalities : [raid1]
@@ -37,11 +28,9 @@ md1 : active raid1 sda2[0] sdb2[1]
 
 unused devices: <none>
 EOF
-export PATH="$T/bin:$PATH" T_LOG=$T/log T_N=$T/n \
-    MDADM_EVENT_NOTIFY=$T/bin/fake-notify MDADM_EVENT_MDSTAT=$T/mdstat
+export MDADM_EVENT_NOTIFY=$T/bin/fake-notify MDADM_EVENT_MDSTAT=$T/mdstat
 
-pass=0 fail=0
-check() { if eval "$2"; then pass=$((pass + 1)); echo "PASS  $1"; else fail=$((fail + 1)); echo "FAIL  $1"; sed 's/^/      n: /' "$T_N" 2> /dev/null; sed 's/^/      log: /' "$T_LOG" 2> /dev/null; fi; }
+t_diag() { sed 's/^/      n: /' "$T_N" 2> /dev/null; sed 's/^/      log: /' "$T_LOG" 2> /dev/null; }
 ev() { : > "$T_N"; : > "$T_LOG"; bash "$H" "$@"; rc=$?; }
 
 ev Fail /dev/md/2 /dev/sdb3
@@ -80,5 +69,4 @@ check "notifier failing: exit 0, failure logged" '[[ $rc -eq 0 ]] && grep -q "no
 MDADM_EVENT_MDSTAT=$T/missing ev DegradedArray /dev/md/2
 check "no mdstat: ALERT still sent" 'grep -q "^alert|RAID деградирован: /dev/md/2|cat /proc/mdstat" "$T_N"'
 
-echo "result: $pass passed, $fail failed"
-(( fail == 0 ))
+t_result

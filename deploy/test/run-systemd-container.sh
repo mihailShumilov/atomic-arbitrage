@@ -69,6 +69,11 @@ docker exec "$NAME" sh -c 'mkdir -p /etc/systemd/system/chrony.service.d &&
     systemctl daemon-reload'
 
 x() { docker exec "$NAME" bash -c "$1"; }
+# Units of the kit, as bootstrap.sh installs them: every deploy/*.service and
+# deploy/*.timer; the template notify-failure@.service is verified as an instance.
+units=$(cd "$ROOT/deploy" && for u in *.service *.timer; do printf '%s ' "${u/%@.service/@x.service}"; done)
+units=${units% }
+echo "units: $units"
 # boot: runs bootstrap, shows its WARN/ERROR lines on stderr, prints the change count.
 boot() {
     x 'bash /opt/hoodchain-mev/src/deploy/bootstrap.sh' > "$WORK/boot.log" 2>&1 || true
@@ -88,6 +93,9 @@ x 'touch /tmp/m; sleep 1'
 c2=$(boot); expect_changes 0 "$c2" "bootstrap run 2"
 mod=$(x 'find / -xdev \( -path /proc -o -path /sys -o -path /run -o -path /tmp -o -path /var/log -o -path /var/lib/systemd -o -path /var/cache \) -prune -o -newer /tmp/m -print 2>/dev/null')
 ok "run 2 modified no files" "run 2 modified: $mod" test -z "$mod"
+# shellcheck disable=SC2016  # expands inside the container
+ok "every deploy/*.service and *.timer installed as is" "unit files not installed" \
+    x 'cd /opt/hoodchain-mev/src/deploy && for u in *.service *.timer; do cmp -s "$u" "/etc/systemd/system/$u" || exit 1; done'
 
 # Task 014: timezone and mdadm steps of bootstrap.
 tz=$(x 'timedatectl show -p Timezone --value' || true)
@@ -164,11 +172,10 @@ if (( build )); then
     x 'bash /opt/hoodchain-mev/src/deploy/build-on-server.sh' | grep '^\[build\]'
     c3=$(boot); expect_changes 2 "$c3" "bootstrap run 3 (enables 2 timers)"
     c4=$(boot); expect_changes 0 "$c4" "bootstrap run 4"
-    units='recorder.service healthcheck.service healthcheck.timer feed-audit.service feed-audit.timer backup.service backup.timer enricher-gaps.service enricher-gaps.timer notify-failure@x.service'
     ok "systemd-analyze verify (all units)" "verify" x "cd /etc/systemd/system && systemd-analyze verify $units"
 else
     # Without binaries verify reports only the two missing ExecStart binaries.
-    out=$(x 'cd /etc/systemd/system && systemd-analyze verify recorder.service healthcheck.service healthcheck.timer feed-audit.service feed-audit.timer backup.service backup.timer enricher-gaps.service enricher-gaps.timer notify-failure@x.service 2>&1' || true)
+    out=$(x "cd /etc/systemd/system && systemd-analyze verify $units 2>&1" || true)
     other=$(grep -v 'is not executable: No such file or directory' <<< "$out" || true)
     ok "systemd-analyze verify (only missing binaries reported)" "verify: $other" test -z "$other"
 fi

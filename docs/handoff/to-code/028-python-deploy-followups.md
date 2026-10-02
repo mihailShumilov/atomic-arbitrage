@@ -1,5 +1,5 @@
 # 028 — Python и deploy: хвосты ревью
-status: ready
+status: done
 phase: 1a
 depends-on: 024
 executor: indexer-engineer (Python), infra-ops (deploy)

@@ -78,9 +78,12 @@ def zlen(b: bytes) -> int:
     return len(subprocess.run(["zstd", "-3", "-q", "-c"], input=b, capture_output=True, check=True).stdout)
 
 
-def metrics(line: bytes, hour_start: int | None = None) -> dict:
-    """One output row (COLS) for one blocks-format line."""
-    o = json.loads(line)
+def metrics(line: bytes, hour_start: int | None = None, obj: dict | None = None) -> dict:
+    """One output row (COLS) for one blocks-format line.
+
+    obj: the already parsed line (json.loads(line)), to avoid parsing it twice.
+    """
+    o = obj if obj is not None else json.loads(line)
     b, rc = o["block"], o["receipts"]
     txs = b["transactions"]
     pairs = hl.tx_receipt_pairs(b, rc)
@@ -158,8 +161,8 @@ def main():
         with open(tmp, "w") as w:
             w.write("\t".join(COLS) + "\n")
             for line in hl.iter_block_lines(a.input):
-                num = json.loads(line)["number"]
-                m = metrics(line, hour_of.get(num))
+                o = json.loads(line)
+                m = metrics(line, hour_of.get(o["number"]), o)
                 w.write("\t".join(str(m[c]) for c in COLS) + "\n")
                 n += 1
         os.replace(tmp, a.out)

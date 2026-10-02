@@ -12,8 +12,9 @@
 #   dirs       /opt/hoodchain-mev/{bin,deploy}, /srv/hood/data/{feed,blocks,logs},
 #              /srv/hood/reports, /etc/hoodchain, /var/lib/hoodchain/{health,backup}
 #   scripts    deploy/*.sh, feed_audit.py, README -> /opt/hoodchain-mev/deploy
-#   units      recorder, healthcheck(+timer), feed-audit(+timer),
-#              backup(+timer), enricher-gaps(+timer), notify-failure@
+#   units      every deploy/*.service and deploy/*.timer (the files are the
+#              list; which timers get enabled is the explicit list in the
+#              `timers` section below)
 #   config     journald limits, needrestart exclusion for recorder,
 #              /etc/hoodchain/*.example (real secrets are created by hand)
 #   mdadm      if installed: PROGRAM mdadm-event.sh in
@@ -157,9 +158,15 @@ for e in "$DEPLOY_SRC"/etc/*.example; do
     install_file "$e" "$ETC/$(basename "$e")" 640 root hood
 done
 
+# The unit files in deploy/ are the only list of units of the kit; the test
+# stand (deploy/test/run-systemd-container.sh) builds its verify list the same
+# way. smartd-hood.service.conf is a drop-in (*.conf), installed below.
 units_changed=0
-units=(recorder.service healthcheck.service healthcheck.timer feed-audit.service feed-audit.timer
-    backup.service backup.timer enricher-gaps.service enricher-gaps.timer notify-failure@.service)
+units=()
+for u in "$DEPLOY_SRC"/*.service "$DEPLOY_SRC"/*.timer; do
+    [[ -f $u ]] || die "no unit files in $DEPLOY_SRC ($u)"
+    units+=("${u##*/}")
+done
 for u in "${units[@]}"; do
     install_file "$DEPLOY_SRC/$u" "$UNIT_DIR/$u" 644
     (( FILE_CHANGED )) && units_changed=1

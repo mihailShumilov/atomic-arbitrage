@@ -111,7 +111,13 @@ def load_sample(metrics_path, index_path):
         rows = list(csv.DictReader(f, delimiter="\t"))
     for r in rows:
         for k in r:
-            if k not in ("hour_start_utc", "date", "weekday"):
+            if k in ("hour_start_utc", "date", "weekday"):
+                continue
+            if k.endswith("_wei"):
+                # wei stay exact integers (empty -> None: arithmetic fails loudly, unlike NaN);
+                # divide only for display (bf_gwei)
+                r[k] = int(r[k]) if r[k] != "" else None
+            else:
                 r[k] = float(r[k]) if r[k] != "" else NAN
     rows.sort(key=itemgetter("block"))
     with open(index_path) as f:

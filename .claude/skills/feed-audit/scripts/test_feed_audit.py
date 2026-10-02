@@ -170,18 +170,41 @@ class PureFunctions(unittest.TestCase):
         self.assertFalse(fa.is_feed_file("data/feed/2026/10/01/feed-20261001-06.tsv.zst.tmp"))
         self.assertFalse(fa.is_feed_file("data/feed/connections.tsv"))
 
+    def test_frame_len_without_zstd(self):
+        """Header parsing that needs no real frame: runs on any machine (zstd CLI not required)."""
+        zstd_magic = (0xFD2FB528).to_bytes(4, "little")
+        self.assertEqual(fa.frame_len(zstd_magic[:2], 0), (None, "incomplete"))
+        self.assertEqual(fa.frame_len(zstd_magic, 0), (None, "incomplete"))
+        skippable = (0x184D2A50).to_bytes(4, "little") + (3).to_bytes(4, "little") + b"abc"
+        self.assertEqual(fa.frame_len(skippable, 0), (11, None))
+        self.assertEqual(fa.frame_len(skippable[:9], 0), (None, "incomplete"))
+        self.assertEqual(fa.frame_len(b"xx" + skippable, 2), (11, None))
+        self.assertEqual(fa.frame_len(b"garbage!", 0), (None, "invalid"))
+        self.assertEqual(fa.split_frames(skippable + skippable), (2, 22, None))
+        self.assertEqual(fa.split_frames(skippable + b"garbage!"), (1, 11, "invalid"))
+
+    def test_rpc_pick_is_deterministic_for_a_seed(self):
+        # blocks: seq -> (blockHash, header.blockNumber, kind, running max); every 7th is delayed (kind 9)
+        blocks = {s: ("0x", 1, 9 if s % 7 == 0 else 3, 1) for s in range(100, 300)}
+        a = fa.rpc_pick(blocks, 20, 42)
+        self.assertEqual(a, fa.rpc_pick(blocks, 20, 42))
+        self.assertEqual(a, sorted(a))
+        self.assertEqual(len(a), 20)
+        self.assertTrue({100, 299} <= set(a))
+        self.assertGreaterEqual(sum(1 for s in a if s % 7 == 0), 5)  # sample // 4 delayed
+        self.assertNotEqual(a, fa.rpc_pick(blocks, 20, 43))
+        self.assertEqual(fa.rpc_pick(blocks, 500, 1), sorted(blocks))  # sample larger than the record
+
 
 @unittest.skipUnless(HAVE_ZSTD, "zstd CLI not installed")
 class FrameLen(unittest.TestCase):
-    def test_complete_truncated_skippable_garbage(self):
+    """Cases that need a real frame from the zstd CLI (the rest: PureFunctions.test_frame_len_without_zstd)."""
+
+    def test_complete_and_truncated_real_frame(self):
         frame = zstd_frame(b"hello\n" * 100)
         self.assertEqual(fa.frame_len(frame, 0), (len(frame), None))
         self.assertEqual(fa.frame_len(frame[:-1], 0), (None, "incomplete"))
         self.assertEqual(fa.frame_len(frame[:2], 0), (None, "incomplete"))
-        skippable = (0x184D2A50).to_bytes(4, "little") + (3).to_bytes(4, "little") + b"abc"
-        self.assertEqual(fa.frame_len(skippable, 0), (11, None))
-        self.assertEqual(fa.frame_len(skippable[:9], 0), (None, "incomplete"))
-        self.assertEqual(fa.frame_len(b"garbage!", 0), (None, "invalid"))
         self.assertEqual(fa.split_frames(frame + frame), (2, 2 * len(frame), None))
         self.assertEqual(fa.split_frames(frame + frame[:10]), (1, len(frame), "incomplete"))
         self.assertEqual(fa.split_frames(frame + b"xyzw1234"), (1, len(frame), "invalid"))
@@ -396,6 +419,37 @@ class EndToEnd(unittest.TestCase):
             self.fail("feed_audit.py hung after an exception mid-file")
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("MemoryError: synthetic", p.stderr)
+
+    def test_rpc_seed(self):
+        """--seed: absent from the default output; printed when given; repeats the same RPC sample."""
+        self.write_normal_day()
+        _, s, _ = self.audit()
+        self.assertEqual(s["rpc"], {})
+        rc, out, _ = run_audit("--feed-root", self.tmp, "--now", self.NOW, self.glob)
+        self.assertIn("rpc                {}", out.splitlines())
+        _, s, _ = self.audit("--seed", "7")
+        self.assertEqual(s["rpc"], {"seed": 7})
+
+        calls = []
+
+        def fake_rpc_blocks(url, numbers):
+            calls.append(list(numbers))
+            return {n: {"hash": f"0x{n:064x}", "l1BlockNumber": hex(26095700)} for n in numbers}
+
+        real = fa.rpc_blocks
+        fa.rpc_blocks = fake_rpc_blocks
+        try:
+            r1 = self.audit("--rpc-sample", "8", "--seed", "42", "--rpc-url", "http://127.0.0.1:9")
+            r2 = self.audit("--rpc-sample", "8", "--seed", "42", "--rpc-url", "http://127.0.0.1:9")
+            r3 = self.audit("--rpc-sample", "8", "--rpc-url", "http://127.0.0.1:9")
+        finally:
+            fa.rpc_blocks = real
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(len(calls[0]), 8)
+        for rc, s, _ in (r1, r2):
+            self.assertEqual((rc, s["verdict"]), (0, "PASS"))
+            self.assertEqual(s["rpc"], {"seed": 42, "sampled": 8, "hash_mismatch": [], "l1_mismatch": []})
+        self.assertIsInstance(r3[1]["rpc"]["seed"], int)  # time_ns default, printed for a rerun
 
     def test_usage_errors(self):
         self.write_normal_day()

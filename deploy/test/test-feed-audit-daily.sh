@@ -11,18 +11,19 @@
 # cases print SKIP.
 #
 #   bash deploy/test/test-feed-audit-daily.sh     (bash 3.2+; default-day case needs GNU date)
-# check() evals its single-quoted expression later (SC2016); rc is read
-# there too (SC2034).
+# check() (lib.sh) evals its single-quoted expression later (SC2016); rc is
+# read there too (SC2034).
 # shellcheck disable=SC2016,SC2034
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$HERE/lib.sh"
 W=$HERE/../feed-audit-daily.sh
 REAL_AUDIT=$HERE/../../.claude/skills/feed-audit/scripts/feed_audit.py
-REAL_PY=$(command -v python3 || true)
-T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
-mkdir -p "$T/bin" "$T/feed" "$T/reports"
+REAL_PY=$(command -v python3 || true)   # before t_init puts the python3 shim first in PATH
+t_init
+mkdir -p "$T/feed" "$T/reports"
 
 # python3 shim: FAKE_AUDIT=real runs the real interpreter; otherwise it logs
 # its argv, prints $FAKE_AUDIT_OUT and exits with $FAKE_AUDIT_RC.
@@ -33,18 +34,13 @@ printf '%s\n' "$@" > "$T_ARGV"
 [[ -n ${FAKE_AUDIT_OUT:-} ]] && cat "$FAKE_AUDIT_OUT"
 exit "${FAKE_AUDIT_RC:-0}"
 EOF
-cat > "$T/bin/fake-notify" <<'EOF'
-#!/usr/bin/env bash
-[[ ${FAKE_NOTIFY_FAIL:-0} == 1 ]] && exit 1
-printf '%s|%s|%s\n' "$1" "$2" "${3//$'\n'/ / }" >> "$T_N"
-EOF
-chmod +x "$T/bin/"*
-export PATH="$T/bin:$PATH" T_N=$T/n T_ARGV=$T/argv REAL_PY \
+chmod +x "$T/bin/python3"
+t_fake_notify
+export T_ARGV=$T/argv REAL_PY \
     AUDIT_FEED_DIR=$T/feed AUDIT_REPORT_DIR=$T/reports AUDIT_SCRIPT=/fake/feed_audit.py \
     HC_NOTIFY=$T/bin/fake-notify
 
-pass=0 fail=0
-check() { if eval "$2"; then pass=$((pass + 1)); echo "PASS  $1"; else fail=$((fail + 1)); echo "FAIL  $1"; sed 's/^/      n: /' "$T_N" 2> /dev/null; sed 's/^/      out: /' "$T/out" 2> /dev/null; fi; }
+t_diag() { sed 's/^/      n: /' "$T_N" 2> /dev/null; sed 's/^/      out: /' "$T/out" 2> /dev/null; }
 # run [ARGS...]: the wrapper with a fresh notification log; rc, $T/out.
 run() { : > "$T_N"; rm -f "$T_ARGV"; bash "$W" "$@" > "$T/out" 2>&1; rc=$?; }
 
@@ -157,5 +153,4 @@ else
     echo "SKIP  real feed_audit.py cases (need python3, zstd and $REAL_AUDIT)"
 fi
 
-echo "result: $pass passed, $fail failed"
-(( fail == 0 ))
+t_result
