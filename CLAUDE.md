@@ -59,7 +59,7 @@ cargo build --release --workspace
 cargo test --workspace
 cargo run --release -p recorder -- --out-dir data/feed
 cargo run --release -p enricher -- --from <N> --to <M> --out-dir data/blocks
-docker compose up -d clickhouse   # схема из sql/ применяется при первом старте
+docker compose up -d clickhouse && sql/apply.sh   # миграции sql/NNN_*.sql, журнал hood.schema_migrations
 ```
 
 Docker: только уникальные порты хоста и только `127.0.0.1` — на машине работают другие проекты. ClickHouse: HTTP `127.0.0.1:18123`, native `127.0.0.1:19100` (`CLICKHOUSE_HTTP_PORT` / `CLICKHOUSE_TCP_PORT` в `.env`). Новые сервисы — тоже на свободных нестандартных портах, проверять `lsof -iTCP -sTCP:LISTEN`.

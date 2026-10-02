@@ -14,8 +14,11 @@ use futures::{stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::atomic::{append_line_synced, AtomicZstdFile};
-use crate::ranges::Range;
+use hood_core::fsutil::append_line_synced;
+use hood_core::hex::quantity;
+use hood_core::ranges::{FilledRow, Range};
+
+use crate::atomic::AtomicZstdFile;
 use crate::rpc::{Call, Check, Item, Rpc};
 
 pub const M_BLOCK: &str = "eth_getBlockByNumber";
@@ -29,7 +32,7 @@ pub fn file_name(r: Range) -> String {
 /// Consistency checks between a block and its receipts. A failure is
 /// treated as transient (retried, then the run stops) — never skipped.
 pub fn validate_block(n: u64, block: &Value, receipts: &Value) -> Result<(), String> {
-    let want = format!("0x{n:x}");
+    let want = quantity(n);
     if block["number"].as_str() != Some(want.as_str()) {
         return Err(format!("block {n}: number field is {}", block["number"]));
     }
@@ -53,7 +56,7 @@ pub fn validate_block(n: u64, block: &Value, receipts: &Value) -> Result<(), Str
 fn calls_for(from: u64, to: u64) -> Vec<Call> {
     let mut calls = Vec::with_capacity(((to - from + 1) * 2) as usize);
     for n in from..=to {
-        let tag = format!("0x{n:x}");
+        let tag = quantity(n);
         calls.push(Call { id: n * 2, method: M_BLOCK, params: json!([tag, true]) });
         calls.push(Call { id: n * 2 + 1, method: M_RECEIPTS, params: json!([tag]) });
     }
@@ -141,9 +144,11 @@ pub async fn write_range(rpc: &Rpc, dir: &Path, r: Range, o: &BlocksOpts) -> Res
 
 /// Record a committed file in `filled.tsv`. Called only after `commit`.
 pub fn mark_filled(dir: &Path, r: Range, file: &Path) -> Result<()> {
-    let name = file.file_name().and_then(|n| n.to_str()).context("file name")?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    append_line_synced(&dir.join(FILLED_TSV), &format!("{}\t{}\t{name}\t{now}", r.from, r.to))
+    let file_name = file.file_name().and_then(|n| n.to_str()).context("file name")?;
+    let filled_unix_s = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let row = FilledRow { range: r, file_name, filled_unix_s };
+    append_line_synced(&dir.join(FILLED_TSV), &row.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]

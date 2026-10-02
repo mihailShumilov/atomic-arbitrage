@@ -1,7 +1,8 @@
 //! Atomic output files and the per-out-dir lock.
 //!
 //! A file is written as `<final>.partial`, then zstd is finished, the file is
-//! `fsync`ed, renamed to its final name and the directory is `fsync`ed. A file
+//! `fsync`ed, renamed to its final name and the directory is `fsync`ed
+//! ([`hood_core::fsutil::rename_durable`]). A file
 //! with a final name is therefore always complete. If the process dies before
 //! `commit`, only a `*.partial` file can remain; it is removed on drop (normal
 //! error / Ctrl-C) or by [`OutDirLock::acquire`] on the next start (kill -9).
@@ -11,6 +12,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use hood_core::fsutil::rename_durable;
 
 pub const PARTIAL_SUFFIX: &str = ".partial";
 const LOCK_NAME: &str = ".enricher.lock";
@@ -51,11 +53,8 @@ impl AtomicZstdFile {
         let f = buf.into_inner().map_err(|e| e.into_error()).context("flush")?;
         f.sync_all().context("fsync data")?;
         drop(f);
-        fs::rename(&self.partial_path, &self.final_path)
-            .with_context(|| format!("rename {} -> {}", self.partial_path.display(), self.final_path.display()))?;
-        if let Some(dir) = self.final_path.parent() {
-            fsync_dir(dir)?;
-        }
+        // Rename + fsync of the directory; errors name the paths.
+        rename_durable(&self.partial_path, &self.final_path)?;
         Ok(self.final_path.clone())
     }
 }
@@ -76,11 +75,6 @@ impl Drop for AtomicZstdFile {
             let _ = fs::remove_file(&self.partial_path);
         }
     }
-}
-
-pub fn fsync_dir(dir: &Path) -> Result<()> {
-    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-    File::open(dir).and_then(|d| d.sync_all()).with_context(|| format!("fsync dir {}", dir.display()))
 }
 
 /// Exclusive lock on an output directory. Held for the whole run; the OS
@@ -125,16 +119,6 @@ fn remove_partials(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     removed.sort();
     Ok(removed)
-}
-
-/// Append one line to a small state file and fsync it.
-pub fn append_line_synced(path: &Path, line: &str) -> Result<()> {
-    let mut f =
-        OpenOptions::new().create(true).append(true).open(path).with_context(|| format!("open {}", path.display()))?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
-    f.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

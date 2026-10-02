@@ -34,8 +34,9 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use tracing::{info, warn};
 
+use hood_core::ranges::{self as hr, Range};
+
 use crate::atomic::OutDirLock;
-use crate::ranges::Range;
 use crate::rpc::{redact_url, RetryPolicy, Rpc};
 use crate::stats::{Stats, Summary};
 
@@ -156,7 +157,7 @@ pub async fn run(a: &Args, stats: Arc<Stats>) -> Result<()> {
             let lock = OutDirLock::acquire(&a.out_dir)?;
             report_partials(&lock);
             let opts = blocks::BlocksOpts { batch: a.batch, concurrency: a.concurrency };
-            for r in ranges::chunk(&[range], a.chunk.unwrap_or(u64::MAX)) {
+            for r in hr::chunk(&[range], a.chunk.unwrap_or(u64::MAX)) {
                 let path = blocks::write_range(&rpc, &a.out_dir, r, &opts).await?;
                 blocks::mark_filled(&a.out_dir, r, &path)?;
             }
@@ -170,7 +171,7 @@ pub async fn run(a: &Args, stats: Arc<Stats>) -> Result<()> {
                 a.topics.iter().map(|t| logs::validate_topic(t)).collect::<Result<_>>()?
             };
             let opts = logs::LogsOpts { topics, window: a.logs_window, window_max: a.logs_window_max };
-            for r in ranges::chunk(&[range], a.chunk.unwrap_or(u64::MAX)) {
+            for r in hr::chunk(&[range], a.chunk.unwrap_or(u64::MAX)) {
                 logs::write_range(&rpc, &a.logs_out_dir, r, &opts).await?;
             }
         }
@@ -191,12 +192,18 @@ async fn run_gaps(a: &Args, stats: Arc<Stats>) -> Result<()> {
         info!(file = %g.display(), gaps = v.len(), "read gaps");
         gaps.extend(v);
     }
-    let gaps = ranges::merge(gaps);
-    let filled = ranges::read_ranges_file(&a.out_dir.join(blocks::FILLED_TSV), "filled")?;
-    let todo = ranges::subtract(gaps.clone(), filled);
+    let gaps = hr::merge(gaps);
+    let filled_path = a.out_dir.join(blocks::FILLED_TSV);
+    let (filled, cut) = ranges::read_filled_file(&filled_path)?;
+    if let Some(line) = cut {
+        // Torn append (the enricher holds the out-dir lock, so nobody is
+        // writing it now): that file is not counted and gets downloaded again.
+        warn!(file = %filled_path.display(), line = %line.escape_debug(), "ignoring unterminated last line of filled.tsv (torn write?); its range is filled again");
+    }
+    let todo = hr::subtract(gaps.clone(), filled);
     let gap_blocks: u64 = gaps.iter().map(Range::blocks).sum();
     let todo_blocks: u64 = todo.iter().map(Range::blocks).sum();
-    let chunks = ranges::chunk(&todo, a.chunk.unwrap_or(1000));
+    let chunks = hr::chunk(&todo, a.chunk.unwrap_or(1000));
     info!(
         gap_ranges = gaps.len(),
         gap_blocks,

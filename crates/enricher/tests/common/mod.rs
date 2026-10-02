@@ -49,7 +49,7 @@ impl Mock {
 }
 
 pub fn hex(v: &Value) -> u64 {
-    u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+    hood_core::hex::parse_quantity(v.as_str().unwrap()).unwrap()
 }
 
 pub fn block_hash(n: u64) -> String {
@@ -86,7 +86,7 @@ fn answer(b: &Behavior, call: &Value) -> Value {
             Value::Array(
                 (a..=z)
                     .map(|n| {
-                        json!({"blockNumber": format!("0x{n:x}"), "blockHash": block_hash(n),
+                        json!({"blockNumber": hood_core::hex::quantity(n), "blockHash": block_hash(n),
                                     "logIndex": "0x0", "transactionIndex": "0x0", "transactionHash": tx_hash(n, 0),
                                     "address": "0x02", "topics": [t0], "data": "0x", "removed": false})
                     })

@@ -261,17 +261,6 @@ pub fn startup_wait(
     }
 }
 
-/// Parse an HTTP `Retry-After` value: delta-seconds or an HTTP-date.
-/// `now_unix` is used to turn a date into a delay.
-pub fn parse_retry_after(v: &str, now_unix: i64) -> Option<Duration> {
-    let v = v.trim();
-    if let Ok(secs) = v.parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    let when = chrono::DateTime::parse_from_rfc2822(v).ok()?.timestamp();
-    Some(Duration::from_secs(when.saturating_sub(now_unix).max(0) as u64))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +430,26 @@ mod tests {
         assert_eq!(p, RETRY_AFTER_MAX);
     }
 
+    /// Task 019: the shared parser (hood_core::http) accepts fractional
+    /// seconds; before 019 "90.5" fell back to the 429 ladder (5 min).
+    #[test]
+    fn fractional_and_date_retry_after_reach_the_ladder() {
+        use hood_core::http::parse_retry_after;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = UNIX_EPOCH + Duration::from_secs(784_111_777 - 120);
+        let mut l = Ladder::default();
+        let ra = parse_retry_after("90.5", now);
+        let (p, r) = l.next_pause(EndKind::RateLimited, ra, S0, 0.1);
+        assert_eq!((p, r), (Duration::from_millis(90_500), Rule::RetryAfter));
+        let ra = parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", now);
+        let (p, r) = Ladder::default().next_pause(EndKind::RateLimited, ra, S0, 0.1);
+        assert_eq!((p, r), (Duration::from_secs(120), Rule::RetryAfter));
+        // Sub-second values are still floored at 1 s by the ladder.
+        let ra = parse_retry_after("0.2", SystemTime::now());
+        let (p, _) = Ladder::default().next_pause(EndKind::RateLimited, ra, S0, 0.1);
+        assert_eq!(p, Duration::from_secs(1));
+    }
+
     #[test]
     fn mixed_429_and_403_share_strikes() {
         let mut l = Ladder::default();
@@ -520,14 +529,5 @@ mod tests {
         // Healthy normal close clears the ladder.
         l.next_pause(EndKind::ServerClosed, None, minutes(1), 0.5);
         assert_eq!(l.transient, 0);
-    }
-
-    #[test]
-    fn retry_after_parsing() {
-        assert_eq!(parse_retry_after(" 120 ", 0), Some(Duration::from_secs(120)));
-        // Sun, 06 Nov 1994 08:49:37 GMT = 784111777
-        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 - 30), Some(Duration::from_secs(30)));
-        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777 + 30), Some(Duration::ZERO));
-        assert_eq!(parse_retry_after("soon", 0), None);
     }
 }

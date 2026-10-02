@@ -55,6 +55,40 @@ async fn retries_after_429_honouring_retry_after() {
     assert_eq!(sum.sizes["eth_getBlockReceipts"].results, 10, "sizes count only accepted results");
 }
 
+/// Task 019: `Retry-After` as an HTTP-date is honoured (before 019 the
+/// enricher ignored it and retried after the 10 ms backoff).
+#[tokio::test]
+async fn retry_after_http_date_is_honoured() {
+    let when = chrono::Utc::now() + chrono::Duration::seconds(3);
+    let date: &'static str = Box::leak(when.format("%a, %d %b %Y %H:%M:%S GMT").to_string().into_boxed_str());
+    let m = start(Behavior { http_429_first: 1, retry_after: Some(date), ..Default::default() }).await;
+    let d = scratch("retry-date");
+    let out = d.join("blocks");
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "100",
+        "--to",
+        "101",
+        "--rps",
+        "0",
+        "--backoff-ms",
+        "10",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
+    let stats = Arc::new(Stats::default());
+    let t = Instant::now();
+    enricher::run(&a, stats.clone()).await.unwrap();
+    let el = t.elapsed();
+    assert_eq!(stats.counters().http_429, 1);
+    assert_eq!(m.requests(), 2);
+    // The date has 1 s resolution: the wait is 2..3 s.
+    assert!(el >= Duration::from_millis(1900), "HTTP-date Retry-After not honoured: {el:?}");
+    assert!(el < Duration::from_secs(10), "{el:?}");
+}
+
 #[tokio::test]
 async fn gives_up_with_clear_error_and_writes_nothing() {
     let m = start(Behavior { always_429: true, ..Default::default() }).await;

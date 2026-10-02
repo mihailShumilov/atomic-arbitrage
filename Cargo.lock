@@ -1060,6 +1060,7 @@ name = "enricher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "decoders",
  "futures",
@@ -1410,6 +1411,7 @@ dependencies = [
 name = "hood-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
 ]

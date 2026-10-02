@@ -8,3 +8,5 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# HTTP-date form of `Retry-After` (http::parse_retry_after); already used by recorder.
+chrono.workspace = true

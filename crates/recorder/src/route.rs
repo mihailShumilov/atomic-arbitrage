@@ -17,7 +17,7 @@
 //! Filtering is the job of the decode stage.
 
 use base64::Engine;
-use hood_core::{FeedEnvelope, Gap};
+use hood_core::{detect_gap, FeedEnvelope, Gap};
 
 /// One recorded line, handed from the network task to the writer thread.
 #[derive(Debug, Clone)]
@@ -79,8 +79,8 @@ pub fn intra_envelope_gaps(seqs: &[u64]) -> (Vec<Gap>, u32) {
     let mut disorder = 0u32;
     for w in seqs.windows(2) {
         let (a, b) = (w[0], w[1]);
-        if b > a + 1 {
-            gaps.push(Gap { from: a + 1, to: b - 1 });
+        if let Some(g) = detect_gap(Some(a), b) {
+            gaps.push(g);
         } else if b <= a {
             disorder += 1;
         }

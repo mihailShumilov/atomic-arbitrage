@@ -19,8 +19,10 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use hood_core::hex::{parse_quantity, quantity};
+use hood_core::ranges::Range;
+
 use crate::atomic::AtomicZstdFile;
-use crate::ranges::Range;
 use crate::rpc::{classify, Call, CallError, Check, ErrClass, Rpc};
 
 pub const M_LOGS: &str = "eth_getLogs";
@@ -74,10 +76,6 @@ pub struct LogsOpts {
     pub window_max: u64,
 }
 
-fn hex_u64(v: &Value) -> Option<u64> {
-    u64::from_str_radix(v.as_str()?.strip_prefix("0x")?, 16).ok()
-}
-
 enum WindowResult {
     Logs(Vec<Value>),
     TooMuch(String),
@@ -87,7 +85,7 @@ async fn get_logs(rpc: &Rpc, a: u64, b: u64, topics: &[String]) -> Result<Window
     let call = Call {
         id: 1,
         method: M_LOGS,
-        params: json!([{"fromBlock": format!("0x{a:x}"), "toBlock": format!("0x{b:x}"), "topics": [topics]}]),
+        params: json!([{"fromBlock": quantity(a), "toBlock": quantity(b), "topics": [topics]}]),
     };
     let what = format!("logs {a}..={b}");
     let check = |items: &[crate::rpc::Item]| match (&items[0].error, &items[0].result) {
@@ -149,14 +147,14 @@ pub async fn write_range(rpc: &Rpc, dir: &Path, r: Range, o: &LogsOpts) -> Resul
             WindowResult::Logs(logs) => {
                 let mut by_block: BTreeMap<u64, Vec<(u64, Value)>> = BTreeMap::new();
                 for l in logs {
-                    let n = hex_u64(&l["blockNumber"]).context("log without blockNumber")?;
+                    let n = l["blockNumber"].as_str().and_then(parse_quantity).context("log without blockNumber")?;
                     if n < start || n > end {
                         bail!("logs {start}..={end}: node returned a log from block {n}");
                     }
                     if l["removed"].as_bool() == Some(true) {
                         warn!(block = n, "log marked removed=true (kept as-is)");
                     }
-                    let idx = hex_u64(&l["logIndex"]).context("log without logIndex")?;
+                    let idx = l["logIndex"].as_str().and_then(parse_quantity).context("log without logIndex")?;
                     by_block.entry(n).or_default().push((idx, l));
                 }
                 for n in start..=end {

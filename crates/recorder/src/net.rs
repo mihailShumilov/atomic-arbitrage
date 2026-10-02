@@ -27,7 +27,9 @@ use tracing::{info, warn};
 use yawc::close::CloseCode;
 use yawc::{frame::OpCode, CompressionLevel, Frame, HttpRequest, MaybeTlsStream, Options, WebSocket, WebSocketError};
 
-use crate::backoff::{parse_retry_after, EndKind};
+use hood_core::http::parse_retry_after;
+
+use crate::backoff::EndKind;
 use crate::resume::Backlog;
 use crate::route::{route_opaque, route_text, Line};
 
@@ -265,11 +267,10 @@ async fn connect(url_str: &str, tls: &TlsConnector, requested: Option<u64>) -> s
                 WebSocketError::InvalidStatusCode(c) => Some(*c),
                 _ => head.status,
             };
-            let now_unix = (now_ns() / 1_000_000_000) as i64;
             Err(ConnEnd {
                 kind,
                 http_status: status,
-                retry_after: head.retry_after.as_deref().and_then(|v| parse_retry_after(v, now_unix)),
+                retry_after: head.retry_after.as_deref().and_then(|v| parse_retry_after(v, SystemTime::now())),
                 retry_after_raw: head.retry_after.clone(),
                 session: Duration::ZERO,
                 envelopes: 0,

@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
         torn_repairs = rec.repairs.len(), "recovery done"
     );
     for g in &rec.reconciled {
-        let detail = format!("{}..{} recv_ns={} missing from gaps.tsv, appended", g.from, g.to, g.recv_ns);
+        let detail = format!("{}..{} recv_ns={} missing from gaps.tsv, appended", g.range.from, g.range.to, g.recv_ns);
         conn_log.event(ConnEvent { event: "gap_reconciled", reason: "startup", detail: &detail, ..Default::default() });
     }
     for r in &rec.repairs {

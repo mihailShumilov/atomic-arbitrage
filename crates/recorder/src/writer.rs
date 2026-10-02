@@ -15,7 +15,7 @@
 //!   derives the resume point from the data itself.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use hood_core::detect_gap;
+use hood_core::fsutil::{append_synced, fsync_dir, write_atomic};
+use hood_core::ranges::{parse_ranges_file_lenient, subtract, to_lines, GapRow, Range};
 use tracing::{info, warn};
 
 use crate::route::Line;
@@ -37,29 +39,11 @@ pub const POLL_STEP: Duration = Duration::from_millis(500);
 /// than `frame_max` after its first line.
 pub const COMMIT_GUARD: Duration = Duration::from_millis(200);
 
-// ------------------------------------------------------------- fs helpers ---
-
-/// fsync a directory so a rename/create inside it is durable. Best effort:
-/// some platforms refuse to open directories for sync.
-fn sync_dir(dir: &Path) {
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
-    }
-}
-
-/// Atomically replace `path` with `contents`: tmp file, fsync, rename, fsync dir.
-pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(".{}.tmp", path.file_name().and_then(|n| n.to_str()).unwrap_or("state")));
-    {
-        let mut f = File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path).with_context(|| format!("rename to {}", path.display()))?;
-    sync_dir(dir);
-    Ok(())
-}
+// fs helpers (atomic write, fsync of a directory, append + fsync) are in
+// `hood_core::fsutil` since task 019. Every fsync error, the directory's
+// included, is returned: it ends the writer (`shutdown writer_error`, exit 2)
+// or start-up (exit 1) instead of letting last_seq.txt / gaps.tsv claim data
+// that may not be on disk. Before 019 the directory fsync was best effort.
 
 pub fn read_state(out: &Path) -> Option<u64> {
     fs::read_to_string(out.join(STATE_FILE)).ok()?.trim().parse().ok()
@@ -110,7 +94,7 @@ pub fn repair_torn(path: &Path, torn_dir: &Path, stamp: &str) -> Result<Option<T
         f.write_all(&data[keep..])?;
         f.sync_all()?;
     }
-    sync_dir(torn_dir);
+    fsync_dir(torn_dir)?;
     let f = OpenOptions::new().write(true).open(path)?;
     f.set_len(keep as u64)?;
     f.sync_all()?;
@@ -190,54 +174,34 @@ pub fn max_seq_in_file(path: &Path) -> Result<Option<u64>> {
     Ok(best)
 }
 
-/// One `gaps.tsv` row: `from \t to \t recv_ns` (recv_ns of the first line
-/// after the hole).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GapRow {
-    pub from: u64,
-    pub to: u64,
-    pub recv_ns: u128,
-}
-
-/// Ranges already listed in `gaps.tsv` (malformed rows are ignored).
-pub fn read_gap_ranges(out: &Path) -> Vec<(u64, u64)> {
-    let Ok(text) = fs::read_to_string(out.join(GAPS_FILE)) else {
-        return Vec::new();
+/// Ranges already listed in `gaps.tsv`, read with the shared policy of
+/// `hood_core::ranges`: an unterminated last line is ignored with a WARN.
+///
+/// One deliberate difference from the enricher: a broken line that ends
+/// with `\n` is skipped with a WARN here instead of failing. This runs at
+/// start-up of the live recorder; failing would crash-loop it under systemd
+/// over its own state file, i.e. lose feed data, while a skipped line costs
+/// at most a duplicate gap row (the enricher merges overlapping ranges). The
+/// enricher (`--gaps`) still rejects such a file, so the line gets noticed.
+/// A file that cannot be read at all (other than missing) is an error.
+pub fn read_gap_ranges(out: &Path) -> Result<Vec<Range>> {
+    let path = out.join(GAPS_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
-    text.lines()
-        .filter_map(|l| {
-            let mut c = l.split('\t');
-            let from = c.next()?.trim().parse().ok()?;
-            let to = c.next()?.trim().parse().ok()?;
-            Some((from, to))
-        })
-        .collect()
-}
-
-/// Parts of `[from, to]` not covered by any of `listed`.
-fn uncovered(from: u64, to: u64, listed: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut iv: Vec<(u64, u64)> = listed.iter().copied().filter(|&(f, t)| f <= t && t >= from && f <= to).collect();
-    iv.sort_unstable();
-    let mut out = Vec::new();
-    let mut cur = from;
-    for (f, t) in iv {
-        if f > cur {
-            out.push((cur, f - 1));
-        }
-        if t >= cur {
-            match t.checked_add(1) {
-                Some(n) => cur = n,
-                None => return out,
-            }
-        }
-        if cur > to {
-            return out;
-        }
+    let p = parse_ranges_file_lenient(&text);
+    if let Some(line) = p.unterminated {
+        warn!(file = %path.display(), line = %line.escape_debug(), "ignoring unterminated last line of gaps.tsv");
     }
-    if cur <= to {
-        out.push((cur, to));
+    for e in &p.broken {
+        warn!(
+            file = %path.display(), line_no = e.line_no, line = %e.line.escape_debug(), reason = %e.reason,
+            "skipping broken line of gaps.tsv"
+        );
     }
-    out
+    Ok(p.ranges)
 }
 
 /// Replays the writer's gap bookkeeping ([`FeedWriter::accept`]) over the
@@ -280,12 +244,12 @@ pub fn scan_seq_holes(path: &Path, last: &mut Option<u64>, holes: &mut Vec<GapRo
         if last.is_some_and(|l| seq_max <= l) {
             continue; // the writer skips such lines; they are never on disk
         }
-        if let Some(g) = detect_gap(*last, first) {
-            holes.push(GapRow { from: g.from, to: g.to, recv_ns });
+        if let Some(range) = detect_gap(*last, first) {
+            holes.push(GapRow { range, recv_ns });
         }
-        for g in intra {
-            if last.is_none_or(|s| g.to > s) {
-                holes.push(GapRow { from: g.from, to: g.to, recv_ns });
+        for range in intra {
+            if last.is_none_or(|s| range.to > s) {
+                holes.push(GapRow { range, recv_ns });
             }
         }
         *last = Some(last.map_or(seq_max, |s| s.max(seq_max)));
@@ -298,21 +262,15 @@ pub fn scan_seq_holes(path: &Path, last: &mut Option<u64>, holes: &mut Vec<GapRo
 /// does not know about. Holes found in `holes` but not covered by gaps.tsv
 /// are appended (fsync) and returned. Idempotent: a second call adds nothing.
 pub fn reconcile_gaps(out: &Path, holes: &[GapRow]) -> Result<Vec<GapRow>> {
-    let listed = read_gap_ranges(out);
+    let listed = read_gap_ranges(out)?;
     let mut missing = Vec::new();
     for h in holes {
-        for (from, to) in uncovered(h.from, h.to, &listed) {
-            missing.push(GapRow { from, to, recv_ns: h.recv_ns });
+        for range in subtract(vec![h.range], listed.clone()) {
+            missing.push(GapRow { range, recv_ns: h.recv_ns });
         }
     }
     if !missing.is_empty() {
-        let path = out.join(GAPS_FILE);
-        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-        for g in &missing {
-            writeln!(f, "{}\t{}\t{}", g.from, g.to, g.recv_ns)?;
-        }
-        f.sync_data()?;
-        sync_dir(out);
+        append_synced(&out.join(GAPS_FILE), to_lines(&missing).as_bytes())?;
     }
     Ok(missing)
 }
@@ -374,7 +332,12 @@ pub fn recover(out: &Path) -> Result<Recovery> {
     rec.data_seq = recent_max.or(seam);
     rec.reconciled = reconcile_gaps(out, &holes)?;
     for g in &rec.reconciled {
-        warn!(from = g.from, to = g.to, recv_ns = g.recv_ns as u64, "hole in data was missing from gaps.tsv, appended");
+        warn!(
+            from = g.range.from,
+            to = g.range.to,
+            recv_ns = g.recv_ns as u64,
+            "hole in data was missing from gaps.tsv, appended"
+        );
     }
     rec.resume_seq = match (rec.data_seq, rec.state_seq) {
         (Some(d), Some(s)) if d != s => {
@@ -387,7 +350,7 @@ pub fn recover(out: &Path) -> Result<Recovery> {
     // Make the state file match what is really on disk.
     if let Some(s) = rec.resume_seq {
         if rec.state_seq != Some(s) {
-            write_atomic(&out.join(STATE_FILE), &s.to_string())?;
+            write_atomic(&out.join(STATE_FILE), s.to_string().as_bytes())?;
         }
     }
     Ok(rec)
@@ -430,7 +393,7 @@ pub struct FeedWriter {
     last_seq: Option<u64>,
     /// Highest seq known to be fsynced and recorded in last_seq.txt.
     durable_seq: Option<u64>,
-    pending_gaps: Vec<String>,
+    pending_gaps: Vec<GapRow>,
     pub stats: WriterStats,
 }
 
@@ -474,7 +437,7 @@ impl FeedWriter {
             .append(true)
             .open(&path)
             .with_context(|| format!("open {}", path.display()))?;
-        sync_dir(dir);
+        fsync_dir(dir)?;
         info!(file = %path.display(), "writing");
         self.cur = Some(HourFile { key, slot: Slot::Idle(file) });
         Ok(())
@@ -523,13 +486,13 @@ impl FeedWriter {
             }
             if let Some(g) = detect_gap(self.last_seq, l.seq_first) {
                 warn!(from = g.from, to = g.to, "gap in feed");
-                self.pending_gaps.push(format!("{}\t{}\t{}", g.from, g.to, l.recv_ns));
+                self.pending_gaps.push(GapRow { range: g, recv_ns: l.recv_ns });
                 self.stats.gaps += 1;
             }
             for g in &l.intra_gaps {
                 if self.last_seq.is_none_or(|s| g.to > s) {
                     warn!(from = g.from, to = g.to, "gap inside envelope");
-                    self.pending_gaps.push(format!("{}\t{}\t{}", g.from, g.to, l.recv_ns));
+                    self.pending_gaps.push(GapRow { range: *g, recv_ns: l.recv_ns });
                     self.stats.intra_gaps += 1;
                 }
             }
@@ -576,16 +539,13 @@ impl FeedWriter {
             }
         }
         if !self.pending_gaps.is_empty() {
-            let path = self.root.join(GAPS_FILE);
-            let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-            for g in self.pending_gaps.drain(..) {
-                writeln!(f, "{g}")?;
-            }
-            f.sync_data()?;
+            // One write + fsync of the file and of the directory.
+            append_synced(&self.root.join(GAPS_FILE), to_lines(&self.pending_gaps).as_bytes())?;
+            self.pending_gaps.clear();
         }
         if self.last_seq != self.durable_seq {
             if let Some(s) = self.last_seq {
-                write_atomic(&self.root.join(STATE_FILE), &s.to_string())?;
+                write_atomic(&self.root.join(STATE_FILE), s.to_string().as_bytes())?;
                 self.durable_seq = Some(s);
                 info!(last_seq = s, frames = self.stats.frames, lines = self.stats.lines, "frame committed");
             }
@@ -749,15 +709,19 @@ mod tests {
         fs::read_to_string(dir.join(GAPS_FILE)).unwrap_or_default().lines().map(str::to_owned).collect()
     }
 
+    fn gap(from: u64, to: u64, recv_ns: u128) -> GapRow {
+        GapRow { range: Range { from, to }, recv_ns }
+    }
+
+    /// Task 019: one reading policy (hood_core::ranges) with the recorder's
+    /// documented exception: a broken terminated line is skipped, not fatal.
     #[test]
-    fn uncovered_ranges() {
-        assert_eq!(uncovered(10, 20, &[]), vec![(10, 20)]);
-        assert_eq!(uncovered(10, 20, &[(10, 20)]), vec![]);
-        assert_eq!(uncovered(10, 20, &[(5, 30)]), vec![]);
-        assert_eq!(uncovered(10, 20, &[(12, 14)]), vec![(10, 11), (15, 20)]);
-        assert_eq!(uncovered(10, 20, &[(18, 25), (1, 10), (13, 13)]), vec![(11, 12), (14, 17)]);
-        assert_eq!(uncovered(10, 20, &[(21, 30), (1, 9)]), vec![(10, 20)]);
-        assert_eq!(uncovered(10, 20, &[(0, u64::MAX)]), vec![]);
+    fn gap_ranges_reading_policy() {
+        let dir = tmpdir("gapsread");
+        assert_eq!(read_gap_ranges(&dir).unwrap(), vec![]);
+        fs::write(dir.join(GAPS_FILE), "51\t99\t2\nbroken\n# c\n\n102\t104\t4\n200\t2").unwrap();
+        assert_eq!(read_gap_ranges(&dir).unwrap(), vec![Range { from: 51, to: 99 }, Range { from: 102, to: 104 }]);
+        fs::remove_dir_all(&dir).ok();
     }
 
     /// Acceptance test for item 1 (З1): a hole in the data without a
@@ -786,7 +750,7 @@ mod tests {
         fs::write(dir.join(STATE_FILE), "108").unwrap();
 
         let rec = recover(&dir).unwrap();
-        assert_eq!(rec.reconciled, vec![GapRow { from: 104, to: 106, recv_ns: 6 }]);
+        assert_eq!(rec.reconciled, vec![gap(104, 106, 6)]);
         assert_eq!(gaps_rows(&dir), vec!["104\t106\t6"]);
         assert_eq!(rec.resume_seq, Some(108));
 
@@ -817,10 +781,7 @@ mod tests {
         .unwrap();
         fs::write(dir.join(GAPS_FILE), "51\t99\t2\n102\t104\t4\n").unwrap();
         let rec = recover(&dir).unwrap();
-        assert_eq!(
-            rec.reconciled,
-            vec![GapRow { from: 105, to: 109, recv_ns: 4 }, GapRow { from: 111, to: 111, recv_ns: 4 },]
-        );
+        assert_eq!(rec.reconciled, vec![gap(105, 109, 4), gap(111, 111, 4)]);
         assert_eq!(rec.data_seq, Some(113));
         assert_eq!(gaps_rows(&dir), vec!["51\t99\t2", "102\t104\t4", "105\t109\t4", "111\t111\t4"]);
         assert!(recover(&dir).unwrap().reconciled.is_empty());
@@ -828,8 +789,29 @@ mod tests {
         // Seam hole missing from gaps.tsv is found too.
         fs::write(dir.join(GAPS_FILE), "").unwrap();
         let rec = recover(&dir).unwrap();
-        assert_eq!(rec.reconciled.first(), Some(&GapRow { from: 51, to: 99, recv_ns: 2 }));
+        assert_eq!(rec.reconciled.first(), Some(&gap(51, 99, 2)));
         assert_eq!(rec.reconciled.len(), 3);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Finding F1 of the 019 data audit: gaps.tsv ends with the recorder's
+    /// own row for a real hole, without `\n` (torn write). Start-up ignores
+    /// it (WARN), reconciles the hole and appends a row; the append first
+    /// terminates the fragment, so the new row is on its own line instead of
+    /// being glued into a 5-column line. A second start adds nothing.
+    #[test]
+    fn recover_after_own_unterminated_gap_row_does_not_glue_rows() {
+        let dir = tmpdir("f1");
+        let day = dir.join("2026/09/30");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("feed-20260930-12.tsv.zst"), frame(&[env_line(1, &[100]), env_line(6, &[107])].concat()))
+            .unwrap();
+        fs::write(dir.join(GAPS_FILE), "101\t106\t6").unwrap();
+        let rec = recover(&dir).unwrap();
+        assert_eq!(rec.reconciled, vec![gap(101, 106, 6)]);
+        assert_eq!(fs::read_to_string(dir.join(GAPS_FILE)).unwrap(), "101\t106\t6\n101\t106\t6\n");
+        assert!(recover(&dir).unwrap().reconciled.is_empty());
+        assert_eq!(gaps_rows(&dir), vec!["101\t106\t6", "101\t106\t6"]);
         fs::remove_dir_all(&dir).ok();
     }
 

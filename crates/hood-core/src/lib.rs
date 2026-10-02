@@ -5,28 +5,48 @@
 //! - `header.blockNumber` is the **L1** block number, not L2.
 //! - `header.timestamp` has 1-second resolution (~10 L2 blocks per second),
 //!   so ordering must always use (block_number, tx_index, log_index).
+//!
+//! Modules (pure logic and thin std helpers shared by recorder and enricher):
+//! [`ranges`] (block ranges, `gaps.tsv` / `filled.tsv`), [`http`]
+//! (`Retry-After`), [`fsutil`] (atomic write, fsync, append), [`hex`]
+//! (JSON-RPC quantities).
+
+pub mod fsutil;
+pub mod hex;
+pub mod http;
+pub mod ranges;
 
 use serde::Deserialize;
 
+pub use ranges::{detect_gap, Gap, Range};
+
+/// Robinhood Chain mainnet chain id (`references/chain-facts.md`). The
+/// enricher's `eth_chainId` check at start-up (task 020) compares against it.
 pub const CHAIN_ID: u64 = 4663;
+/// Public sequencer broadcast feed (WebSocket).
 pub const FEED_URL: &str = "wss://feed.mainnet.chain.robinhood.com";
+/// Public JSON-RPC endpoint; rate limited, not for production runs.
 pub const PUBLIC_RPC_URL: &str = "https://rpc.mainnet.chain.robinhood.com";
 
 /// Minimal view of a broadcast-feed envelope. Unknown fields are ignored on
 /// purpose: the raw text is always stored verbatim, this is only for routing.
 #[derive(Debug, Deserialize)]
 pub struct FeedEnvelope {
+    /// Feed protocol version (1 so far).
     #[serde(default)]
     pub version: u32,
+    /// One message per L2 block; empty for e.g. `confirmedSequenceNumberMessage`.
     #[serde(default)]
     pub messages: Vec<FeedMessageHead>,
 }
 
+/// The part of one feed message the recorder routes on.
 #[derive(Debug, Deserialize)]
 pub struct FeedMessageHead {
     /// Equal to the L2 block number on Robinhood Chain.
     #[serde(rename = "sequenceNumber")]
     pub sequence_number: u64,
+    /// L2 block hash, when the feed sends it.
     #[serde(rename = "blockHash", default)]
     pub block_hash: Option<String>,
 }
@@ -37,22 +57,6 @@ impl FeedEnvelope {
         let first = self.messages.first()?.sequence_number;
         let last = self.messages.last()?.sequence_number;
         Some((first, last))
-    }
-}
-
-/// A contiguous range of L2 blocks missing from the recorded feed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Gap {
-    pub from: u64,
-    pub to: u64,
-}
-
-/// Given the last recorded sequence number and the first one of a new
-/// envelope, returns the gap between them (if any).
-pub fn detect_gap(last_seen: Option<u64>, first_new: u64) -> Option<Gap> {
-    match last_seen {
-        Some(last) if first_new > last + 1 => Some(Gap { from: last + 1, to: first_new - 1 }),
-        _ => None,
     }
 }
 
@@ -67,13 +71,5 @@ mod tests {
         let env: FeedEnvelope = serde_json::from_str(raw).unwrap();
         assert_eq!(env.seq_range(), Some((74755960, 74755960)));
         assert!(env.messages[0].block_hash.as_deref().unwrap().starts_with("0x529d"));
-    }
-
-    #[test]
-    fn gap_detection() {
-        assert_eq!(detect_gap(None, 10), None);
-        assert_eq!(detect_gap(Some(9), 10), None);
-        assert_eq!(detect_gap(Some(10), 10), None); // duplicate, not a gap
-        assert_eq!(detect_gap(Some(5), 10), Some(Gap { from: 6, to: 9 }));
     }
 }

@@ -14,6 +14,8 @@ use serde_json::value::RawValue;
 use serde_json::{json, Value};
 use tracing::warn;
 
+use hood_core::http::parse_retry_after;
+
 use crate::stats::Stats;
 
 #[derive(Debug, Clone)]
@@ -44,13 +46,6 @@ pub fn backoff_delay(attempt: u32, base: Duration, cap: Duration, u: f64) -> Dur
     let exp = base.saturating_mul(1u32 << attempt.saturating_sub(1).min(20)).min(cap);
     let half = exp / 2;
     half + half.mul_f64(u.clamp(0.0, 1.0))
-}
-
-/// `Retry-After` in delta-seconds form (integer or decimal). The HTTP-date
-/// form is not supported and falls back to the exponential backoff.
-pub fn parse_retry_after(v: &str) -> Option<Duration> {
-    let x: f64 = v.trim().parse().ok()?;
-    (x.is_finite() && x >= 0.0).then(|| Duration::from_secs_f64(x))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,8 +342,11 @@ impl Rpc {
             .await
             .map_err(|e| self.transport(e))?;
         let status = resp.status();
-        let retry_after =
-            resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(parse_retry_after);
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| parse_retry_after(v, SystemTime::now()));
         let bytes = resp.bytes().await.map_err(|e| self.transport(e))?;
         self.stats.update(|s| s.http_body_bytes += bytes.len() as u64);
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -445,14 +443,6 @@ mod tests {
             let u = jitter();
             assert!((0.0..1.0).contains(&u));
         }
-    }
-
-    #[test]
-    fn retry_after_parsing() {
-        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
-        assert_eq!(parse_retry_after(" 0.5 "), Some(Duration::from_millis(500)));
-        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
-        assert_eq!(parse_retry_after("-1"), None);
     }
 
     #[test]

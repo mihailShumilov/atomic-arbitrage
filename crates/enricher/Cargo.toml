@@ -20,3 +20,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
 reqwest.workspace = true
+
+[dev-dependencies]
+# tests/retry.rs: format an HTTP-date `Retry-After` for the mock server.
+chrono.workspace = true

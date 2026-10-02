@@ -1,5 +1,5 @@
 # 019 — Общий код в hood-core (задача B ревью 2026-10-02)
-status: ready
+status: done
 phase: 1a
 depends-on: 018
 executor: indexer-engineer
