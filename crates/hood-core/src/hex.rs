@@ -11,9 +11,11 @@ pub fn quantity(n: u64) -> String {
     format!("0x{n:x}")
 }
 
-/// Parse a hex quantity: `0x` followed by 1 to 16 hex digits (either case).
-/// Leading zeros are tolerated (some providers send them), a sign, an empty
-/// body, `0X` or overflow are not.
+/// Parse a hex quantity: `0x` followed by one or more hex digits (either
+/// case) whose value fits in `u64`. Leading zeros are tolerated and do not
+/// count against the size (`0x` + 20 digits with leading zeros is fine;
+/// some providers send them). A sign, whitespace, an empty body, `0X` or a
+/// value above `u64::MAX` give `None`.
 pub fn parse_quantity(s: &str) -> Option<u64> {
     let digits = s.strip_prefix("0x")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -36,6 +38,8 @@ mod tests {
         }
         assert_eq!(parse_quantity("0x0A"), Some(10));
         assert_eq!(parse_quantity("0x000a"), Some(10));
+        // More than 16 digits is fine while the value fits (task 025, doc fix).
+        assert_eq!(parse_quantity("0x0000ffffffffffffffff"), Some(u64::MAX));
     }
 
     #[test]

@@ -9,7 +9,10 @@
 //! - Commit order: finish frame -> fsync data file -> append pending gap rows
 //!   to gaps.tsv + fsync -> write last_seq.txt atomically (tmp, fsync, rename,
 //!   fsync dir). So `last_seq.txt` and `gaps.tsv` never get ahead of data that
-//!   is actually on disk.
+//!   is actually on disk. This holds on hour rotation too: a line that opens
+//!   a new hour is accounted for (`last_seq`, its gap rows) only after the
+//!   rotation commit of the previous hour (task 025 item 2; before 025 its
+//!   gap row went out with that commit, ahead of the line).
 //! - After `kill -9` at most the open frame (<= frame_max of data) is lost.
 //!
 //! Every fsync error, the directory's included, ends the writer (`shutdown
@@ -43,14 +46,15 @@ enum Slot {
     Idle(File),
     /// A zstd frame is being written.
     Frame(zstd::Encoder<'static, BufWriter<File>>),
-    /// Transitional value while moving between the two.
-    Empty,
 }
 
 struct HourFile {
     key: String,
     path: PathBuf,
-    slot: Slot,
+    /// None only after a failed transition (starting or finishing a frame
+    /// consumed the file and returned an error); the writer is stopping
+    /// then, and any further write reports an inconsistent state.
+    slot: Option<Slot>,
 }
 
 /// Counters of one writer run (logged at the end).
@@ -120,29 +124,31 @@ impl FeedWriter {
             .with_context(|| format!("open {}", path.display()))?;
         fsync_dir(dir)?;
         info!(file = %path.display(), "writing");
-        self.cur = Some(HourFile { key, path, slot: Slot::Idle(file) });
+        self.cur = Some(HourFile { key, path, slot: Some(Slot::Idle(file)) });
         Ok(())
     }
 
     fn encoder(&mut self) -> Result<&mut zstd::Encoder<'static, BufWriter<File>>> {
-        let cur = self.cur.as_mut().expect("ensure_hour opens the hour file before any write");
-        if let Slot::Idle(_) = cur.slot {
-            let Slot::Idle(file) = std::mem::replace(&mut cur.slot, Slot::Empty) else { unreachable!() };
-            let mut enc = zstd::Encoder::new(BufWriter::with_capacity(1 << 16, file), self.level)
-                .with_context(|| format!("start zstd frame in {}", cur.path.display()))?;
-            enc.include_checksum(true).with_context(|| format!("zstd checksum for {}", cur.path.display()))?;
-            cur.slot = Slot::Frame(enc);
-            self.frame_opened = Some(Instant::now());
+        let cur = self.cur.as_mut().expect("accept opens the hour file (ensure_hour) before any write");
+        match cur.slot.take() {
+            Some(Slot::Idle(file)) => {
+                let mut enc = zstd::Encoder::new(BufWriter::with_capacity(1 << 16, file), self.level)
+                    .with_context(|| format!("start zstd frame in {}", cur.path.display()))?;
+                enc.include_checksum(true).with_context(|| format!("zstd checksum for {}", cur.path.display()))?;
+                cur.slot = Some(Slot::Frame(enc));
+                self.frame_opened = Some(Instant::now());
+            }
+            other => cur.slot = other,
         }
         match &mut cur.slot {
-            Slot::Frame(enc) => Ok(enc),
+            Some(Slot::Frame(enc)) => Ok(enc),
             _ => anyhow::bail!("writer in inconsistent state ({})", cur.path.display()),
         }
     }
 
+    /// Append `l` to the open frame of the current hour (the caller has
+    /// called `ensure_hour` for it).
     fn write_line(&mut self, l: &Line) -> Result<()> {
-        let t: DateTime<Utc> = DateTime::from_timestamp_nanos(l.recv_ns as i64);
-        self.ensure_hour(t)?;
         // `raw` is always valid JSON here (route.rs wraps anything else in a
         // base64 `recorderFrame`). In valid JSON a raw CR/LF/TAB can only be
         // insignificant whitespace between tokens (control characters are
@@ -163,36 +169,45 @@ impl FeedWriter {
     /// Accept one line: gap bookkeeping (the shared [`SeqTracker`] rule),
     /// then append to the open frame.
     pub fn accept(&mut self, l: &Line) -> Result<()> {
-        if l.has_seq() {
+        let fresh = if l.has_seq() {
             match self.seq.check(l.seq_first, l.seq_max, &l.intra_gaps) {
-                // Duplicate or stale envelope (replay after reconnect).
+                // Duplicate or stale envelope (replay after reconnect): never
+                // written, so it does not open or rotate an hour file either.
                 Seen::Stale => {
                     self.stats.dup_skipped += 1;
                     return Ok(());
                 }
-                Seen::Fresh { seam, intra } => {
-                    if let Some(g) = seam {
-                        warn!(from = g.from, to = g.to, "gap in feed");
-                        self.pending_gaps.push(GapRow { range: g, recv_ns: l.recv_ns });
-                        self.stats.gaps += 1;
-                    }
-                    for g in intra {
-                        warn!(from = g.from, to = g.to, "gap inside envelope");
-                        self.pending_gaps.push(GapRow { range: g, recv_ns: l.recv_ns });
-                        self.stats.intra_gaps += 1;
-                    }
-                }
-            }
-            if l.intra_disorder > 0 {
-                warn!(count = l.intra_disorder, seq_first = l.seq_first, "sequence disorder inside envelope");
-                self.stats.intra_disorder += u64::from(l.intra_disorder);
+                Seen::Fresh { seam, intra } => Some((seam, intra)),
             }
         } else {
-            self.stats.unsequenced += 1;
+            None
+        };
+        // Open or rotate to the line's hour *before* queueing its gap rows
+        // and advancing last_seq: the rotation commits the previous hour, and
+        // that commit must publish neither a gap row nor a last_seq of a line
+        // that is not in a frame yet (task 025 item 2, remark Р4 of the 021
+        // review; last_seq since task 021). The rows go out with the commit
+        // that makes this line durable.
+        self.ensure_hour(DateTime::<Utc>::from_timestamp_nanos(l.recv_ns as i64))?;
+        match fresh {
+            Some((seam, intra)) => {
+                if let Some(g) = seam {
+                    warn!(from = g.from, to = g.to, "gap in feed");
+                    self.pending_gaps.push(GapRow { range: g, recv_ns: l.recv_ns });
+                    self.stats.gaps += 1;
+                }
+                for g in intra {
+                    warn!(from = g.from, to = g.to, "gap inside envelope");
+                    self.pending_gaps.push(GapRow { range: g, recv_ns: l.recv_ns });
+                    self.stats.intra_gaps += 1;
+                }
+                if l.intra_disorder > 0 {
+                    warn!(count = l.intra_disorder, seq_first = l.seq_first, "sequence disorder inside envelope");
+                    self.stats.intra_disorder += u64::from(l.intra_disorder);
+                }
+            }
+            None => self.stats.unsequenced += 1,
         }
-        // last_seq advances only after the line is in the frame: an hour
-        // rotation inside write_line commits last_seq.txt, which must not
-        // name a line that is not written yet (as before task 021).
         self.write_line(l)?;
         if l.has_seq() {
             self.seq.advance(l.seq_max);
@@ -218,15 +233,17 @@ impl FeedWriter {
     /// Close the open frame, fsync, then publish gaps and last_seq.
     pub fn commit(&mut self) -> Result<()> {
         if let Some(cur) = self.cur.as_mut() {
-            if let Slot::Frame(_) = cur.slot {
-                let Slot::Frame(enc) = std::mem::replace(&mut cur.slot, Slot::Empty) else { unreachable!() };
-                let p = cur.path.display();
-                let bw = enc.finish().with_context(|| format!("finish zstd frame of {p}"))?;
-                let file = bw.into_inner().map_err(|e| e.into_error()).with_context(|| format!("flush {p}"))?;
-                file.sync_data().with_context(|| format!("fsync {p}"))?;
-                cur.slot = Slot::Idle(file);
-                self.frame_opened = None;
-                self.stats.frames += 1;
+            match cur.slot.take() {
+                Some(Slot::Frame(enc)) => {
+                    let p = cur.path.display();
+                    let bw = enc.finish().with_context(|| format!("finish zstd frame of {p}"))?;
+                    let file = bw.into_inner().map_err(|e| e.into_error()).with_context(|| format!("flush {p}"))?;
+                    file.sync_data().with_context(|| format!("fsync {p}"))?;
+                    cur.slot = Some(Slot::Idle(file));
+                    self.frame_opened = None;
+                    self.stats.frames += 1;
+                }
+                other => cur.slot = other,
             }
         }
         if !self.pending_gaps.is_empty() {
@@ -443,6 +460,89 @@ mod tests {
         assert_eq!(read_state(&dir), Some(111));
         w.commit().unwrap();
         assert_eq!(read_state(&dir), Some(112));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 025 item 2: the gap row of a line that opens a new hour is not
+    /// published by the rotation commit of the previous hour (before 025 it
+    /// was, while the line itself was still in the open frame), but by the
+    /// commit that makes the line durable. A stale line does not open an
+    /// hour file.
+    #[test]
+    fn hour_rotation_publishes_gap_row_after_its_line() {
+        let dir = tmpdir("rotategap");
+        let t0: u128 = 1_790_769_600 * 1_000_000_000; // 2026-09-30T12:00Z
+        let t1 = t0 + 3_600_000_000_000;
+        let mut w = FeedWriter::new(dir.clone(), 3, Duration::from_secs(60), Some(110));
+        w.accept(&line(t0, 111)).unwrap();
+        w.accept(&line(t0 + 1, 113)).unwrap(); // hole 112, hour 12
+
+        // Hole 114..=119; the first line of hour 13 triggers the rotation.
+        w.accept(&line(t1, 120)).unwrap();
+        // The rotation published hour 12 only.
+        assert_eq!(gaps_rows(&dir), vec![format!("112\t112\t{}", t0 + 1)]);
+        assert_eq!(read_state(&dir), Some(113));
+        let files = list_feed_files(&dir);
+        assert_eq!(files.len(), 2);
+        assert_eq!(fs::metadata(&files[1]).unwrap().len(), 0, "hour 13 has no complete frame yet");
+        w.commit().unwrap();
+        assert_eq!(gaps_rows(&dir), vec![format!("112\t112\t{}", t0 + 1), format!("114\t119\t{t1}")]);
+        assert_eq!(read_state(&dir), Some(120));
+        assert_eq!(file_seq_max(&files[1]).unwrap(), Some(120));
+        w.accept(&line(t1 + 3_600_000_000_000, 100)).unwrap(); // stale, hour 14
+        w.commit().unwrap();
+        assert_eq!(list_feed_files(&dir).len(), 2);
+        assert_eq!(w.stats.dup_skipped, 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Lines in complete frames on disk, as (recv_ns, seq_max).
+    fn durable_lines(dir: &std::path::Path) -> Vec<(u128, u64)> {
+        let mut out = Vec::new();
+        for f in list_feed_files(dir) {
+            let data = fs::read(&f).unwrap();
+            let complete = &data[..valid_prefix_len(&data)];
+            if complete.is_empty() {
+                continue;
+            }
+            let text = zstd::stream::decode_all(complete).unwrap();
+            for l in text.split(|&b| b == b'\n').filter_map(crate::rawline::parse_raw_line) {
+                if let Some(s) = l.seqs() {
+                    out.push((l.recv_ns, s.seq_max));
+                }
+            }
+        }
+        out
+    }
+
+    /// Task 025 item 2, invariant over many rotations (the state a `kill -9`
+    /// would leave after any accept): every gaps.tsv row belongs to a line
+    /// in a complete frame, and last_seq.txt is not ahead of the data.
+    #[test]
+    fn gaps_and_last_seq_never_ahead_of_data_across_rotations() {
+        let dir = tmpdir("rotateinv");
+        let t0: u128 = 1_790_769_600 * 1_000_000_000;
+        let hour: u128 = 3_600_000_000_000;
+        let mut w = FeedWriter::new(dir.clone(), 3, Duration::from_secs(60), Some(9));
+        // (hour offset, seq): holes inside hours and on every boundary,
+        // a stale line as the first line of a new hour (it must not rotate).
+        let plan = [(0, 10), (0, 12), (1, 15), (1, 16), (2, 14), (2, 20), (3, 21), (3, 25), (4, 30)];
+        for (i, &(h, seq)) in plan.iter().enumerate() {
+            let recv = t0 + h * hour + i as u128;
+            w.accept(&line(recv, seq)).unwrap();
+            let on_disk = durable_lines(&dir);
+            for row in gaps_rows(&dir) {
+                let recv_ns: u128 = row.split('\t').nth(2).unwrap().parse().unwrap();
+                assert!(on_disk.iter().any(|&(r, _)| r == recv_ns), "after #{i}: row {row:?} ahead of data");
+            }
+            if let Some(s) = read_state(&dir) {
+                assert!(on_disk.iter().any(|&(_, m)| m >= s), "after #{i}: last_seq {s} ahead of data");
+            }
+        }
+        w.commit().unwrap();
+        let rows: Vec<String> = gaps_rows(&dir).iter().map(|r| r.rsplit_once('\t').unwrap().0.to_owned()).collect();
+        assert_eq!(rows, vec!["11\t11", "13\t14", "17\t19", "22\t24", "26\t29"]);
+        assert_eq!(read_state(&dir), Some(30));
         fs::remove_dir_all(&dir).ok();
     }
 

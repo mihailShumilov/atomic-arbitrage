@@ -7,6 +7,7 @@
 //! data that gaps.tsv does not know about, and derives the resume point from
 //! the data itself.
 
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use hood_core::fsutil::{append_synced, fsync_dir, write_atomic};
-use hood_core::ranges::{parse_ranges_file_lenient, subtract, to_lines, GapRow, Range};
+use hood_core::ranges::{parse_ranges_file_lenient, subtract, to_lines, GapRow, LineFault, Range};
 use tracing::warn;
 
 use crate::layout::{list_feed_files, read_state, GAPS_FILE, STATE_FILE, TORN_DIR};
@@ -93,7 +94,7 @@ pub enum GapsSkip {
     /// The last line has no `\n` (torn write, or being appended).
     Unterminated,
     /// A terminated line that does not parse; the parser's reason.
-    Broken(String),
+    Broken(LineFault),
 }
 
 /// A line of gaps.tsv that [`read_gap_ranges`] skipped (also logged to
@@ -126,14 +127,25 @@ pub struct GapsRead {
 /// over its own state file, i.e. lose feed data, while a skipped line costs
 /// at most a duplicate gap row (the enricher merges overlapping ranges). The
 /// enricher (`--gaps`) still rejects such a file, so the line gets noticed.
-/// A file that cannot be read at all (other than missing) is an error.
+///
+/// Bytes that are not valid UTF-8 (task 025 item 4, decided by the same
+/// argument; before 025 the whole file was an error and start-up exited 1,
+/// i.e. a crash loop under systemd): the file is decoded lossily with one
+/// WARN. Each invalid sequence becomes U+FFFD, so a line with such bytes in
+/// `from` or `to` is a broken line (WARN + `gaps_line_skipped broken`); bytes
+/// in the third column (`recv_ns`) are not looked at, the range still counts.
+/// Any other read error (permissions, IO) is an error: exit 1.
 pub fn read_gap_ranges(out: &Path) -> Result<GapsRead> {
     let path = out.join(GAPS_FILE);
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(GapsRead::default()),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
+    let text = String::from_utf8_lossy(&bytes);
+    if matches!(text, Cow::Owned(_)) {
+        warn!(file = %path.display(), "gaps.tsv is not valid UTF-8; invalid bytes read as U+FFFD, lines they break are skipped");
+    }
     let p = parse_ranges_file_lenient(&text);
     let mut skipped = Vec::new();
     for e in &p.broken {
@@ -141,11 +153,7 @@ pub fn read_gap_ranges(out: &Path) -> Result<GapsRead> {
             file = %path.display(), line_no = e.line_no, line = %e.line.escape_debug(), reason = %e.reason,
             "skipping broken line of gaps.tsv"
         );
-        skipped.push(SkippedGapLine {
-            line_no: e.line_no,
-            line: e.line.clone(),
-            why: GapsSkip::Broken(e.reason.clone()),
-        });
+        skipped.push(SkippedGapLine { line_no: e.line_no, line: e.line.clone(), why: GapsSkip::Broken(e.reason) });
     }
     if let Some(line) = p.unterminated {
         warn!(file = %path.display(), line = %line.escape_debug(), "ignoring unterminated last line of gaps.tsv");
@@ -185,7 +193,7 @@ pub fn reconcile_gaps(out: &Path, holes: &[GapRow]) -> Result<(Vec<GapRow>, Vec<
     let listed = read_gap_ranges(out)?;
     let mut missing = Vec::new();
     for h in holes {
-        for range in subtract(vec![h.range], listed.ranges.clone()) {
+        for range in subtract(&[h.range], &listed.ranges) {
             missing.push(GapRow { range, recv_ns: h.recv_ns });
         }
     }
@@ -429,6 +437,35 @@ pub(crate) mod tests {
         assert_eq!((r.skipped[0].line_no, r.skipped[0].line.as_str()), (2, "broken"));
         assert!(matches!(r.skipped[0].why, GapsSkip::Broken(_)));
         assert_eq!(r.skipped[1], SkippedGapLine { line_no: 6, line: "200\t2".into(), why: GapsSkip::Unterminated });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Task 025 item 4: gaps.tsv with bytes that are not UTF-8 is read
+    /// lossily instead of failing start-up. A line broken by them is skipped
+    /// (with its typed reason); invalid bytes in `recv_ns` keep the range.
+    #[test]
+    fn non_utf8_gaps_file_is_read_lossily() {
+        let dir = tmpdir("gapsutf8");
+        fs::write(dir.join(GAPS_FILE), b"51\t99\t2\n1\xff2\t130\t5\n104\t106\t9\xfe\n").unwrap();
+        let r = read_gap_ranges(&dir).unwrap();
+        assert_eq!(r.ranges, vec![Range { from: 51, to: 99 }, Range { from: 104, to: 106 }]);
+        assert_eq!(r.skipped.len(), 1);
+        assert_eq!(r.skipped[0].line_no, 2);
+        assert_eq!(r.skipped[0].line, "1\u{FFFD}2\t130\t5");
+        assert_eq!(r.skipped[0].why, GapsSkip::Broken(LineFault::NotANumber("from")));
+
+        // Whole start-up: no error, the hole 104..=106 counts as listed (not
+        // appended again), the file is not rewritten.
+        let day = dir.join("2026/09/30");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("feed-20260930-12.tsv.zst"), frame(&[env_line(1, &[103]), env_line(2, &[107])].concat()))
+            .unwrap();
+        let before = fs::read(dir.join(GAPS_FILE)).unwrap();
+        let rec = recover(&dir).unwrap();
+        assert!(rec.reconciled.is_empty());
+        assert_eq!(rec.skipped_gap_lines.len(), 1);
+        assert_eq!(rec.resume_seq, Some(107));
+        assert_eq!(fs::read(dir.join(GAPS_FILE)).unwrap(), before);
         fs::remove_dir_all(&dir).ok();
     }
 

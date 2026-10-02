@@ -292,7 +292,7 @@ async fn run_gaps(a: &Args, stats: Arc<Stats>) -> Result<()> {
     for e in &filled.broken {
         warn!(file = %filled_path.display(), line_no = e.line_no, line = %e.line.escape_debug(), reason = %e.reason, "ignoring broken line of filled.tsv; its range is filled again if it is still a gap");
     }
-    let todo = hr::subtract(gaps.clone(), filled.ranges);
+    let todo = hr::subtract(&gaps, &filled.ranges);
     let gap_blocks: u64 = gaps.iter().map(Range::blocks).sum();
     let todo_blocks: u64 = todo.iter().map(Range::blocks).sum();
     let chunks = hr::chunk(&todo, a.chunk.unwrap_or(GAPS_DEFAULT_CHUNK));

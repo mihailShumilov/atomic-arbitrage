@@ -36,6 +36,10 @@ const CLOSE_SHUTDOWN_WAIT: Duration = Duration::from_millis(500);
 
 /// TLS with the OS certificate store (works on normal servers and behind
 /// TLS-intercepting proxies) and HTTP/1.1 ALPN.
+///
+/// # Errors
+/// No usable OS root certificate, or the TLS provider rejects the default
+/// protocol versions.
 pub fn tls_connector() -> Result<TlsConnector> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().certs {
@@ -189,6 +193,11 @@ fn handshake_request(requested: Option<u64>) -> yawc::HttpRequestBuilder {
 
 /// Connect and upgrade (one TCP connection, one upgrade request). `ws://`
 /// is only for local mock-feed tests; the real feed is `wss://`.
+///
+/// # Errors
+/// A [`ConnectError`] classified for the pause ladder: bad URL, TCP/TLS
+/// failure or timeout, or an upgrade rejected by the server (HTTP status
+/// and `Retry-After` kept).
 pub async fn connect(url_str: &str, tls: &TlsConnector, requested: Option<u64>) -> Result<FeedWs, ConnectError> {
     let url: url::Url = url_str.parse().map_err(|e| ConnectError::net(format!("bad url: {e}")))?;
     let host = url.host_str().unwrap_or_default().to_string();

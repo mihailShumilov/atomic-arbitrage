@@ -1,5 +1,5 @@
 # 025 — recorder и hood-core: хвосты ревью
-status: ready
+status: done
 phase: 1a
 depends-on: 021
 executor: indexer-engineer

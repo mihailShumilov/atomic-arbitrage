@@ -25,6 +25,11 @@ fn parent_dir(path: &Path) -> &Path {
 
 /// fsync a directory so that a create or rename inside it is durable.
 /// An empty path means the current directory.
+///
+/// # Errors
+/// The first failing step, as an [`io::Error`] that keeps the
+/// [`io::ErrorKind`] and names the step and the path (open or fsync of
+/// the directory).
 pub fn fsync_dir(dir: &Path) -> io::Result<()> {
     let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
     File::open(dir).and_then(|d| d.sync_all()).map_err(|e| with_path(e, "fsync dir", dir))
@@ -32,6 +37,11 @@ pub fn fsync_dir(dir: &Path) -> io::Result<()> {
 
 /// Rename `from` to `to`, then fsync the directory of `to`. `from` must
 /// already be fsynced by the caller.
+///
+/// # Errors
+/// The first failing step, as an [`io::Error`] that keeps the
+/// [`io::ErrorKind`] and names the step and the path (rename, fsync of
+/// the directory).
 pub fn rename_durable(from: &Path, to: &Path) -> io::Result<()> {
     fs::rename(from, to).map_err(|e| with_path(e, &format!("rename {} ->", from.display()), to))?;
     fsync_dir(parent_dir(to))
@@ -47,6 +57,12 @@ fn atomic_tmp_path(path: &Path) -> PathBuf {
 /// Atomically replace `path` with `contents`: write a temporary file, fsync
 /// it, rename it over `path`, fsync the directory. A reader sees either the
 /// old or the new contents, never a mix.
+///
+/// # Errors
+/// The first failing step, as an [`io::Error`] that keeps the
+/// [`io::ErrorKind`] and names the step and the path (create, write or
+/// fsync of the temporary file, rename, fsync of the directory). On an
+/// error the temporary file may be left behind; the next call overwrites it.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let tmp = atomic_tmp_path(path);
     {
@@ -67,6 +83,11 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// `write_all`. Otherwise the new line would be glued to the fragment
 /// (finding F1 of the 019 data audit). The fragment becomes a terminated
 /// line of its own; readers then see it as broken or as a valid row.
+///
+/// # Errors
+/// The first failing step, as an [`io::Error`] that keeps the
+/// [`io::ErrorKind`] and names the step and the path (open, read of the
+/// last byte, append, fsync of the file or of the directory).
 pub fn append_synced(path: &Path, data: &[u8]) -> io::Result<()> {
     let mut f = OpenOptions::new()
         .create(true)
@@ -102,6 +123,9 @@ fn ends_with_newline(f: &mut File) -> io::Result<bool> {
 
 /// [`append_synced`] for one line; `\n` is added, line and newline go out
 /// in a single write (no line without `\n` if the process dies in between).
+///
+/// # Errors
+/// As [`append_synced`].
 pub fn append_line_synced(path: &Path, line: &str) -> io::Result<()> {
     append_synced(path, format!("{line}\n").as_bytes())
 }

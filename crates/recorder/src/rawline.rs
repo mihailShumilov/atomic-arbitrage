@@ -18,7 +18,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use hood_core::{FeedEnvelope, Gap};
 
-use crate::route::intra_envelope_gaps;
+use crate::route::envelope_seqs;
 
 /// One parsed line; the JSON column is borrowed, not parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,24 +59,22 @@ pub fn parse_raw_line(line: &[u8]) -> Option<RawLine<'_>> {
 
 impl RawLine<'_> {
     /// Sequence numbers of the line; None for unsequenced lines
-    /// (`seq_first = seq_last = 0`). The JSON is parsed only when
-    /// `seq_first != seq_last`.
+    /// (`seq_first = seq_last = 0`). The JSON is always parsed (only at
+    /// start-up, at most three hourly files): until the 025 review a line
+    /// with `seq_first == seq_last` skipped it, so an envelope like
+    /// `[7, 9, 7]` counted as 7 without the hole 8 here but as 9 with the
+    /// hole in the live writer.
     pub fn seqs(&self) -> Option<LineSeqs> {
         if self.seq_first == 0 && self.seq_last == 0 {
             return None;
         }
-        if self.seq_first == self.seq_last {
-            return Some(LineSeqs { seq_max: self.seq_first, intra_gaps: Vec::new() });
-        }
-        let fallback = LineSeqs { seq_max: self.seq_first.max(self.seq_last), intra_gaps: Vec::new() };
-        match serde_json::from_slice::<FeedEnvelope>(self.json) {
-            Ok(env) if !env.messages.is_empty() => {
-                let seqs: Vec<u64> = env.messages.iter().map(|m| m.sequence_number).collect();
-                let (intra_gaps, _) = intra_envelope_gaps(&seqs);
-                Some(LineSeqs { seq_max: seqs.iter().copied().max().unwrap_or(fallback.seq_max), intra_gaps })
-            }
-            _ => Some(fallback),
-        }
+        // Same derivation as for live frames (`route::envelope_seqs`); the
+        // larger column if the JSON is broken or has no messages.
+        let parsed = serde_json::from_slice::<FeedEnvelope>(self.json).ok();
+        Some(match parsed.as_ref().and_then(envelope_seqs) {
+            Some(s) => LineSeqs { seq_max: s.seq_max, intra_gaps: s.intra_gaps },
+            None => LineSeqs { seq_max: self.seq_first.max(self.seq_last), intra_gaps: Vec::new() },
+        })
     }
 }
 
@@ -151,5 +149,23 @@ mod tests {
         // Broken JSON: the larger of the two columns.
         let broken = parse_raw_line(b"1\t110\t108\t{").unwrap();
         assert_eq!(broken.seqs().unwrap().seq_max, 110);
+    }
+
+    /// Task 025 item 1: live routing and the disk reader derive seq_max and
+    /// the holes in one place (`route::envelope_seqs`), so they agree.
+    #[test]
+    fn disk_reader_agrees_with_live_routing() {
+        let cases: [&[u64]; 8] =
+            [&[7], &[100, 101, 105, 106, 108], &[110, 108], &[10, 12, 11], &[5, 5], &[3, 9, 4], &[7, 9, 7], &[7, 3, 7]];
+        for seqs in cases {
+            let raw = env(seqs);
+            let live = crate::route::route_text(1, raw.clone());
+            let line = format!("1\t{}\t{}\t{raw}", live.seq_first, live.seq_last);
+            let s = parse_raw_line(line.as_bytes()).unwrap().seqs().unwrap();
+            assert_eq!((s.seq_max, s.intra_gaps), (live.seq_max, live.intra_gaps), "{seqs:?}");
+        }
+        // No messages: the columns decide (unchanged).
+        let empty = parse_raw_line(b"1\t4\t6\t{\"version\":1,\"messages\":[]}").unwrap();
+        assert_eq!(empty.seqs(), Some(LineSeqs { seq_max: 6, intra_gaps: vec![] }));
     }
 }

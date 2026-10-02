@@ -232,11 +232,11 @@ impl<'a> ConnEvent<'a> {
     /// `broken` or `unterminated`.
     pub fn gaps_line_skipped(s: &SkippedGapLine) -> Self {
         let quoted: String = s.line.chars().take(SKIPPED_LINE_MAX).collect::<String>().escape_debug().to_string();
-        let (reason, why) = match &s.why {
-            GapsSkip::Broken(r) => ("broken", r.as_str()),
-            GapsSkip::Unterminated => ("unterminated", "no trailing newline"),
+        let n = s.line_no;
+        let (reason, detail) = match &s.why {
+            GapsSkip::Broken(fault) => ("broken", format!("gaps.tsv line {n}: {fault}: \"{quoted}\"")),
+            GapsSkip::Unterminated => ("unterminated", format!("gaps.tsv line {n}: no trailing newline: \"{quoted}\"")),
         };
-        let detail = format!("gaps.tsv line {}: {why}: \"{quoted}\"", s.line_no);
         Self::new(ConnEventKind::GapsLineSkipped, reason, detail)
     }
 
@@ -421,6 +421,7 @@ mod tests {
     use super::*;
     use crate::backoff::EndKind;
     use crate::transport::CloseReply;
+    use hood_core::ranges::LineFault;
     use hood_core::Range;
 
     /// Golden test (task 021 item 4): the exact rows of every event. Rows
@@ -495,7 +496,7 @@ mod tests {
              "2026-09-30T12:57:31.286Z\t1790773051286991000\ttorn_repair\tstartup\t-\t-\t-\t-\t-\t-\tdata/feed-test-002/2026/09/30/feed-20260930-12.tsv.zst kept=4772435 torn=1187507 saved=data/feed-test-002/_torn/feed-20260930-12.tsv.zst.at4772435.20260930T125731Z.torn"),
             (now, ConnEvent::gap_reconciled(&GapRow { range: Range { from: 104, to: 106 }, recv_ns: 6 }),
              "2026-10-01T06:45:52.000Z\t1790837152000000000\tgap_reconciled\tstartup\t-\t-\t-\t-\t-\t-\t104..106 recv_ns=6 missing from gaps.tsv, appended"),
-            (now, ConnEvent::gaps_line_skipped(&SkippedGapLine { line_no: 2, line: "broken\tx".into(), why: GapsSkip::Broken("column to is not a number".into()) }),
+            (now, ConnEvent::gaps_line_skipped(&SkippedGapLine { line_no: 2, line: "broken\tx".into(), why: GapsSkip::Broken(LineFault::NotANumber("to")) }),
              "2026-10-01T06:45:52.000Z\t1790837152000000000\tgaps_line_skipped\tbroken\t-\t-\t-\t-\t-\t-\tgaps.tsv line 2: column to is not a number: \"broken\\tx\""),
             (now, ConnEvent::gaps_line_skipped(&SkippedGapLine { line_no: 6, line: "200\t2".into(), why: GapsSkip::Unterminated }),
              "2026-10-01T06:45:52.000Z\t1790837152000000000\tgaps_line_skipped\tunterminated\t-\t-\t-\t-\t-\t-\tgaps.tsv line 6: no trailing newline: \"200\\t2\""),
@@ -561,7 +562,11 @@ mod tests {
 
     #[test]
     fn skipped_rows_are_capped_with_one_summary() {
-        let line = |n: usize| SkippedGapLine { line_no: n, line: "x".into(), why: GapsSkip::Broken("bad".into()) };
+        let line = |n: usize| SkippedGapLine {
+            line_no: n,
+            line: "x".into(),
+            why: GapsSkip::Broken(LineFault::MissingColumn("to")),
+        };
         let few: Vec<SkippedGapLine> = (1..=SKIPPED_ROWS_MAX).map(line).collect();
         assert_eq!(gaps_skipped_events(&few).len(), SKIPPED_ROWS_MAX);
         let many: Vec<SkippedGapLine> = (1..=700).map(line).collect();

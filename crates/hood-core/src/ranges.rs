@@ -30,7 +30,10 @@ pub struct Range {
 pub type Gap = Range;
 
 impl Range {
-    /// Checked constructor: `to < from` is an error.
+    /// Checked constructor.
+    ///
+    /// # Errors
+    /// [`RangeError`] if `to < from`.
     pub fn new(from: u64, to: u64) -> Result<Self, RangeError> {
         if to < from {
             return Err(RangeError { from, to });
@@ -89,11 +92,12 @@ pub fn merge(mut v: Vec<Range>) -> Vec<Range> {
     out
 }
 
-/// `want` minus `have`, sorted and merged.
-pub fn subtract(want: Vec<Range>, have: Vec<Range>) -> Vec<Range> {
-    let have = merge(have);
+/// `want` minus `have`, sorted and merged. Inputs need not be sorted or
+/// disjoint; they are borrowed (task 025: callers used to clone them).
+pub fn subtract(want: &[Range], have: &[Range]) -> Vec<Range> {
+    let have = merge(have.to_vec());
     let mut out = Vec::new();
-    for w in merge(want) {
+    for w in merge(want.to_vec()) {
         let mut cur = w.from;
         let mut done = false;
         for h in have.iter().filter(|h| h.to >= w.from && h.from <= w.to) {
@@ -149,6 +153,30 @@ fn split_unterminated(text: &str) -> (&str, Option<&str>) {
     (&text[..cut], (!tail.trim().is_empty()).then_some(tail))
 }
 
+/// What is wrong with a line of a ranges file (task 025, remark Р1 of the
+/// 019 review). `Display` gives the texts used before 025 (they appear in
+/// WARN lines and in the `detail` of the recorder's `gaps_line_skipped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineFault {
+    /// Fewer columns than needed; the name of the first missing one
+    /// (`from` or `to`).
+    MissingColumn(&'static str),
+    /// The named column is not a decimal `u64`.
+    NotANumber(&'static str),
+    /// `to < from`.
+    BadRange(RangeError),
+}
+
+impl fmt::Display for LineFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingColumn(name) => write!(f, "missing column {name}"),
+            Self::NotANumber(name) => write!(f, "column {name} is not a number"),
+            Self::BadRange(e) => e.fmt(f),
+        }
+    }
+}
+
 /// A line of a ranges file that could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineError {
@@ -157,7 +185,7 @@ pub struct LineError {
     /// The line as it is in the file.
     pub line: String,
     /// What is wrong with it.
-    pub reason: String,
+    pub reason: LineFault,
 }
 
 impl fmt::Display for LineError {
@@ -171,18 +199,18 @@ impl std::error::Error for LineError {}
 /// Parse one line: the first two tab-separated columns as an inclusive
 /// range, further columns are not looked at. `Ok(None)` for a blank line or
 /// a `#` comment.
-fn parse_range_line(line: &str) -> Result<Option<Range>, String> {
+fn parse_range_line(line: &str) -> Result<Option<Range>, LineFault> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return Ok(None);
     }
     let mut cols = line.split('\t');
-    let mut num = |name: &str| -> Result<u64, String> {
-        let c = cols.next().ok_or_else(|| format!("missing column {name}"))?;
-        c.trim().parse::<u64>().map_err(|_| format!("column {name} is not a number"))
+    let mut num = |name: &'static str| -> Result<u64, LineFault> {
+        let c = cols.next().ok_or(LineFault::MissingColumn(name))?;
+        c.trim().parse::<u64>().map_err(|_| LineFault::NotANumber(name))
     };
     let (from, to) = (num("from")?, num("to")?);
-    Range::new(from, to).map(Some).map_err(|e| e.to_string())
+    Range::new(from, to).map(Some).map_err(LineFault::BadRange)
 }
 
 /// Ranges read from the contents of `gaps.tsv` or `filled.tsv`.
@@ -219,7 +247,10 @@ pub fn parse_ranges_file_lenient(text: &str) -> ParsedRanges<'_> {
 /// Strict reading policy (the enricher's `gaps.tsv`): an unterminated
 /// last line is ignored and returned (it is either being appended right now
 /// or is a torn write; the next run sees it once it has its `\n`), a broken
-/// line that ends with `\n` is an error (the first one is returned).
+/// line that ends with `\n` is an error.
+///
+/// # Errors
+/// The first broken `\n`-terminated line, as a [`LineError`].
 pub fn parse_ranges_file(text: &str) -> Result<ParsedRanges<'_>, LineError> {
     let mut p = parse_ranges_file_lenient(text);
     if p.broken.is_empty() {
@@ -302,12 +333,12 @@ mod tests {
         assert_eq!(merge(vec![r(1, u64::MAX), r(5, 6)]), vec![r(1, u64::MAX)]);
         let want = vec![r(100, 199), r(300, 310)];
         let have = vec![r(90, 120), r(150, 160), r(300, 310)];
-        assert_eq!(subtract(want, have), vec![r(121, 149), r(161, 199)]);
-        assert_eq!(subtract(vec![r(1, 10)], vec![]), vec![r(1, 10)]);
-        assert_eq!(subtract(vec![r(1, 10)], vec![r(0, 100)]), vec![]);
-        assert_eq!(subtract(vec![], vec![r(0, 100)]), vec![]);
+        assert_eq!(subtract(&want, &have), vec![r(121, 149), r(161, 199)]);
+        assert_eq!(subtract(&[r(1, 10)], &[]), vec![r(1, 10)]);
+        assert_eq!(subtract(&[r(1, 10)], &[r(0, 100)]), vec![]);
+        assert_eq!(subtract(&[], &[r(0, 100)]), vec![]);
         // The recorder's former `uncovered` cases (writer.rs, before task 019).
-        let unc = |listed: Vec<Range>| subtract(vec![r(10, 20)], listed);
+        let unc = |listed: Vec<Range>| subtract(&[r(10, 20)], &listed);
         assert_eq!(unc(vec![]), vec![r(10, 20)]);
         assert_eq!(unc(vec![r(10, 20)]), vec![]);
         assert_eq!(unc(vec![r(5, 30)]), vec![]);
@@ -316,12 +347,12 @@ mod tests {
         assert_eq!(unc(vec![r(21, 30), r(1, 9)]), vec![r(10, 20)]);
         assert_eq!(unc(vec![r(0, u64::MAX)]), vec![]);
         assert_eq!(
-            subtract(vec![r(u64::MAX - 5, u64::MAX)], vec![r(u64::MAX - 3, u64::MAX)]),
+            subtract(&[r(u64::MAX - 5, u64::MAX)], &[r(u64::MAX - 3, u64::MAX)]),
             vec![r(u64::MAX - 5, u64::MAX - 4)]
         );
         // Unsorted, overlapping input on both sides.
         assert_eq!(
-            subtract(vec![r(50, 60), r(1, 30), r(20, 40)], vec![r(35, 52), r(5, 5)]),
+            subtract(&[r(50, 60), r(1, 30), r(20, 40)], &[r(35, 52), r(5, 5)]),
             vec![r(1, 4), r(6, 34), r(53, 60)]
         );
     }
@@ -339,9 +370,21 @@ mod tests {
         assert_eq!(parse_ranges_file(t).unwrap().ranges, vec![r(100, 199), r(300, 300)]);
         let e = parse_ranges_file("1\t2\t3\n5\tx\n").unwrap_err();
         assert_eq!((e.line_no, e.line.as_str()), (2, "5\tx"));
-        assert!(e.to_string().contains("column to is not a number"), "{e}");
-        assert!(parse_ranges_file("9\t5\n").unwrap_err().reason.contains("bad range"));
-        assert!(parse_ranges_file("9\n").unwrap_err().reason.contains("missing column to"));
+        assert_eq!(e.reason, LineFault::NotANumber("to"));
+        assert_eq!(e.to_string(), "line 2: column to is not a number in \"5\\tx\"");
+        let e = parse_ranges_file("9\t5\n").unwrap_err();
+        assert_eq!(e.reason, LineFault::BadRange(RangeError { from: 9, to: 5 }));
+        assert_eq!(parse_ranges_file("9\n").unwrap_err().reason, LineFault::MissingColumn("to"));
+        assert_eq!(parse_ranges_file("x\t5\n").unwrap_err().reason, LineFault::NotANumber("from"));
+    }
+
+    /// Task 025: the typed reason prints exactly the texts of the former
+    /// `String` reason (WARN lines, `gaps_line_skipped` detail).
+    #[test]
+    fn line_fault_texts_are_unchanged() {
+        assert_eq!(LineFault::MissingColumn("to").to_string(), "missing column to");
+        assert_eq!(LineFault::NotANumber("from").to_string(), "column from is not a number");
+        assert_eq!(LineFault::BadRange(RangeError { from: 9, to: 5 }).to_string(), "bad range 9..=5");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use hood_core::jitter;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
@@ -61,17 +62,6 @@ pub enum Outcome {
     Stopped,
     /// The writer failed; exit with [`EXIT_WRITER_ERROR`].
     WriterFailed,
-}
-
-/// Cheap jitter source in [0, 1) without an RNG dependency.
-fn rand01() -> f64 {
-    let n = now_ns() as u64;
-    // splitmix64 finaliser
-    let mut z = n.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 async fn shutdown_signal() -> &'static str {
@@ -176,7 +166,7 @@ async fn net_loop(
         if stop_reason(stop).is_some() {
             return;
         }
-        let (pause, rule) = ladder.next_pause(end.kind, end.retry_after, end.session, rand01());
+        let (pause, rule) = ladder.next_pause(end.kind, end.retry_after, end.session, jitter::rand01());
         warn!(
             reason = end.kind.as_str(), http = ?end.http_status, retry_after = ?end.retry_after_raw,
             session_s = end.session.as_secs_f64(), envelopes = end.envelopes,
@@ -192,7 +182,12 @@ async fn net_loop(
 }
 
 /// Run the recorder until a signal (`Stopped`) or a fatal writer error
-/// (`WriterFailed`). `Err`: failed before recording (exit 1).
+/// (`WriterFailed`).
+///
+/// # Errors
+/// A failure before recording starts (exit 1): the out-dir cannot be
+/// created, crash recovery fails (unreadable data, fsync) or the TLS setup
+/// fails.
 pub async fn run(cfg: Config) -> Result<Outcome> {
     std::fs::create_dir_all(&cfg.out_dir).with_context(|| format!("create {}", cfg.out_dir.display()))?;
     let conn_log = ConnLog::new(&cfg.out_dir);

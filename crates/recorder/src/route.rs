@@ -72,9 +72,36 @@ fn newest_kind3_ts(v: &serde_json::Value) -> Option<u64> {
         .max()
 }
 
+/// Sequence numbers of one envelope, as the writer accounts for them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvSeqs {
+    /// First message's seq.
+    pub seq_first: u64,
+    /// Last message's seq.
+    pub seq_last: u64,
+    /// Highest seq (== `seq_last` unless the envelope is out of order).
+    pub seq_max: u64,
+    /// Holes between consecutive messages.
+    pub intra_gaps: Vec<Gap>,
+    /// Consecutive messages that went backwards or repeated.
+    pub intra_disorder: u32,
+}
+
+/// The one place that derives `seq_max` and the holes from an envelope's
+/// messages (task 025 item 1, remark Р3 of the 021 review): used for live
+/// frames ([`route_text`]) and for raw lines read back from disk
+/// (`rawline::RawLine::seqs`). None for an envelope without messages.
+pub fn envelope_seqs(env: &FeedEnvelope) -> Option<EnvSeqs> {
+    let (seq_first, seq_last) = env.seq_range()?;
+    let seqs: Vec<u64> = env.messages.iter().map(|m| m.sequence_number).collect();
+    let (intra_gaps, intra_disorder) = intra_envelope_gaps(&seqs);
+    let seq_max = seqs.iter().copied().max().unwrap_or(seq_last);
+    Some(EnvSeqs { seq_first, seq_last, seq_max, intra_gaps, intra_disorder })
+}
+
 /// Holes and disorder inside one envelope. Every pair `(a, b)` of consecutive
 /// sequence numbers must satisfy `b == a + 1`.
-pub fn intra_envelope_gaps(seqs: &[u64]) -> (Vec<Gap>, u32) {
+fn intra_envelope_gaps(seqs: &[u64]) -> (Vec<Gap>, u32) {
     let mut gaps = Vec::new();
     let mut disorder = 0u32;
     for w in seqs.windows(2) {
@@ -102,12 +129,9 @@ pub fn route_text(recv_ns: u128, raw: String) -> Line {
         Ok(e) => e,
         Err(_) => return Line::unsequenced(recv_ns, raw),
     };
-    let Some((seq_first, seq_last)) = env.seq_range() else {
+    let Some(EnvSeqs { seq_first, seq_last, seq_max, intra_gaps, intra_disorder }) = envelope_seqs(&env) else {
         return Line::unsequenced(recv_ns, raw);
     };
-    let seqs: Vec<u64> = env.messages.iter().map(|m| m.sequence_number).collect();
-    let (intra_gaps, intra_disorder) = intra_envelope_gaps(&seqs);
-    let seq_max = seqs.iter().copied().max().unwrap_or(seq_last);
     Line { recv_ns, seq_first, seq_last, seq_max, intra_gaps, intra_disorder, kind3_ts, raw }
 }
 
@@ -174,6 +198,21 @@ mod tests {
         let l = route_text(1, envelope(&[10, 12, 11]));
         assert_eq!(l.seq_max, 12);
         assert_eq!(l.seq_last, 11);
+    }
+
+    #[test]
+    fn envelope_seqs_derivation() {
+        let env: FeedEnvelope = serde_json::from_str(&envelope(&[10, 12, 11])).unwrap();
+        let want = EnvSeqs {
+            seq_first: 10,
+            seq_last: 11,
+            seq_max: 12,
+            intra_gaps: vec![Gap { from: 11, to: 11 }],
+            intra_disorder: 1,
+        };
+        assert_eq!(envelope_seqs(&env), Some(want));
+        let empty: FeedEnvelope = serde_json::from_str(r#"{"version":1,"messages":[]}"#).unwrap();
+        assert_eq!(envelope_seqs(&empty), None);
     }
 
     #[test]

@@ -9,11 +9,12 @@
 //! Modules (pure logic and thin std helpers shared by recorder and enricher):
 //! [`ranges`] (block ranges, `gaps.tsv` / `filled.tsv`), [`http`]
 //! (`Retry-After`), [`fsutil`] (atomic write, fsync, append), [`hex`]
-//! (JSON-RPC quantities).
+//! (JSON-RPC quantities), [`jitter`] (random spread of retry pauses).
 
 pub mod fsutil;
 pub mod hex;
 pub mod http;
+pub mod jitter;
 pub mod ranges;
 
 use serde::Deserialize;
