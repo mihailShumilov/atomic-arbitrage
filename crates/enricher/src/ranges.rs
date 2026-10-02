@@ -1,38 +1,53 @@
 //! Reading the recorder's `gaps.tsv` and the enricher's `filled.tsv`.
 //!
-//! Formats, range arithmetic and the reading policy live in
-//! [`hood_core::ranges`]; this module only adds file IO and error context.
-//! Policy (task 012 item 5, the same for both files since task 019): an
-//! unterminated last line is ignored and returned so the caller logs a WARN,
-//! a broken line that ends with `\n` is an error.
+//! Formats, range arithmetic and the parsers live in [`hood_core::ranges`];
+//! this module only adds file IO, error context and the reading policy:
+//! - both files: an unterminated last line is ignored and returned, the
+//!   caller logs a WARN (task 012 item 5);
+//! - `gaps.tsv`: a broken line that ends with `\n` is an error (a lost line
+//!   would be a lost gap);
+//! - `filled.tsv` (task 020 item 6, review 019 Р9): broken lines are skipped
+//!   and returned for a WARN. Losing a line is harmless: its range is just
+//!   downloaded again. A strict read made one damaged line stop every
+//!   `--gaps` run until someone edited the file by hand.
 
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use hood_core::ranges::{parse_ranges_file, Range};
+use hood_core::ranges::{parse_ranges_file, parse_ranges_file_lenient, LineError, ParsedRanges, Range};
 
-/// Ranges of a state file plus the ignored unterminated last line, if any.
-pub type RangesRead = (Vec<Range>, Option<String>);
-
-fn parse_text(text: &str, path: &Path, what: &str) -> Result<RangesRead> {
-    let p = parse_ranges_file(text).with_context(|| format!("{what} file {}", path.display()))?;
-    Ok((p.ranges, p.unterminated.map(str::to_owned)))
+/// Ranges of a state file plus what was skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RangesRead {
+    /// Ranges of the complete lines that parsed, in file order.
+    pub ranges: Vec<Range>,
+    /// The ignored unterminated last line, if any.
+    pub unterminated: Option<String>,
+    /// Skipped broken lines (only ever non-empty for `filled.tsv`).
+    pub broken: Vec<LineError>,
 }
 
-/// The recorder's `gaps.tsv` for `--gaps`. A missing file is an error.
+impl From<ParsedRanges<'_>> for RangesRead {
+    fn from(p: ParsedRanges<'_>) -> Self {
+        Self { ranges: p.ranges, unterminated: p.unterminated.map(str::to_owned), broken: p.broken }
+    }
+}
+
+/// The recorder's `gaps.tsv` for `--gaps`, strict. A missing file is an error.
 pub fn read_gaps_file(path: &Path) -> Result<RangesRead> {
     let text = fs::read_to_string(path).with_context(|| format!("read gaps file {}", path.display()))?;
-    parse_text(&text, path, "gaps")
+    let p = parse_ranges_file(&text).with_context(|| format!("gaps file {}", path.display()))?;
+    Ok(p.into())
 }
 
-/// `filled.tsv` of the blocks out-dir. A missing file means nothing is
-/// filled yet.
+/// `filled.tsv` of the blocks out-dir, lenient. A missing file means
+/// nothing is filled yet.
 pub fn read_filled_file(path: &Path) -> Result<RangesRead> {
     match fs::read_to_string(path) {
-        Ok(text) => parse_text(&text, path, "filled"),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok((Vec::new(), None)),
+        Ok(text) => Ok(parse_ranges_file_lenient(&text).into()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(RangesRead::default()),
         Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
     }
 }
@@ -49,25 +64,35 @@ mod tests {
     }
 
     #[test]
-    fn files_follow_one_policy() {
+    fn gaps_strict_filled_lenient() {
         let d = scratch("policy");
         let r = |from, to| Range { from, to };
         let filled = d.join("filled.tsv");
-        assert_eq!(read_filled_file(&filled).unwrap(), (vec![], None));
+        assert_eq!(read_filled_file(&filled).unwrap(), RangesRead::default());
         assert!(read_gaps_file(&d.join("gaps.tsv")).is_err(), "missing gaps file is an error");
 
         fs::write(&filled, "1\t2\tblocks-1-2.jsonl.zst\t1790000000\n3\t4\tblocks-3").unwrap();
-        assert_eq!(read_filled_file(&filled).unwrap(), (vec![r(1, 2)], Some("3\t4\tblocks-3".to_owned())));
-        fs::write(&filled, "1\t2\tblocks-1-2.jsonl.zst\t1790000000\n3\n").unwrap();
-        let e = read_filled_file(&filled).unwrap_err();
-        assert!(format!("{e:#}").contains("filled file"), "{e:#}");
-        assert!(format!("{e:#}").contains("line 2"), "{e:#}");
+        let got = read_filled_file(&filled).unwrap();
+        assert_eq!(got.ranges, vec![r(1, 2)]);
+        assert_eq!(got.unterminated.as_deref(), Some("3\t4\tblocks-3"));
+        assert!(got.broken.is_empty());
+
+        // A broken terminated line of filled.tsv is skipped, not an error.
+        fs::write(&filled, "1\t2\tblocks-1-2.jsonl.zst\t1790000000\n3\n5\t6\tblocks-5-6.jsonl.zst\t1\n").unwrap();
+        let got = read_filled_file(&filled).unwrap();
+        assert_eq!(got.ranges, vec![r(1, 2), r(5, 6)]);
+        assert_eq!(got.broken.len(), 1);
+        assert_eq!((got.broken[0].line_no, got.broken[0].line.as_str()), (2, "3"));
 
         let gaps = d.join("gaps.tsv");
         fs::write(&gaps, "5\t9\t1\n77200000\t").unwrap();
-        assert_eq!(read_gaps_file(&gaps).unwrap(), (vec![r(5, 9)], Some("77200000\t".to_owned())));
-        fs::write(&gaps, "5\tx\n").unwrap();
-        assert!(read_gaps_file(&gaps).is_err());
+        let got = read_gaps_file(&gaps).unwrap();
+        assert_eq!(got.ranges, vec![r(5, 9)]);
+        assert_eq!(got.unterminated.as_deref(), Some("77200000\t"));
+        // ... but in gaps.tsv it is still an error, with file and line.
+        fs::write(&gaps, "5\t9\t1\n5\tx\n").unwrap();
+        let e = format!("{:#}", read_gaps_file(&gaps).unwrap_err());
+        assert!(e.contains("gaps file") && e.contains("line 2"), "{e}");
         fs::remove_dir_all(&d).ok();
     }
 }

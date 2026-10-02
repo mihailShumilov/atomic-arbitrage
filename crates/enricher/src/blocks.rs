@@ -19,11 +19,13 @@ use hood_core::hex::quantity;
 use hood_core::ranges::{FilledRow, Range};
 
 use crate::atomic::AtomicZstdFile;
-use crate::rpc::{Call, Check, Item, Rpc};
+use crate::rpc::{Call, Item, OnTimeout, Rpc};
 
 pub const M_BLOCK: &str = "eth_getBlockByNumber";
 pub const M_RECEIPTS: &str = "eth_getBlockReceipts";
 pub const FILLED_TSV: &str = "filled.tsv";
+/// `eth_getBlockByNumber` + `eth_getBlockReceipts`.
+pub const CALLS_PER_BLOCK: u64 = 2;
 
 pub fn file_name(r: Range) -> String {
     format!("blocks-{}-{}.jsonl.zst", r.from, r.to)
@@ -54,7 +56,7 @@ pub fn validate_block(n: u64, block: &Value, receipts: &Value) -> Result<(), Str
 }
 
 fn calls_for(from: u64, to: u64) -> Vec<Call> {
-    let mut calls = Vec::with_capacity(((to - from + 1) * 2) as usize);
+    let mut calls = Vec::with_capacity(((to - from + 1) * CALLS_PER_BLOCK) as usize);
     for n in from..=to {
         let tag = quantity(n);
         calls.push(Call { id: n * 2, method: M_BLOCK, params: json!([tag, true]) });
@@ -63,46 +65,41 @@ fn calls_for(from: u64, to: u64) -> Vec<Call> {
     calls
 }
 
-fn check_items(from: u64, items: &[Item]) -> Check {
-    for (i, pair) in items.chunks(2).enumerate() {
-        let n = from + i as u64;
-        for (it, m) in pair.iter().zip([M_BLOCK, M_RECEIPTS]) {
-            if let Some(e) = &it.error {
-                return Check::Retry(format!("block {n}: {m} error {} {}", e.code, e.message));
-            }
-            if it.result.is_none() {
-                return Check::Retry(format!("block {n}: {m} returned null (not available yet?)"));
-            }
-        }
-        let parse = |it: &Item| serde_json::from_str::<Value>(it.result.as_ref().unwrap().get());
-        match (parse(&pair[0]), parse(&pair[1])) {
-            (Ok(b), Ok(r)) => {
-                if let Err(e) = validate_block(n, &b, &r) {
-                    return Check::Retry(e);
-                }
-            }
-            _ => return Check::Retry(format!("block {n}: invalid JSON in result")),
-        }
+/// The result of one call as JSON, or why the batch must be retried.
+fn parse_result(n: u64, method: &str, it: &Item) -> Result<Value, String> {
+    if let Some(e) = &it.error {
+        return Err(format!("block {n}: {method} error {} {}", e.code, e.message));
     }
-    Check::Accept
+    let raw = it.result.as_ref().ok_or_else(|| format!("block {n}: {method} returned null (not available yet?)"))?;
+    serde_json::from_str(raw.get()).map_err(|_| format!("block {n}: invalid JSON in {method} result"))
 }
 
-/// Fetch `from..=to` in one JSON-RPC batch. Returns one output line per block.
-pub async fn fetch_batch(rpc: &Rpc, from: u64, to: u64) -> Result<Vec<Value>> {
-    let calls = calls_for(from, to);
-    let what = format!("blocks {from}..={to}");
-    let items = rpc.call(&calls, &what, false, |items| check_items(from, items)).await?;
+/// Turn a complete batch response (pairs block, receipts per block from
+/// `from` on) into output lines, parsing each result once. `Err` = retry.
+fn accept_batch(from: u64, items: &[Item]) -> Result<Vec<Value>, String> {
     let mut out = Vec::with_capacity(items.len() / 2);
     for (i, pair) in items.chunks(2).enumerate() {
         let n = from + i as u64;
-        let (rb, rr) = (pair[0].result.as_ref().unwrap(), pair[1].result.as_ref().unwrap());
-        rpc.stats.record_result(M_BLOCK, rb.get());
-        rpc.stats.record_result(M_RECEIPTS, rr.get());
-        let b: Value = serde_json::from_str(rb.get())?;
-        let r: Value = serde_json::from_str(rr.get())?;
-        out.push(json!({"number": n, "block": b, "receipts": r}));
+        let [b, r] = pair else { return Err(format!("block {n}: receipts response missing")) };
+        let block = parse_result(n, M_BLOCK, b)?;
+        let receipts = parse_result(n, M_RECEIPTS, r)?;
+        validate_block(n, &block, &receipts)?;
+        // Same Value construction as before task 020: identical output bytes.
+        out.push(json!({"number": n, "block": block, "receipts": receipts}));
     }
     Ok(out)
+}
+
+/// Fetch `from..=to` in one JSON-RPC batch. Returns one output line per block.
+pub(crate) async fn fetch_batch(rpc: &Rpc, from: u64, to: u64) -> Result<Vec<Value>> {
+    let calls = calls_for(from, to);
+    let what = format!("blocks {from}..={to}");
+    Ok(rpc.call(&calls, &what, OnTimeout::Retry, |items| accept_batch(from, items)).await?)
+}
+
+/// JSON-RPC calls needed to fetch `r` once (no retries).
+pub fn calls_needed(r: Range) -> u64 {
+    r.blocks().saturating_mul(CALLS_PER_BLOCK)
 }
 
 pub struct BlocksOpts {
@@ -166,5 +163,31 @@ mod tests {
         assert!(validate_block(10, &b, &wrong_hash).unwrap_err().contains("blockHash"));
         let wrong_tx = json!([{"blockHash":"0xh","transactionHash":"0xt2"}]);
         assert!(validate_block(10, &b, &wrong_tx).unwrap_err().contains("tx hash"));
+    }
+
+    fn items(json: &str) -> Vec<Item> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Task 020 item 7: one parse per result, and the output line keeps the
+    /// exact bytes of the pre-020 format (serde_json without preserve_order:
+    /// keys sorted, `block` < `number` < `receipts`).
+    #[test]
+    fn accepted_batch_gives_the_same_line_bytes() {
+        let ok = items(
+            r#"[{"id":20,"result":{"number":"0xa","hash":"0xh","transactions":[{"hash":"0xt1"}]}},
+                {"id":21,"result":[{"transactionHash":"0xt1","blockHash":"0xh","status":"0x1"}]}]"#,
+        );
+        let lines = accept_batch(10, &ok).unwrap();
+        assert_eq!(
+            serde_json::to_string(&lines[0]).unwrap(),
+            r#"{"block":{"hash":"0xh","number":"0xa","transactions":[{"hash":"0xt1"}]},"number":10,"receipts":[{"blockHash":"0xh","status":"0x1","transactionHash":"0xt1"}]}"#
+        );
+        let null = items(r#"[{"id":20,"result":null},{"id":21,"result":[]}]"#);
+        assert!(accept_batch(10, &null).unwrap_err().contains("returned null"));
+        let err = items(r#"[{"id":20,"error":{"code":-32000,"message":"x"}},{"id":21,"result":[]}]"#);
+        assert!(accept_batch(10, &err).unwrap_err().contains("eth_getBlockByNumber error -32000"));
+        assert!(accept_batch(10, &ok[..1]).unwrap_err().contains("receipts response missing"));
+        assert_eq!(calls_needed(Range { from: 5, to: 9 }), 10);
     }
 }

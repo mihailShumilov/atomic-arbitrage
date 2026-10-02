@@ -8,7 +8,13 @@
 //! - `logs`: `eth_getLogs` by topic0 with an adaptive window
 //!   → `<logs-out>/logs-<from>-<to>.jsonl.zst` (see `logs`). No reverted txs.
 //! - `--gaps <gaps.tsv>`: fills every recorder gap not yet in `filled.tsv`, in
-//!   `blocks` mode; a rerun downloads nothing that is already closed.
+//!   `blocks` mode; a rerun downloads nothing that is already closed (and
+//!   makes no call at all). `gaps.tsv` is read strictly, `filled.tsv`
+//!   leniently (see `ranges`).
+//!
+//! Before the first download every run checks `eth_chainId` against
+//! `hood_core::CHAIN_ID` (one call, part of `--max-calls`); `--dry-run` and a
+//! run with nothing to do make no call. Exit codes: see `exit`.
 //!
 //! All output is atomic (`*.partial` → fsync → rename). Calls are rate
 //! limited (`--rps`, per JSON-RPC call), honour `Retry-After`, back off with
@@ -21,6 +27,7 @@
 
 pub mod atomic;
 pub mod blocks;
+pub mod exit;
 pub mod logs;
 pub mod ranges;
 pub mod rpc;
@@ -34,10 +41,11 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, ValueEnum};
 use tracing::{info, warn};
 
+use hood_core::hex::quantity;
 use hood_core::ranges::{self as hr, Range};
 
 use crate::atomic::OutDirLock;
-use crate::rpc::{redact_url, RetryPolicy, Rpc};
+use crate::rpc::{redact_url, RetryPolicy, Rpc, M_CHAIN_ID};
 use crate::stats::{Stats, Summary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -78,8 +86,10 @@ pub struct Args {
     /// consumes N (blocks mode: 2 calls per block). 0 = unlimited.
     #[arg(long, default_value_t = 4.0)]
     pub rps: f64,
-    /// Hard budget of JSON-RPC calls for the whole run (retries included);
-    /// the run stops instead of exceeding it, the binary with exit code 75.
+    /// Hard budget of JSON-RPC calls for the whole run (retries and the one
+    /// `eth_chainId` check included); the run stops instead of exceeding it,
+    /// the binary with exit code 75. A file the rest of the budget cannot pay
+    /// for is not started. `--gaps`: less than one file + 1 is an error (exit 1).
     #[arg(long)]
     pub max_calls: Option<u64>,
     /// Attempts per request before the run stops with an error.
@@ -113,9 +123,26 @@ pub struct Args {
     pub stats_json: Option<PathBuf>,
 }
 
-pub fn make_rpc(a: &Args, stats: Arc<Stats>) -> Result<Rpc> {
-    ensure!(a.rps >= 0.0 && a.rps.is_finite(), "--rps must be >= 0");
-    ensure!(a.max_attempts >= 1, "--max-attempts must be >= 1");
+/// Default `--chunk` in `--gaps` mode (blocks per file).
+pub const GAPS_DEFAULT_CHUNK: u64 = 1000;
+
+impl Args {
+    /// Every argument check that needs no IO, before anything is done.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.batch >= 1, "--batch must be >= 1");
+        if let Some(c) = self.chunk {
+            ensure!(c >= 1, "--chunk must be >= 1");
+        }
+        ensure!(self.rps >= 0.0 && self.rps.is_finite(), "--rps must be >= 0");
+        ensure!(self.max_attempts >= 1, "--max-attempts must be >= 1");
+        if !self.gaps.is_empty() {
+            ensure!(self.mode == Mode::Blocks, "--gaps always fills in blocks mode; do not combine with --mode logs");
+        }
+        Ok(())
+    }
+}
+
+fn make_rpc(a: &Args, stats: Arc<Stats>) -> Result<Rpc> {
     let policy = RetryPolicy {
         max_attempts: a.max_attempts,
         base: Duration::from_millis(a.backoff_ms.max(1)),
@@ -125,7 +152,28 @@ pub fn make_rpc(a: &Args, stats: Arc<Stats>) -> Result<Rpc> {
         .with_max_calls(a.max_calls))
 }
 
-fn check_budget(a: &Args, blocks: u64) -> Result<()> {
+/// Build the client and make sure the endpoint is Robinhood Chain (task 020
+/// item 2): one `eth_chainId` call, counted in `--max-calls`, before the first
+/// download. Another network is an error (exit 1) and nothing is written:
+/// its blocks would pass every internal consistency check and `filled.tsv`
+/// would mark the gaps closed.
+async fn connect(a: &Args, stats: Arc<Stats>) -> Result<Rpc> {
+    let rpc = make_rpc(a, stats)?;
+    let got = rpc.chain_id().await.context("check the chain id of the RPC endpoint")?;
+    ensure!(
+        got == hood_core::CHAIN_ID,
+        "wrong network: the RPC endpoint {} reports chain id {got} ({}), expected Robinhood Chain {} ({}); \
+         check RPC_URL / --rpc-url. Nothing was downloaded",
+        redact_url(&a.rpc_url),
+        quantity(got),
+        hood_core::CHAIN_ID,
+        quantity(hood_core::CHAIN_ID),
+    );
+    info!(chain_id = got, "chain id ok");
+    Ok(rpc)
+}
+
+fn check_max_blocks(a: &Args, blocks: u64) -> Result<()> {
     if let Some(max) = a.max_blocks {
         if blocks > max {
             bail!("plan needs {blocks} blocks, more than --max-blocks {max}");
@@ -134,44 +182,86 @@ fn check_budget(a: &Args, blocks: u64) -> Result<()> {
     Ok(())
 }
 
+/// Calls one run needs at least: the chain id check plus the largest file
+/// (a file is all or nothing). `None` for an empty plan (no call is made).
+fn min_calls_per_run(chunks: &[Range]) -> Option<u64> {
+    let largest = chunks.iter().map(|c| blocks::calls_needed(*c)).max()?;
+    Some(largest.saturating_add(CHAIN_ID_CALLS))
+}
+
+/// `eth_chainId` calls per run (see [`connect`]).
+const CHAIN_ID_CALLS: u64 = 1;
+
+/// Task 020 item 3 (review I7): with `--max-calls` below what one file
+/// needs, every `--gaps` run would spend its budget on a file it cannot
+/// commit and exit 75 ("success" for systemd) without progress. That is a
+/// configuration error: exit 1, so `OnFailure=` notifies.
+fn check_plan_fits_budget(a: &Args, chunks: &[Range]) -> Result<()> {
+    let (Some(max), Some(need)) = (a.max_calls, min_calls_per_run(chunks)) else { return Ok(()) };
+    if need <= max {
+        return Ok(());
+    }
+    let largest = chunks.iter().map(Range::blocks).max().unwrap_or(0);
+    let max_chunk = max.saturating_sub(CHAIN_ID_CALLS) / blocks::CALLS_PER_BLOCK;
+    let fix = if max_chunk >= 1 {
+        format!("lower --chunk to <= {max_chunk} or raise --max-calls to >= {need}")
+    } else {
+        format!("raise --max-calls to >= {need}")
+    };
+    bail!(
+        "--max-calls {max} is less than the {need} calls a run needs to commit its largest file \
+         ({largest} blocks x {} calls + {CHAIN_ID_CALLS} {M_CHAIN_ID}): no run could make progress; {fix}",
+        blocks::CALLS_PER_BLOCK
+    )
+}
+
+/// Download `chunks` one file each, recording every committed file in
+/// `filled.tsv`. A file the remaining `--max-calls` cannot pay for is not
+/// started: the run stops with the budget error (exit 75) instead of
+/// spending calls on a file that would be discarded.
+async fn fill_blocks(rpc: &Rpc, a: &Args, chunks: &[Range]) -> Result<()> {
+    let opts = blocks::BlocksOpts { batch: a.batch, concurrency: a.concurrency };
+    for &c in chunks {
+        rpc.ensure_budget(blocks::calls_needed(c), &format!("blocks {}..={}", c.from, c.to))?;
+        let path = blocks::write_range(rpc, &a.out_dir, c, &opts).await?;
+        blocks::mark_filled(&a.out_dir, c, &path)?;
+        info!(from = c.from, to = c.to, "file filled");
+    }
+    Ok(())
+}
+
 /// Run the selected mode. `stats` is filled as it goes so the caller can
 /// print counters even if this future is dropped (Ctrl-C) or fails.
 pub async fn run(a: &Args, stats: Arc<Stats>) -> Result<()> {
-    ensure!(a.batch >= 1, "--batch must be >= 1");
-    if let Some(c) = a.chunk {
-        ensure!(c >= 1, "--chunk must be >= 1");
-    }
+    a.validate()?;
     info!(rpc = %redact_url(&a.rpc_url), mode = ?a.mode, rps = a.rps, max_calls = ?a.max_calls, batch = a.batch, concurrency = a.concurrency, "enricher");
 
     if !a.gaps.is_empty() {
-        ensure!(a.mode == Mode::Blocks, "--gaps always fills in blocks mode; do not combine with --mode logs");
         return run_gaps(a, stats).await;
     }
     let (from, to) = (a.from.context("--from")?, a.to.context("--to")?);
     let range = Range::new(from, to).context("--to must be >= --from")?;
-    check_budget(a, range.blocks())?;
-    let rpc = make_rpc(a, stats)?;
+    check_max_blocks(a, range.blocks())?;
+    let chunks = hr::chunk(&[range], a.chunk.unwrap_or(u64::MAX));
 
     match a.mode {
         Mode::Blocks => {
             let lock = OutDirLock::acquire(&a.out_dir)?;
             report_partials(&lock);
-            let opts = blocks::BlocksOpts { batch: a.batch, concurrency: a.concurrency };
-            for r in hr::chunk(&[range], a.chunk.unwrap_or(u64::MAX)) {
-                let path = blocks::write_range(&rpc, &a.out_dir, r, &opts).await?;
-                blocks::mark_filled(&a.out_dir, r, &path)?;
-            }
+            let rpc = connect(a, stats).await?;
+            fill_blocks(&rpc, a, &chunks).await?;
         }
         Mode::Logs => {
-            let lock = OutDirLock::acquire(&a.logs_out_dir)?;
-            report_partials(&lock);
             let topics = if a.topics.is_empty() {
                 logs::default_topics()
             } else {
                 a.topics.iter().map(|t| logs::validate_topic(t)).collect::<Result<_>>()?
             };
+            let lock = OutDirLock::acquire(&a.logs_out_dir)?;
+            report_partials(&lock);
+            let rpc = connect(a, stats).await?;
             let opts = logs::LogsOpts { topics, window: a.logs_window, window_max: a.logs_window_max };
-            for r in hr::chunk(&[range], a.chunk.unwrap_or(u64::MAX)) {
+            for r in chunks {
                 logs::write_range(&rpc, &a.logs_out_dir, r, &opts).await?;
             }
         }
@@ -184,54 +274,51 @@ async fn run_gaps(a: &Args, stats: Arc<Stats>) -> Result<()> {
     report_partials(&lock);
     let mut gaps = Vec::new();
     for g in &a.gaps {
-        ensure!(g.exists(), "gaps file {} does not exist", g.display());
-        let (v, cut) = ranges::read_gaps_file(g)?;
-        if let Some(line) = cut {
+        let read = ranges::read_gaps_file(g)?;
+        if let Some(line) = &read.unterminated {
             warn!(file = %g.display(), line = %line.escape_debug(), "ignoring unterminated last line of gaps file (being written?); the next run picks it up");
         }
-        info!(file = %g.display(), gaps = v.len(), "read gaps");
-        gaps.extend(v);
+        info!(file = %g.display(), gaps = read.ranges.len(), "read gaps");
+        gaps.extend(read.ranges);
     }
     let gaps = hr::merge(gaps);
     let filled_path = a.out_dir.join(blocks::FILLED_TSV);
-    let (filled, cut) = ranges::read_filled_file(&filled_path)?;
-    if let Some(line) = cut {
+    let filled = ranges::read_filled_file(&filled_path)?;
+    if let Some(line) = &filled.unterminated {
         // Torn append (the enricher holds the out-dir lock, so nobody is
         // writing it now): that file is not counted and gets downloaded again.
         warn!(file = %filled_path.display(), line = %line.escape_debug(), "ignoring unterminated last line of filled.tsv (torn write?); its range is filled again");
     }
-    let todo = hr::subtract(gaps.clone(), filled);
+    for e in &filled.broken {
+        warn!(file = %filled_path.display(), line_no = e.line_no, line = %e.line.escape_debug(), reason = %e.reason, "ignoring broken line of filled.tsv; its range is filled again if it is still a gap");
+    }
+    let todo = hr::subtract(gaps.clone(), filled.ranges);
     let gap_blocks: u64 = gaps.iter().map(Range::blocks).sum();
     let todo_blocks: u64 = todo.iter().map(Range::blocks).sum();
-    let chunks = hr::chunk(&todo, a.chunk.unwrap_or(1000));
+    let chunks = hr::chunk(&todo, a.chunk.unwrap_or(GAPS_DEFAULT_CHUNK));
     info!(
         gap_ranges = gaps.len(),
         gap_blocks,
         already_filled_blocks = gap_blocks - todo_blocks,
         todo_ranges = todo.len(),
         todo_blocks,
-        min_calls = todo_blocks * 2,
+        planned_calls = todo_blocks * blocks::CALLS_PER_BLOCK + if chunks.is_empty() { 0 } else { CHAIN_ID_CALLS },
         files = chunks.len(),
         "gaps plan"
     );
     for c in &chunks {
         info!(from = c.from, to = c.to, blocks = c.blocks(), "to fill");
     }
-    check_budget(a, todo_blocks)?;
+    check_max_blocks(a, todo_blocks)?;
+    check_plan_fits_budget(a, &chunks)?;
     if a.dry_run || chunks.is_empty() {
         if chunks.is_empty() {
             info!("nothing to fill: every gap is already in filled.tsv");
         }
         return Ok(());
     }
-    let rpc = make_rpc(a, stats)?;
-    let opts = blocks::BlocksOpts { batch: a.batch, concurrency: a.concurrency };
-    for c in chunks {
-        let path = blocks::write_range(&rpc, &a.out_dir, c, &opts).await?;
-        blocks::mark_filled(&a.out_dir, c, &path)?;
-        info!(from = c.from, to = c.to, "gap chunk filled");
-    }
-    Ok(())
+    let rpc = connect(a, stats).await?;
+    fill_blocks(&rpc, a, &chunks).await
 }
 
 fn report_partials(lock: &OutDirLock) {
@@ -253,6 +340,7 @@ pub fn report(sum: &Summary, stats_json: Option<&std::path::Path>) -> Result<()>
         timeouts = c.timeouts,
         rpc_rate_limited = c.rpc_rate_limited,
         retries = c.retries,
+        global_pauses = c.global_pauses,
         "stats"
     );
     for (m, n) in &c.calls {

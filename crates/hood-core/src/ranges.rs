@@ -199,8 +199,9 @@ pub struct ParsedRanges<'a> {
 
 /// Lenient read of `gaps.tsv` / `filled.tsv`: like [`parse_ranges_file`],
 /// but broken terminated lines are collected in [`ParsedRanges::broken`]
-/// instead of failing. Only for the recorder's start-up, which must not
-/// crash-loop over its own state file (see `read_gap_ranges` there).
+/// instead of failing. Used where a lost line is harmless: the recorder's
+/// start-up (`gaps.tsv`, must not crash-loop over its own state file) and the
+/// enricher's `filled.tsv` (a lost row only means the range is re-downloaded).
 pub fn parse_ranges_file_lenient(text: &str) -> ParsedRanges<'_> {
     let (complete, unterminated) = split_unterminated(text);
     let mut ranges = Vec::new();
@@ -215,7 +216,7 @@ pub fn parse_ranges_file_lenient(text: &str) -> ParsedRanges<'_> {
     ParsedRanges { ranges, unterminated, broken }
 }
 
-/// The one reading policy for `gaps.tsv` and `filled.tsv`: an unterminated
+/// Strict reading policy (the enricher's `gaps.tsv`): an unterminated
 /// last line is ignored and returned (it is either being appended right now
 /// or is a torn write; the next run sees it once it has its `\n`), a broken
 /// line that ends with `\n` is an error (the first one is returned).

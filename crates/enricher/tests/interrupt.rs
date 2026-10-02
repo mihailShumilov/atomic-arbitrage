@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::{scratch, start, Behavior};
 
-fn spawn(url: &str, out: &std::path::Path, from: u64, to: u64) -> std::process::Child {
+fn spawn(url: &str, out: &std::path::Path, from: u64, to: u64, extra: &[&str]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_enricher"))
         .args([
             "--rpc-url",
@@ -26,6 +26,7 @@ fn spawn(url: &str, out: &std::path::Path, from: u64, to: u64) -> std::process::
             "--out-dir",
             out.to_str().unwrap(),
         ])
+        .args(extra)
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -43,7 +44,9 @@ async fn sigint_mid_range_leaves_no_final_file() {
     let m = start(Behavior { delay: Duration::from_millis(200), ..Default::default() }).await;
     let d = scratch("sigint");
     let out = d.join("blocks");
-    let mut child = spawn(&m.url, &out, 1, 200);
+    // Task 020 item 5: a --stats-json that cannot be written (a directory)
+    // does not turn 130 into 1.
+    let mut child = spawn(&m.url, &out, 1, 200, &["--stats-json", d.to_str().unwrap()]);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(out.join("blocks-1-200.jsonl.zst.partial").exists(), "partial exists while running");
     assert!(!out.join("blocks-1-200.jsonl.zst").exists());
@@ -61,7 +64,7 @@ async fn sigkill_leaves_only_partial_which_next_run_removes() {
     let m = start(Behavior { delay: Duration::from_millis(200), ..Default::default() }).await;
     let d = scratch("sigkill");
     let out = d.join("blocks");
-    let mut child = spawn(&m.url, &out, 1, 200);
+    let mut child = spawn(&m.url, &out, 1, 200, &[]);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     kill(child.id(), "-KILL");
     tokio::task::spawn_blocking(move || child.wait().unwrap()).await.unwrap();
@@ -70,7 +73,7 @@ async fn sigkill_leaves_only_partial_which_next_run_removes() {
 
     // Next run in the same dir removes the leftover and completes its own range.
     let fast = start(Behavior::default()).await;
-    let mut child = spawn(&fast.url, &out, 300, 304);
+    let mut child = spawn(&fast.url, &out, 300, 304, &[]);
     let status = tokio::task::spawn_blocking(move || child.wait().unwrap()).await.unwrap();
     assert!(status.success());
     assert!(!out.join("blocks-1-200.jsonl.zst.partial").exists());

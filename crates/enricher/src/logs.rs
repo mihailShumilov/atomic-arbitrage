@@ -23,7 +23,7 @@ use hood_core::hex::{parse_quantity, quantity};
 use hood_core::ranges::Range;
 
 use crate::atomic::AtomicZstdFile;
-use crate::rpc::{classify, Call, CallError, Check, ErrClass, Rpc};
+use crate::rpc::{classify, Call, CallError, ErrClass, Item, OnTimeout, Rpc};
 
 pub const M_LOGS: &str = "eth_getLogs";
 pub const FORMAT: &str = "hood-logs-v1";
@@ -88,25 +88,25 @@ async fn get_logs(rpc: &Rpc, a: u64, b: u64, topics: &[String]) -> Result<Window
         params: json!([{"fromBlock": quantity(a), "toBlock": quantity(b), "topics": [topics]}]),
     };
     let what = format!("logs {a}..={b}");
-    let check = |items: &[crate::rpc::Item]| match (&items[0].error, &items[0].result) {
-        (Some(e), _) if classify(e.code, &e.message) == ErrClass::TooMuchData => Check::Accept,
-        (Some(e), _) => Check::Retry(format!("{M_LOGS} error {} {}", e.code, e.message)),
-        (None, None) => Check::Retry(format!("{M_LOGS} returned null")),
-        (None, Some(_)) => Check::Accept,
+    // Too much data (error) or the log array; anything else is retried.
+    let accept = |items: &[Item]| -> Result<WindowResult, String> {
+        let [it] = items else { return Err(format!("{M_LOGS}: {} responses for 1 call", items.len())) };
+        match (&it.error, &it.result) {
+            (Some(e), _) if classify(e.code, &e.message) == ErrClass::TooMuchData => {
+                Ok(WindowResult::TooMuch(format!("{} {}", e.code, e.message)))
+            }
+            (Some(e), _) => Err(format!("{M_LOGS} error {} {}", e.code, e.message)),
+            (None, None) => Err(format!("{M_LOGS} returned null")),
+            (None, Some(raw)) => serde_json::from_str::<Vec<Value>>(raw.get())
+                .map(WindowResult::Logs)
+                .map_err(|e| format!("{M_LOGS} result is not an array of logs: {e}")),
+        }
     };
-    let items = match rpc.call(std::slice::from_ref(&call), &what, true, check).await {
-        Ok(items) => items,
-        Err(CallError::Timeout) => return Ok(WindowResult::TooMuch("timeout".into())),
-        Err(e) => return Err(e.into()),
-    };
-    let it = &items[0];
-    if let Some(e) = &it.error {
-        return Ok(WindowResult::TooMuch(format!("{} {}", e.code, e.message)));
+    match rpc.call(std::slice::from_ref(&call), &what, OnTimeout::Return, accept).await {
+        Ok(w) => Ok(w),
+        Err(CallError::Timeout) => Ok(WindowResult::TooMuch("timeout".into())),
+        Err(e) => Err(e.into()),
     }
-    let raw = it.result.as_ref().unwrap();
-    let logs: Vec<Value> = serde_json::from_str(raw.get()).context("eth_getLogs result is not an array")?;
-    rpc.stats.record_result(M_LOGS, raw.get());
-    Ok(WindowResult::Logs(logs))
 }
 
 /// Download logs for `r` into `<dir>/logs-<from>-<to>.jsonl.zst` atomically.

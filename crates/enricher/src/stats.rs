@@ -23,6 +23,9 @@ pub struct Counters {
     pub rpc_rate_limited: u64,
     /// Requests re-sent after a failure.
     pub retries: u64,
+    /// Retries after a rate limit (HTTP 429 or JSON-RPC rate-limit error)
+    /// that also paused every other in-flight task (task 020).
+    pub global_pauses: u64,
     /// JSON-RPC calls sent per method, incl. retries (what a provider bills).
     pub calls: BTreeMap<String, u64>,
 }

@@ -26,11 +26,21 @@ pub struct Behavior {
     pub delay: Duration,
     /// eth_getLogs over more blocks than this returns "more than 10000 results".
     pub logs_max_range: Option<u64>,
+    /// The next K requests (after the 429s and rate-limit errors) answer
+    /// eth_getBlockByNumber with `result: null` (node lag: a transient retry).
+    pub null_block_next: usize,
+    /// `eth_chainId` answer; default `0x1237` (Robinhood Chain, 4663).
+    pub chain_id: Option<&'static str>,
 }
 
 pub struct Mock {
     pub url: String,
+    /// HTTP requests except the `eth_chainId` check (counted separately).
     pub requests: Arc<AtomicUsize>,
+    /// HTTP requests that only carried `eth_chainId`. They are always answered
+    /// normally and do not use up the 429 / rate-limit / delay behaviours, so
+    /// those keep applying to the data requests they were written for.
+    pub chain_id_requests: Arc<AtomicUsize>,
     /// (method, params) of every JSON-RPC call received, incl. retried ones.
     pub calls: Arc<Mutex<Vec<(String, Value)>>>,
 }
@@ -38,6 +48,9 @@ pub struct Mock {
 impl Mock {
     pub fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+    pub fn chain_id_requests(&self) -> usize {
+        self.chain_id_requests.load(Ordering::SeqCst)
     }
     pub fn calls_of(&self, method: &str) -> Vec<Value> {
         self.calls.lock().unwrap().iter().filter(|(m, _)| m == method).map(|(_, p)| p.clone()).collect()
@@ -65,6 +78,7 @@ fn answer(b: &Behavior, call: &Value) -> Value {
     let method = call["method"].as_str().unwrap_or("");
     let p = &call["params"];
     let result = match method {
+        "eth_chainId" => json!(b.chain_id.unwrap_or("0x1237")),
         "eth_getBlockByNumber" => {
             let n = hex(&p[0]);
             json!({"number": p[0], "hash": block_hash(n), "parentHash": block_hash(n.wrapping_sub(1)),
@@ -128,15 +142,15 @@ pub async fn start(b: Behavior) -> Mock {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(AtomicUsize::new(0));
+    let chain_id_requests = Arc::new(AtomicUsize::new(0));
     let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
-    let (rq, cl) = (requests.clone(), calls.clone());
+    let (rq, cq, cl) = (requests.clone(), chain_id_requests.clone(), calls.clone());
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { return };
-            let (b, rq, cl) = (b.clone(), rq.clone(), cl.clone());
+            let (b, rq, cq, cl) = (b.clone(), rq.clone(), cq.clone(), cl.clone());
             tokio::spawn(async move {
                 let Some(body) = read_request(&mut sock).await else { return };
-                let k = rq.fetch_add(1, Ordering::SeqCst);
                 let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let batch: Vec<Value> = match &req {
                     Value::Array(v) => v.clone(),
@@ -145,16 +159,35 @@ pub async fn start(b: Behavior) -> Mock {
                 for c in &batch {
                     cl.lock().unwrap().push((c["method"].as_str().unwrap_or("").to_owned(), c["params"].clone()));
                 }
-                if !b.delay.is_zero() {
+                let chain_only = !batch.is_empty() && batch.iter().all(|c| c["method"] == "eth_chainId");
+                let k = if chain_only {
+                    cq.fetch_add(1, Ordering::SeqCst);
+                    usize::MAX
+                } else {
+                    rq.fetch_add(1, Ordering::SeqCst)
+                };
+                if !chain_only && !b.delay.is_zero() {
                     tokio::time::sleep(b.delay).await;
                 }
-                let (status, extra, body) = if b.always_429 || k < b.http_429_first {
+                let (status, extra, body) = if chain_only {
+                    let v: Vec<Value> = batch.iter().map(|c| answer(&b, c)).collect();
+                    ("200 OK", String::new(), serde_json::to_vec(&v).unwrap())
+                } else if b.always_429 || k < b.http_429_first {
                     let ra = b.retry_after.map(|v| format!("Retry-After: {v}\r\n")).unwrap_or_default();
                     ("429 Too Many Requests", ra, b"{\"error\":\"rate limited\"}".to_vec())
                 } else if k < b.http_429_first + b.rpc_rate_limit_next {
                     let v: Vec<Value> = batch
                         .iter()
                         .map(|c| json!({"jsonrpc":"2.0","id":c["id"],"error":{"code":-32005,"message":"rate limit exceeded"}}))
+                        .collect();
+                    ("200 OK", String::new(), serde_json::to_vec(&v).unwrap())
+                } else if k < b.http_429_first + b.rpc_rate_limit_next + b.null_block_next {
+                    let v: Vec<Value> = batch
+                        .iter()
+                        .map(|c| match c["method"].as_str() {
+                            Some("eth_getBlockByNumber") => json!({"jsonrpc":"2.0","id":c["id"],"result":null}),
+                            _ => answer(&b, c),
+                        })
                         .collect();
                     ("200 OK", String::new(), serde_json::to_vec(&v).unwrap())
                 } else {
@@ -171,7 +204,7 @@ pub async fn start(b: Behavior) -> Mock {
             });
         }
     });
-    Mock { url, requests, calls }
+    Mock { url, requests, chain_id_requests, calls }
 }
 
 pub fn scratch(name: &str) -> PathBuf {

@@ -39,8 +39,12 @@ async fn retries_after_429_honouring_retry_after() {
     assert_eq!(c.http_429, 2);
     assert_eq!(c.rpc_rate_limited, 1, "JSON-RPC rate-limit error inside HTTP 200 is retried too");
     assert_eq!(c.retries, 3);
-    assert_eq!(c.http_requests, 4);
+    assert_eq!(c.global_pauses, 3, "every rate limit pauses all tasks");
+    // 4 data requests + 1 eth_chainId check (task 020).
+    assert_eq!(c.http_requests, 5);
     assert_eq!(m.requests(), 4);
+    assert_eq!(m.chain_id_requests(), 1);
+    assert_eq!(c.calls["eth_chainId"], 1);
     // Two Retry-After: 1 waits; the backoff alone (10 ms base) would be far shorter.
     assert!(el >= Duration::from_millis(1900), "Retry-After not honoured: {el:?}");
     assert_eq!(c.calls["eth_getBlockByNumber"], 40);
@@ -180,6 +184,39 @@ async fn call_budget_is_never_exceeded() {
     // Task 012 item 5: typed, so the binary can exit with 75.
     assert!(enricher::rpc::is_budget_exhausted(&err), "{err:#}");
     assert_eq!(m.requests(), 2);
-    assert_eq!(m.calls.lock().unwrap().len(), 40);
+    // 1 eth_chainId + 2 attempts x 20; the third (61 > 50) is never sent.
+    assert_eq!(m.calls.lock().unwrap().len(), 41);
     assert!(!out.join("blocks-1-10.jsonl.zst").exists());
+}
+
+/// Task 020 item 1 (review I1): the global pause follows the error kind,
+/// not the text. A null block result for block 77429001 has "429" in its
+/// message; before 020 that paused every task. Now it is an ordinary retry.
+#[tokio::test]
+async fn transient_error_with_429_in_text_does_not_pause_all() {
+    let m = start(Behavior { null_block_next: 1, ..Default::default() }).await;
+    let d = scratch("retry-429-text");
+    let out = d.join("blocks");
+    let a = args(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "77429001",
+        "--to",
+        "77429002",
+        "--rps",
+        "0",
+        "--backoff-ms",
+        "10",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
+    let stats = Arc::new(Stats::default());
+    enricher::run(&a, stats.clone()).await.unwrap();
+    let c = stats.counters();
+    assert_eq!(c.retries, 1);
+    assert_eq!(c.global_pauses, 0, "a transient retry must not pause every task");
+    assert_eq!(c.rpc_rate_limited, 0);
+    assert_eq!(m.requests(), 2);
+    assert!(out.join("blocks-77429001-77429002.jsonl.zst").exists());
 }

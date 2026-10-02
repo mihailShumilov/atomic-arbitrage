@@ -44,10 +44,13 @@ async fn gaps_fill_once_and_skip_closed_ranges() {
     let filled = std::fs::read_to_string(out.join("filled.tsv")).unwrap();
     assert_eq!(filled.lines().count(), 3);
 
-    // Rerun: everything is closed → zero RPC requests.
+    assert_eq!(m.chain_id_requests(), 1, "one eth_chainId check per run");
+
+    // Rerun: everything is closed → zero RPC requests, not even eth_chainId.
     let before = m.requests();
     enricher::run(&args(&base), Arc::new(Stats::default())).await.unwrap();
     assert_eq!(m.requests(), before, "rerun must not download closed ranges");
+    assert_eq!(m.chain_id_requests(), 1, "nothing to do: no chain id call");
 
     // A new, partly overlapping gap: only the uncovered part is fetched.
     std::fs::write(&gaps, "100\t104\t1\n200\t202\t2\n103\t105\t3\n201\t207\t4\n").unwrap();
@@ -75,7 +78,49 @@ async fn gaps_dry_run_and_budget_make_no_calls() {
     capped.extend(["--max-blocks", "100"]);
     let err = enricher::run(&args(&capped), Arc::new(Stats::default())).await.unwrap_err();
     assert!(format!("{err:#}").contains("--max-blocks 100"));
+    // Task 020 item 3: the budget check is part of planning, so --dry-run
+    // reports a --max-calls that cannot pay for one file (500 blocks: 1001).
+    let mut small = dry.clone();
+    small.extend(["--max-calls", "1000"]);
+    let e = enricher::run(&args(&small), Arc::new(Stats::default())).await.unwrap_err();
+    assert!(!enricher::rpc::is_budget_exhausted(&e), "a config error (exit 1), not exit 75");
+    let err = format!("{e:#}");
+    assert!(err.contains("--max-calls 1000") && err.contains("1001"), "{err}");
+    let mut enough = dry.clone();
+    enough.extend(["--max-calls", "1001"]);
+    enricher::run(&args(&enough), Arc::new(Stats::default())).await.unwrap();
     assert_eq!(m.requests(), 0);
+    assert_eq!(m.chain_id_requests(), 0, "--dry-run makes no call");
+}
+
+/// Task 020 item 6 (review 019 Р9): a broken, newline-terminated line of
+/// filled.tsv is skipped with a WARN instead of stopping every run. The
+/// ranges of the other lines still count; a range only the broken line
+/// covered would be downloaded again (harmless). gaps.tsv stays strict
+/// (`unterminated_last_gaps_line_is_ignored_until_complete`).
+#[tokio::test]
+async fn broken_filled_line_is_skipped() {
+    let m = start(Behavior::default()).await;
+    let d = scratch("gaps-broken-filled");
+    let out = d.join("blocks");
+    std::fs::create_dir_all(&out).unwrap();
+    let gaps = d.join("gaps.tsv");
+    std::fs::write(&gaps, "100\t103\t1\n200\t201\t2\n").unwrap();
+    std::fs::write(out.join("filled.tsv"), "100\t103\tblocks-100-103.jsonl.zst\t1790000000\n20\nx\ty\tz\n").unwrap();
+    let base =
+        ["--rpc-url", &m.url, "--gaps", gaps.to_str().unwrap(), "--rps", "0", "--out-dir", out.to_str().unwrap()];
+
+    enricher::run(&args(&base), Arc::new(Stats::default())).await.unwrap();
+    assert_eq!(m.blocks_requested(), vec![200, 201], "100..=103 is filled, broken lines are skipped");
+    let filled = std::fs::read_to_string(out.join("filled.tsv")).unwrap();
+    assert!(
+        filled.starts_with("100\t103\tblocks-100-103.jsonl.zst\t1790000000\n20\nx\ty\tz\n200\t201\t"),
+        "{filled:?}"
+    );
+
+    let before = m.requests();
+    enricher::run(&args(&base), Arc::new(Stats::default())).await.unwrap();
+    assert_eq!(m.requests(), before, "rerun downloads nothing");
 }
 
 #[tokio::test]

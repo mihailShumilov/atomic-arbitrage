@@ -22,5 +22,8 @@ zstd.workspace = true
 reqwest.workspace = true
 
 [dev-dependencies]
+# test-util: `#[tokio::test(start_paused = true)]` for the rate limiter test
+# (exact virtual time instead of real sleeps). Feature only, no new crate.
+tokio = { workspace = true, features = ["test-util"] }
 # tests/retry.rs: format an HTTP-date `Retry-After` for the mock server.
 chrono.workspace = true
