@@ -1,5 +1,5 @@
 # 023 — Миграции ClickHouse: ключ funding_edges, применение миграций (задача F ревью 2026-10-02)
-status: ready
+status: done
 phase: 1b-подготовка
 depends-on: 018
 executor: indexer-engineer

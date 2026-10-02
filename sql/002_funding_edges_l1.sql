@@ -1,5 +1,8 @@
 -- 002: funding_edges for inflows from L1 (task 017, decoder crates/decoders/src/l1_inflows.rs).
--- Applied after 001 by docker-entrypoint-initdb (alphabetical order). No data is loaded here.
+-- Applied after 001 by sql/apply.sh (task 023), on new and existing volumes. No data is loaded here.
+-- Idempotent: MODIFY COLUMN to a superset enum, ADD COLUMN IF NOT EXISTS.
+-- The funding_edges key and log_index type are superseded by 003_funding_edges_key.sql
+-- (log_index becomes UInt32 with the tx-level marker 4294967295 instead of Nullable).
 --
 -- Row semantics for the new kinds (one row per tx; token rows: one per DepositFinalized log):
 --   l1_eth   : 0x64 ArbitrumDepositTx (status 1)             -> to_addr = tx.to,  value_wei = tx.value
