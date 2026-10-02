@@ -25,6 +25,9 @@
 #   the migration is recorded with outcome 'skipped'.
 # - Statements are split on ';' outside quotes and comments; comments are not sent.
 # - A failing or non-numeric apply-unless query aborts the run (nothing is journaled for that file).
+# - A statement starting with EXCHANGE, CREATE OR REPLACE (any object: TABLE, VIEW, DICTIONARY...)
+#   or REPLACE TABLE aborts the run before any statement of that file is sent, also under --dry-run
+#   and for a file apply-unless would skip (banned: they break metadata on the Docker Desktop bind mount).
 # - Do not run two apply.sh in parallel: there is no lock (single local operator for now).
 # Test: sql/test_apply.sh (fake curl, no ClickHouse needed).
 #
@@ -130,6 +133,18 @@ split_sql() {
     }' "$1"
 }
 
+# Refuse a file whose statement starts with EXCHANGE / CREATE OR REPLACE / REPLACE TABLE: on the
+# Docker Desktop bind mount they lose or orphan metadata. Statement start only (split_sql trims it;
+# whitespace runs folded to one space).
+check_banned() {
+    local s
+    for s in "$2"/stmt-*.sql; do
+        if tr -s '[:space:]' ' ' < "$s" | grep -Eiq '^(EXCHANGE |CREATE OR REPLACE |REPLACE TABLE )'; then
+            die "$1: EXCHANGE / CREATE OR REPLACE / REPLACE TABLE are banned (data-model.md, \"Схема и миграции\"): use CREATE <t>_NNN + two RENAMEs"
+        fi
+    done
+}
+
 # Wait for the server (fresh container: up to ~60 s).
 for _ in $(seq 1 60); do
     if curl -sS --max-time 2 -o /dev/null "${CH_URL%/}/ping" 2>/dev/null; then break; fi
@@ -177,6 +192,12 @@ for f in "${files[@]}"; do
         continue
     fi
 
+    # Split and check every pending file, also under --dry-run and when apply-unless would skip it
+    # (on a fresh volume the same file runs): review 029, Р2.
+    dir="$TMP/$ver"; mkdir -p "$dir"
+    split_sql "$f" "$dir" || die "$name: cannot split statements"
+    check_banned "$name" "$dir"
+
     guard=$(sed -n 's/^-- apply-unless: //p' "$f")
     [ "$(printf '%s\n' "$guard" | grep -c .)" -le 1 ] || die "$name: more than one apply-unless line"
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -193,8 +214,6 @@ for f in "${files[@]}"; do
         [ "$g" = "0" ] || outcome=skipped
     fi
     if [ "$outcome" = applied ]; then
-        dir="$TMP/$ver"; mkdir -p "$dir"
-        split_sql "$f" "$dir" || die "$name: cannot split statements"
         for s in "$dir"/stmt-*.sql; do
             if ! out=$(ch < "$s" 2>&1); then
                 echo "--- failed statement ($name, $(basename "$s")):" >&2

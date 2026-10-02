@@ -1,5 +1,5 @@
 # 029 — Схема ClickHouse: хвосты ревью
-status: ready
+status: done
 phase: 1b-подготовка
 depends-on: 023
 executor: indexer-engineer
