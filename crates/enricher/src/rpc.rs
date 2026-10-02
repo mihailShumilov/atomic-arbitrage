@@ -9,7 +9,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context};
 use serde::Deserialize;
@@ -20,6 +20,7 @@ use tracing::warn;
 
 use hood_core::hex::parse_quantity;
 use hood_core::http::parse_retry_after;
+use hood_core::jitter::rand01;
 
 use crate::stats::Stats;
 
@@ -327,20 +328,6 @@ impl RateLimiter {
     }
 }
 
-fn jitter() -> f64 {
-    static STATE: AtomicU64 = AtomicU64::new(0);
-    let mut x = STATE.load(Ordering::Relaxed);
-    if x == 0 {
-        x = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) | 1;
-    }
-    // xorshift64
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x >> 11) as f64 / (1u64 << 53) as f64
-}
-
 /// Keep only scheme and host: provider URLs often carry the API key in the path.
 pub fn redact_url(url: &str) -> String {
     match url.split_once("://") {
@@ -446,7 +433,7 @@ impl Rpc {
                 Err(Failure::Timeout) => (FailKind::Transient, "timeout".to_owned(), None),
                 Err(Failure::Retry { kind, reason, retry_after }) => (kind, reason, retry_after),
             };
-            match next_step(attempt, kind, retry_after, &self.policy, jitter()) {
+            match next_step(attempt, kind, retry_after, &self.policy, rand01()) {
                 Step::GiveUp => {
                     return Err(CallError::Failed(anyhow!(
                         "{what}: giving up after {attempt} attempts, last error: {reason}"
@@ -581,10 +568,6 @@ mod tests {
         assert_eq!(backoff_delay(3, b, cap, 0.0), Duration::from_millis(1000));
         assert_eq!(backoff_delay(30, b, cap, 0.0), Duration::from_secs(30));
         assert!(backoff_delay(30, b, cap, 0.999) <= cap);
-        for _ in 0..1000 {
-            let u = jitter();
-            assert!((0.0..1.0).contains(&u));
-        }
     }
 
     #[test]

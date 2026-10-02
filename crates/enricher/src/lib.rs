@@ -16,6 +16,20 @@
 //! `hood_core::CHAIN_ID` (one call, part of `--max-calls`); `--dry-run` and a
 //! run with nothing to do make no call. Exit codes: see `exit`.
 //!
+//! Plan checks (both `blocks` modes, before the lock and any call): more
+//! than `--max-blocks` blocks, or a `--max-calls` that cannot pay for the
+//! largest file plus the chain id check, is a configuration error (exit 1);
+//! for ranges since task 026, before it such a run spent one call and exited
+//! 75 on every start. `logs` mode makes a data-dependent number of calls, so
+//! its budget is only enforced while running.
+//!
+//! `--dry-run` (task 026: also in range mode, where it used to be ignored and
+//! the range was downloaded) logs the plan, runs the plan checks and exits
+//! with no RPC call. In range mode it touches nothing on disk: no out-dir,
+//! no lock, no `*.partial` cleanup (the plan does not depend on what is
+//! there). In `--gaps` mode it takes the lock, because the plan subtracts
+//! `filled.tsv`.
+//!
 //! All output is atomic (`*.partial` → fsync → rename). Calls are rate
 //! limited (`--rps`, per JSON-RPC call), honour `Retry-After`, back off with
 //! jitter (a 429 pauses all in-flight tasks), stop the run after
@@ -32,6 +46,8 @@ pub mod logs;
 pub mod ranges;
 pub mod rpc;
 pub mod stats;
+#[cfg(test)]
+mod testdir;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -89,7 +105,8 @@ pub struct Args {
     /// Hard budget of JSON-RPC calls for the whole run (retries and the one
     /// `eth_chainId` check included); the run stops instead of exceeding it,
     /// the binary with exit code 75. A file the rest of the budget cannot pay
-    /// for is not started. `--gaps`: less than one file + 1 is an error (exit 1).
+    /// for is not started. Blocks mode (range or `--gaps`): less than the
+    /// largest file + 1 is an error (exit 1).
     #[arg(long)]
     pub max_calls: Option<u64>,
     /// Attempts per request before the run stops with an error.
@@ -106,7 +123,7 @@ pub struct Args {
     /// Refuse to start if more than this many blocks would be downloaded.
     #[arg(long)]
     pub max_blocks: Option<u64>,
-    /// --gaps: print the plan and exit without RPC calls.
+    /// Print the plan, check it and exit without RPC calls (range and --gaps).
     #[arg(long)]
     pub dry_run: bool,
     /// logs mode: topic0 filter (repeatable). Default: all topics known to crates/decoders.
@@ -195,7 +212,8 @@ const CHAIN_ID_CALLS: u64 = 1;
 /// Task 020 item 3 (review I7): with `--max-calls` below what one file
 /// needs, every `--gaps` run would spend its budget on a file it cannot
 /// commit and exit 75 ("success" for systemd) without progress. That is a
-/// configuration error: exit 1, so `OnFailure=` notifies.
+/// configuration error: exit 1, so `OnFailure=` notifies. Range mode
+/// (`--mode blocks`) uses the same check since task 026.
 fn check_plan_fits_budget(a: &Args, chunks: &[Range]) -> Result<()> {
     let (Some(max), Some(need)) = (a.max_calls, min_calls_per_run(chunks)) else { return Ok(()) };
     if need <= max {
@@ -241,11 +259,20 @@ pub async fn run(a: &Args, stats: Arc<Stats>) -> Result<()> {
     }
     let (from, to) = (a.from.context("--from")?, a.to.context("--to")?);
     let range = Range::new(from, to).context("--to must be >= --from")?;
+    // Before chunking: a huge range with a small --chunk is refused without
+    // building (and logging) its file list.
     check_max_blocks(a, range.blocks())?;
     let chunks = hr::chunk(&[range], a.chunk.unwrap_or(u64::MAX));
+    log_range_plan(a, range, &chunks);
 
     match a.mode {
         Mode::Blocks => {
+            // Task 026 item 2: same plan check as --gaps (exit 1, no call).
+            check_plan_fits_budget(a, &chunks)?;
+            if a.dry_run {
+                info!("dry run: plan only, no RPC call, nothing written");
+                return Ok(());
+            }
             let lock = OutDirLock::acquire(&a.out_dir)?;
             report_partials(&lock);
             let rpc = connect(a, stats).await?;
@@ -257,6 +284,10 @@ pub async fn run(a: &Args, stats: Arc<Stats>) -> Result<()> {
             } else {
                 a.topics.iter().map(|t| logs::validate_topic(t)).collect::<Result<_>>()?
             };
+            if a.dry_run {
+                info!(topics = topics.len(), "dry run: plan only, no RPC call, nothing written");
+                return Ok(());
+            }
             let lock = OutDirLock::acquire(&a.logs_out_dir)?;
             report_partials(&lock);
             let rpc = connect(a, stats).await?;
@@ -267,6 +298,41 @@ pub async fn run(a: &Args, stats: Arc<Stats>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Range mode plan, logged before the checks (like the `--gaps` plan).
+/// `logs` mode has no call estimate: the window adapts to the data.
+fn log_range_plan(a: &Args, range: Range, chunks: &[Range]) {
+    match a.mode {
+        Mode::Blocks => info!(
+            from = range.from,
+            to = range.to,
+            blocks = range.blocks(),
+            files = chunks.len(),
+            planned_calls = planned_calls(chunks),
+            "range plan"
+        ),
+        Mode::Logs => {
+            info!(from = range.from, to = range.to, blocks = range.blocks(), files = chunks.len(), "range plan");
+        }
+    }
+    log_files_to_fill(chunks);
+}
+
+/// Calls the whole blocks plan makes: every file plus the chain id check
+/// (0 for an empty plan, which makes no call). Shared by range and `--gaps`.
+fn planned_calls(chunks: &[Range]) -> u64 {
+    if chunks.is_empty() {
+        return 0;
+    }
+    chunks.iter().map(|c| blocks::calls_needed(*c)).fold(CHAIN_ID_CALLS, u64::saturating_add)
+}
+
+/// One `to fill` line per planned file (range and `--gaps`).
+fn log_files_to_fill(chunks: &[Range]) {
+    for c in chunks {
+        info!(from = c.from, to = c.to, blocks = c.blocks(), "to fill");
+    }
 }
 
 async fn run_gaps(a: &Args, stats: Arc<Stats>) -> Result<()> {
@@ -302,13 +368,11 @@ async fn run_gaps(a: &Args, stats: Arc<Stats>) -> Result<()> {
         already_filled_blocks = gap_blocks - todo_blocks,
         todo_ranges = todo.len(),
         todo_blocks,
-        planned_calls = todo_blocks * blocks::CALLS_PER_BLOCK + if chunks.is_empty() { 0 } else { CHAIN_ID_CALLS },
+        planned_calls = planned_calls(&chunks),
         files = chunks.len(),
         "gaps plan"
     );
-    for c in &chunks {
-        info!(from = c.from, to = c.to, blocks = c.blocks(), "to fill");
-    }
+    log_files_to_fill(&chunks);
     check_max_blocks(a, todo_blocks)?;
     check_plan_fits_budget(a, &chunks)?;
     if a.dry_run || chunks.is_empty() {

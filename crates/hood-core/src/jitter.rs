@@ -1,5 +1,5 @@
 //! Jitter for retry pauses, shared by the recorder (reconnect ladder) and the
-//! enricher (RPC backoff; it switches over in task 026). Task 025 item 3:
+//! enricher (RPC backoff). Task 025 item 3:
 //! before it each binary had its own generator (recorder: splitmix64 of the
 //! clock on every call, enricher: xorshift64 seeded from the clock).
 //!

@@ -6,6 +6,12 @@
 //! with a final name is therefore always complete. If the process dies before
 //! `commit`, only a `*.partial` file can remain; it is removed on drop (normal
 //! error / Ctrl-C) or by [`OutDirLock::acquire`] on the next start (kill -9).
+//!
+//! Every frame carries the zstd content checksum (task 026; files written
+//! before it have none). A reader (`zstd -dc`, `zstd::Decoder`, Python
+//! `zstandard`) then rejects a file whose decompressed bytes were changed by
+//! a flipped bit on disk instead of returning them. Old files without the
+//! checksum decode as before. The decompressed content is unchanged.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -31,10 +37,13 @@ pub struct AtomicZstdFile {
 }
 
 impl AtomicZstdFile {
+    /// Start writing `<final_path>.partial` at zstd `level`, with the
+    /// content checksum on (see the module docs).
     pub fn create(final_path: &Path, level: i32) -> Result<Self> {
         let partial_path = partial_path(final_path);
         let f = File::create(&partial_path).with_context(|| format!("create {}", partial_path.display()))?;
-        let enc = zstd::Encoder::new(BufWriter::new(f), level)?;
+        let mut enc = zstd::Encoder::new(BufWriter::new(f), level)?;
+        enc.include_checksum(true).with_context(|| format!("zstd checksum for {}", partial_path.display()))?;
         Ok(Self { final_path: final_path.to_owned(), partial_path, enc: Some(enc) })
     }
 
@@ -124,13 +133,83 @@ fn remove_partials(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testdir::TestDir;
     use std::io::Read;
 
-    fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("enricher-atomic-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+    fn scratch(name: &str) -> TestDir {
+        TestDir::new(&format!("atomic-{name}"))
+    }
+
+    /// Frame header descriptor of the first frame: bit 2 = content checksum.
+    fn has_checksum_flag(zst: &[u8]) -> bool {
+        assert_eq!(zst[..4], [0x28, 0xb5, 0x2f, 0xfd], "zstd magic");
+        zst[4] & 0b100 != 0
+    }
+
+    /// Bytes that zstd cannot compress, so they are stored as a raw block
+    /// and a flipped byte in the middle of the file is a flipped byte of the
+    /// content (no structural error to catch it). Deterministic (xorshift).
+    fn incompressible(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn flip_middle_byte(p: &Path) {
+        let mut b = fs::read(p).unwrap();
+        let i = b.len() / 2;
+        b[i] ^= 0x01;
+        fs::write(p, b).unwrap();
+    }
+
+    /// Task 026 item 1: files carry the checksum, and a flipped content byte
+    /// is reported as an error instead of being decoded silently.
+    #[test]
+    fn corrupted_byte_is_detected_by_the_checksum() {
+        let d = scratch("checksum");
+        let data = incompressible(64 * 1024);
+        let fin = d.join("blocks-1-2.jsonl.zst");
+        let mut f = AtomicZstdFile::create(&fin, 3).unwrap();
+        f.write_all(&data).unwrap();
+        f.commit().unwrap();
+        assert!(has_checksum_flag(&fs::read(&fin).unwrap()));
+        assert_eq!(zstd::decode_all(File::open(&fin).unwrap()).unwrap(), data);
+
+        flip_middle_byte(&fin);
+        let e = zstd::decode_all(File::open(&fin).unwrap()).unwrap_err();
+        assert!(e.to_string().to_lowercase().contains("checksum"), "{e}");
+
+        // Control: the same corruption of a file without checksum (as written
+        // before task 026) decodes "fine" to wrong bytes. That is what the
+        // checksum is for, and it proves the flip hit the content.
+        let old = d.join("old.jsonl.zst");
+        fs::write(&old, zstd::encode_all(&data[..], 3).unwrap()).unwrap();
+        assert!(!has_checksum_flag(&fs::read(&old).unwrap()));
+        flip_middle_byte(&old);
+        let got = zstd::decode_all(File::open(&old).unwrap()).unwrap();
+        assert_eq!(got.len(), data.len());
+        assert_ne!(got, data);
+    }
+
+    /// Files written before task 026 (no checksum) still read the same way.
+    #[test]
+    fn old_files_without_checksum_still_decode() {
+        let d = scratch("old");
+        let old = d.join("blocks-1-2.jsonl.zst");
+        let mut enc = zstd::Encoder::new(File::create(&old).unwrap(), 3).unwrap();
+        enc.include_checksum(false).unwrap();
+        enc.write_all(b"{\"number\":1}\n").unwrap();
+        enc.finish().unwrap();
+        assert!(!has_checksum_flag(&fs::read(&old).unwrap()));
+        let mut s = String::new();
+        zstd::Decoder::new(File::open(&old).unwrap()).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "{\"number\":1}\n");
     }
 
     #[test]

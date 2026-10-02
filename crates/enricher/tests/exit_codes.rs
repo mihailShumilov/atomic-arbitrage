@@ -142,6 +142,33 @@ async fn gaps_budget_below_one_file_is_a_config_error() {
     assert!(out.join("blocks-100-1099.jsonl.zst").exists());
 }
 
+/// Task 026 item 2: the same plan check in range mode, exit 1 and no call
+/// (before 026: one `eth_chainId` call and exit 75 on every run).
+#[tokio::test(flavor = "multi_thread")]
+async fn range_budget_below_one_file_is_a_config_error() {
+    let m = start(Behavior::default()).await;
+    let d = scratch("exit-range-plan");
+    let out = d.join("blocks");
+    let (code, err) = run_bin(&[
+        "--rpc-url",
+        &m.url,
+        "--from",
+        "100",
+        "--to",
+        "109",
+        "--rps",
+        "0",
+        "--max-calls",
+        "20",
+        "--out-dir",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{err}");
+    assert!(err.contains("--max-calls 20") && err.contains("21"), "{err}");
+    assert_eq!((m.requests(), m.chain_id_requests()), (0, 0));
+    assert!(!out.exists());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn other_errors_still_exit_1() {
     // Retries exhausted (HTTP 429 forever, 1 attempt): not the budget.

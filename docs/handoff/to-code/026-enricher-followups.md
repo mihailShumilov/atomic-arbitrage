@@ -1,5 +1,5 @@
 # 026 — enricher: хвосты ревью
-status: ready
+status: done
 phase: 1a
 depends-on: 025
 executor: indexer-engineer

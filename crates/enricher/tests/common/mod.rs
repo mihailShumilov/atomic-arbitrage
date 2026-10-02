@@ -3,7 +3,6 @@
 //! Synthesises consistent blocks/receipts/logs for any block number.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -207,11 +206,13 @@ pub async fn start(b: Behavior) -> Mock {
     Mock { url, requests, chain_id_requests, calls }
 }
 
-pub fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("enricher-it-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+#[path = "../../src/testdir.rs"]
+mod testdir;
+pub use testdir::TestDir as Scratch;
+
+/// Fresh empty `$TMPDIR/enricher-it-<name>-<pid>`, removed when dropped.
+pub fn scratch(name: &str) -> Scratch {
+    Scratch::new(&format!("it-{name}"))
 }
 
 /// Decompress a jsonl.zst file into parsed lines.

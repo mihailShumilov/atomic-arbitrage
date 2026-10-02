@@ -55,17 +55,11 @@ pub fn read_filled_file(path: &Path) -> Result<RangesRead> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("enricher-ranges-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
-    }
+    use crate::testdir::TestDir;
 
     #[test]
     fn gaps_strict_filled_lenient() {
-        let d = scratch("policy");
+        let d = TestDir::new("ranges-policy");
         let r = |from, to| Range { from, to };
         let filled = d.join("filled.tsv");
         assert_eq!(read_filled_file(&filled).unwrap(), RangesRead::default());
@@ -93,6 +87,5 @@ mod tests {
         fs::write(&gaps, "5\t9\t1\n5\tx\n").unwrap();
         let e = format!("{:#}", read_gaps_file(&gaps).unwrap_err());
         assert!(e.contains("gaps file") && e.contains("line 2"), "{e}");
-        fs::remove_dir_all(&d).ok();
     }
 }
