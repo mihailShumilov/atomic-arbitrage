@@ -1,6 +1,6 @@
 //! Offline scan of block files for L1 inflows: counters, optional TSV of funding edges and of
 //! unaccounted flows. Reads `blocks-*.jsonl.zst` (multi-frame zstd) or plain `.jsonl`.
-//! No network, no ClickHouse.
+//! No network, no ClickHouse. TSV columns and formatting come from `decoders::rows`.
 //!
 //! cargo run -p decoders --example l1_inflows_scan -- [--gateways extra.tsv] [--no-builtin]
 //!     [--edges-out edges.tsv] [--unaccounted-out unaccounted.tsv] FILE...
@@ -8,9 +8,11 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
 use anyhow::{bail, Context, Result};
-use decoders::l1_inflows::{decode_block, parse_line, Counters, GatewayRegistry};
+use decoders::l1_inflows::{decode_block, Counters, GatewayRegistry, UnaccountedFlow};
+use decoders::parse_block_line;
+use decoders::rows::FundingEdge;
 
 fn eth(v: U256) -> String {
     // Display only; sums are reported in wei as well.
@@ -50,7 +52,7 @@ fn main() -> Result<()> {
     let mut edges = match &edges_out {
         Some(p) => {
             let mut w = BufWriter::new(File::create(p)?);
-            writeln!(w, "block_number\ttx_index\tfrom_addr\tto_addr\tvalue_wei\tkind\ttx_hash\tlog_index\ttoken\tl1_token\tgateway\tgateway_status\tl2_alias\ttx_type\tl1_request_id\tticket_id")?;
+            FundingEdge::write_tsv_header(&mut w)?;
             Some(w)
         }
         None => None,
@@ -58,7 +60,7 @@ fn main() -> Result<()> {
     let mut unacc = match &unacc_out {
         Some(p) => {
             let mut w = BufWriter::new(File::create(p)?);
-            writeln!(w, "block_number\ttx_index\ttx_hash\tkind\taddr\tamount_wei\tl1_sender")?;
+            UnaccountedFlow::write_tsv_header(&mut w)?;
             Some(w)
         }
         None => None,
@@ -68,57 +70,27 @@ fn main() -> Result<()> {
     let (mut min_block, mut max_block) = (u64::MAX, 0u64);
     for path in &files {
         let f = File::open(path).with_context(|| format!("open {path}"))?;
-        let reader: Box<dyn Read> =
-            if path.ends_with(".zst") { Box::new(zstd::stream::read::Decoder::new(f)?) } else { Box::new(f) };
+        let zst = std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("zst"));
+        let reader: Box<dyn Read> = if zst { Box::new(zstd::stream::read::Decoder::new(f)?) } else { Box::new(f) };
         let mut file_counters = Counters::default();
         for (i, line) in BufReader::new(reader).lines().enumerate() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            let bl = parse_line(&line).with_context(|| format!("{path}:{}", i + 1))?;
-            min_block = min_block.min(bl.number);
-            max_block = max_block.max(bl.number);
-            let r = decode_block(&bl, &registry).with_context(|| format!("{path}:{}", i + 1))?;
+            let block = parse_block_line(&line).with_context(|| format!("{path}:{}", i + 1))?;
+            min_block = min_block.min(block.number);
+            max_block = max_block.max(block.number);
+            let r = decode_block(&block, &registry).with_context(|| format!("{path}:{}", i + 1))?;
             file_counters.merge(&r.counters);
             if let Some(w) = edges.as_mut() {
                 for row in &r.inflows {
-                    let e = row.funding_edge();
-                    writeln!(
-                        w,
-                        "{}\t{}\t{:#x}\t{:#x}\t{}\t{}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{:#x}\t{}\t{}\t{}",
-                        e.block_number,
-                        e.tx_index,
-                        e.from_addr,
-                        e.to_addr,
-                        e.value_wei,
-                        e.kind,
-                        e.tx_hash,
-                        opt(e.log_index),
-                        e.token.map(|a: Address| format!("{a:#x}")).unwrap_or_default(),
-                        e.l1_token.map(|a| format!("{a:#x}")).unwrap_or_default(),
-                        e.gateway.map(|a| format!("{a:#x}")).unwrap_or_default(),
-                        e.gateway_status,
-                        e.l2_alias,
-                        e.tx_type,
-                        opt(e.l1_request_id),
-                        e.ticket_id.map(|h| format!("{h:#x}")).unwrap_or_default(),
-                    )?;
+                    row.funding_edge().write_tsv(w)?;
                 }
             }
             if let Some(w) = unacc.as_mut() {
                 for u in &r.unaccounted {
-                    writeln!(
-                        w,
-                        "{}\t{}\t{:#x}\t{}\t{}\t{}\t{:#x}",
-                        u.block_number,
-                        u.tx_index,
-                        u.tx_hash,
-                        u.kind.as_str(),
-                        u.addr.map(|a| format!("{a:#x}")).unwrap_or_default(),
-                        u.amount_wei,
-                        u.l1_sender
-                    )?;
+                    u.write_tsv(w)?;
                 }
             }
         }
@@ -171,6 +143,10 @@ fn main() -> Result<()> {
         "flags token_l2_missing={} token_registry_mismatch={} deposit_finalized_foreign={} retry_zero_value={} refund_identity_anomaly={}",
         c.token_l2_missing, c.token_registry_mismatch, c.deposit_finalized_foreign, c.retry_zero_value, c.refund_identity_anomaly
     );
+    // Printed only when non-zero, so the report of a normal run is unchanged.
+    if c.token_sum_overflow > 0 {
+        println!("flags token_sum_overflow={}", c.token_sum_overflow);
+    }
     println!("ctx   0x69 ok n={} depositValue sum={} ETH", c.submit_ok.n, eth(c.submit_ok.sum));
     println!("unaccounted (not in funding_edges):");
     if c.unaccounted.is_empty() {
@@ -178,6 +154,20 @@ fn main() -> Result<()> {
     }
     for (k, a) in &c.unaccounted {
         println!("  {:<30} n={} sum={} ETH ({} wei)", k.as_str(), a.n, eth(a.sum), a.sum);
+    }
+    // Printed only when set, so the report of a normal run is unchanged.
+    let named = [
+        ("deposit_rows", &c.deposit_rows),
+        ("retry_eth_rows", &c.retry_eth_rows),
+        ("token_rows_registered", &c.token_rows_registered),
+        ("token_rows_unregistered", &c.token_rows_unregistered),
+        ("submit_ok", &c.submit_ok),
+    ];
+    let unaccounted = c.unaccounted.iter().map(|(k, a)| (k.as_str(), a));
+    for (name, a) in named.into_iter().chain(unaccounted) {
+        if a.overflowed {
+            println!("overflow {name}: sum={} is a lower bound (lower bound: overflowed)", a.sum);
+        }
     }
     if let Some(mut w) = edges {
         w.flush()?;

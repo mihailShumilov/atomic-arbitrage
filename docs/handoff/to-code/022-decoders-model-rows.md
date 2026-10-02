@@ -1,5 +1,5 @@
 # 022 — Модель и строки декодеров (задача E ревью 2026-10-02)
-status: ready
+status: done
 phase: 1b
 depends-on: 018
 executor: indexer-engineer

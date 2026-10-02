@@ -16,8 +16,13 @@
 //! Tests marked "synthetic" mutate a real fixture (status, registry) to reach code paths that
 //! were not observed on chain.
 
+use std::collections::HashSet;
+
 use alloy_primitives::{address, b256, Address, U256};
+use decoders::addresses::{L2_WETH, L2_WETH_GATEWAY};
 use decoders::l1_inflows::*;
+use decoders::parse_block_line;
+use decoders::rows::{EdgeKind, GatewayStatus};
 use serde_json::Value;
 
 const FIXTURE: &str = include_str!("fixtures/l1-inflows-blocks.jsonl");
@@ -38,7 +43,7 @@ fn raw(n: u64) -> Value {
 }
 
 fn decode_value(v: &Value, reg: &GatewayRegistry) -> anyhow::Result<BlockL1> {
-    decode_block(&parse_line(&v.to_string())?, reg)
+    decode_block(&parse_block_line(&v.to_string())?, reg)
 }
 
 fn decode(n: u64, reg: &GatewayRegistry) -> BlockL1 {
@@ -46,7 +51,7 @@ fn decode(n: u64, reg: &GatewayRegistry) -> BlockL1 {
 }
 
 fn weth_registry(l2_token: Address, status: RegistryStatus) -> GatewayRegistry {
-    GatewayRegistry::new(vec![GatewayEntry { gateway: L2_WETH_GATEWAY, l2_token: Some(l2_token), status }])
+    GatewayRegistry::new(vec![GatewayEntry { gateway: L2_WETH_GATEWAY, l2_token: Some(l2_token), status }]).unwrap()
 }
 
 fn unaccounted(r: &BlockL1, k: UnaccountedKind) -> Vec<&UnaccountedFlow> {
@@ -71,8 +76,9 @@ fn kind12_eth_deposit() {
     assert!(r.unaccounted.is_empty());
 
     let e = row.funding_edge();
-    assert_eq!((e.kind, e.from_addr, e.to_addr, e.value_wei), ("l1_eth", row.to, row.to, row.amount));
-    assert_eq!(e.gateway_status, "none");
+    assert_eq!((e.kind, e.from_addr, e.to_addr, e.value_wei), (EdgeKind::L1Eth, row.to, row.to, row.amount));
+    assert_eq!(e.gateway_status, GatewayStatus::None);
+    assert_eq!(e.log_index, None);
     assert_eq!(r.counters.deposit_rows.n, 1);
     assert_eq!(r.counters.tx_types.get(&0x6a), Some(&1));
 }
@@ -140,10 +146,11 @@ fn kind9_weth_gateway_builtin_verified() {
     assert_eq!(t.l2_token_matches_registry, Some(true));
 
     let e = row.funding_edge();
-    assert_eq!(e.kind, "l1_token");
+    assert_eq!(e.kind, EdgeKind::L1Token);
+    assert_eq!(e.log_index, Some(4));
     assert_eq!(e.from_addr, recipient); // L1 depositor, not the L1 gateway
     assert_eq!(e.token, Some(L2_WETH));
-    assert_eq!(e.gateway_status, "verified");
+    assert_eq!(e.gateway_status, GatewayStatus::Verified);
 
     assert!(unaccounted(&r, UnaccountedKind::GatewayEthUnexplained).is_empty());
     let s = unaccounted(&r, UnaccountedKind::SubmitFeeRefund);
@@ -159,7 +166,7 @@ fn kind9_weth_gateway_unregistered_is_flagged() {
     let t = r.inflows[0].token.as_ref().unwrap();
     assert_eq!(t.registry, None);
     assert_eq!(t.l2_token_matches_registry, None);
-    assert_eq!(r.inflows[0].funding_edge().gateway_status, "none");
+    assert_eq!(r.inflows[0].funding_edge().gateway_status, GatewayStatus::None);
     assert_eq!(r.counters.token_rows_unregistered.n, 1);
     assert_eq!(r.counters.token_rows_registered.n, 0);
 }
@@ -168,7 +175,7 @@ fn kind9_weth_gateway_unregistered_is_flagged() {
 fn synthetic_registry_observed_entry() {
     let r = decode(77312169, &weth_registry(L2_WETH, RegistryStatus::Observed));
     assert_eq!(r.inflows[0].token.as_ref().unwrap().registry, Some(RegistryStatus::Observed));
-    assert_eq!(r.inflows[0].funding_edge().gateway_status, "observed");
+    assert_eq!(r.inflows[0].funding_edge().gateway_status, GatewayStatus::Observed);
 }
 
 #[test]
@@ -195,9 +202,8 @@ fn no_double_count_over_fixtures() {
     assert_eq!(c.tx_types.get(&0x69), Some(&3));
     assert_eq!(c.retry_zero_value, 1);
     assert_eq!(c.deposit_rows.n + c.retry_eth_rows.n + c.token_rows_registered.n, 3);
-    // Each (tx_hash) yields at most one row here.
-    let mut hashes: Vec<_> = rows.iter().map(|r| r.tx_hash).collect();
-    hashes.dedup();
+    // Each tx_hash yields at most one row here.
+    let hashes: HashSet<_> = rows.iter().map(|r| r.tx_hash).collect();
     assert_eq!(hashes.len(), 3);
 }
 
@@ -243,5 +249,91 @@ fn misaligned_receipts_are_an_error() {
     assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
     let mut v = raw(77300695);
     v["receipts"].as_array_mut().unwrap().pop();
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+}
+
+// --- Broken input is an error (from parse_block_line), never a panic or a silent default. ---
+
+#[test]
+fn receipt_without_status_is_an_error() {
+    let mut v = raw(77285531);
+    v["receipts"][1].as_object_mut().unwrap().remove("status");
+    let err = decode_value(&v, &GatewayRegistry::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("status"), "{err:#}");
+}
+
+#[test]
+fn receipt_status_other_than_0_or_1_is_an_error() {
+    let mut v = raw(77285531);
+    v["receipts"][1]["status"] = Value::from("0x2");
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+}
+
+#[test]
+fn retry_without_ticket_id_is_an_error() {
+    let mut v = raw(77300695);
+    v["block"]["transactions"][2].as_object_mut().unwrap().remove("ticketId");
+    let err = decode_value(&v, &GatewayRegistry::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("ticketId"), "{err:#}");
+}
+
+#[test]
+fn submit_without_deposit_value_is_an_error() {
+    let mut v = raw(77300695);
+    v["block"]["transactions"][1].as_object_mut().unwrap().remove("depositValue");
+    let err = decode_value(&v, &GatewayRegistry::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("depositValue"), "{err:#}");
+}
+
+#[test]
+fn bad_hex_in_log_data_is_an_error() {
+    let mut v = raw(77312169);
+    v["receipts"][2]["logs"][0]["data"] = Value::from("0xzz");
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+}
+
+#[test]
+fn empty_quantity_is_an_error() {
+    let mut v = raw(77285531);
+    v["block"]["transactions"][1]["value"] = Value::from("0x");
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+    let mut v = raw(77285531);
+    v["block"]["transactions"][1]["value"] = Value::from("");
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+}
+
+#[test]
+fn errors_name_the_tx() {
+    let mut v = raw(77300695);
+    v["block"]["transactions"][2]["from"] = Value::from("0xnot-an-address");
+    let err = format!("{:#}", decode_value(&v, &GatewayRegistry::default()).unwrap_err());
+    assert!(err.contains("block 77300695 tx 2 0x41955de7"), "{err}");
+}
+
+#[test]
+fn tx_index_must_match_position() {
+    let mut v = raw(77300695);
+    v["block"]["transactions"][2]["transactionIndex"] = Value::from("0x5");
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+}
+
+#[test]
+fn receipt_block_hash_must_match() {
+    let mut v = raw(77300695);
+    v["receipts"][0]["blockHash"] = Value::from(format!("0x{}", "11".repeat(32)));
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+}
+
+#[test]
+fn log_of_another_tx_is_an_error() {
+    let mut v = raw(77312169);
+    v["receipts"][2]["logs"][0]["transactionHash"] = Value::from(format!("0x{}", "22".repeat(32)));
+    assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
+}
+
+#[test]
+fn log_indices_must_increase() {
+    let mut v = raw(77312169);
+    v["receipts"][2]["logs"][1]["logIndex"] = Value::from("0x0");
     assert!(decode_value(&v, &GatewayRegistry::default()).is_err());
 }
