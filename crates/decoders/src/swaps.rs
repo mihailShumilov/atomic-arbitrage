@@ -6,7 +6,7 @@
 //! `Swap` but the topics/data do not decode). Malformed logs are counted, never dropped silently,
 //! so the data-auditor can prove `hood.swaps` complete.
 //!
-//! The emitter is not checked: filtering by the `verified` PoolManager / pool registry happens
+//! The emitter is not checked: filtering by the `verified` `PoolManager` / pool registry happens
 //! downstream (loader), like `registry: None` rows of `l1_inflows`. Any contract can emit a log
 //! with these topic0.
 
@@ -21,7 +21,7 @@ use crate::model::{Block, Log, TxCtx};
 pub enum SwapEvent {
     /// Uniswap v3 pool `Swap` (emitter = the pool).
     V3,
-    /// Uniswap v4 PoolManager `Swap` (emitter = the PoolManager, pool = `pool_id`).
+    /// Uniswap v4 `PoolManager` `Swap` (emitter = the `PoolManager`, pool = `pool_id`).
     V4,
 }
 
@@ -32,7 +32,7 @@ pub enum SwapEvent {
 /// `BalanceDelta` (positive = the swapper receives), so v4 amounts are negated here.
 /// Checked on data 2026-10-02 against ERC-20 `Transfer` logs of the same receipts in
 /// data/blocks + data/samples (2 712 blocks): v3 positive amounts match a Transfer INTO the pool in
-/// 6 859 of 6 862 swaps; raw v4 positive amounts match a Transfer FROM the PoolManager 3 338
+/// 6 859 of 6 862 swaps; raw v4 positive amounts match a Transfer FROM the `PoolManager` 3 338
 /// times vs 229 the other way (native-ETH legs have no Transfer). Fixture: block 74744924.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSwap {
@@ -46,7 +46,7 @@ pub struct PoolSwap {
     /// `tx.to` (router or bot contract).
     pub router: Option<Address>,
     pub event: SwapEvent,
-    /// Emitter of the log (v3: the pool; v4: expected to be the PoolManager). Not verified here.
+    /// Emitter of the log (v3: the pool; v4: expected to be the `PoolManager`). Not verified here.
     pub pool: Address,
     /// v4 only: pool id.
     pub pool_id: Option<B256>,
@@ -108,52 +108,70 @@ pub fn decode_swap(ctx: TxCtx<'_>, log: &Log) -> SwapDecode {
     if log.topics.len() != SWAP_TOPICS {
         return SwapDecode::Malformed(SwapError::TopicCount(log.topics.len()));
     }
-    let base = |pool_id, sender, amount0, amount1, sqrt_price_x96, liquidity, tick, fee_pips| PoolSwap {
-        block_number: ctx.block,
-        tx_index: ctx.tx.index,
-        log_index: log.index,
-        tx_hash: ctx.tx.hash,
-        trader: ctx.tx.from,
-        router: ctx.tx.to,
-        event,
-        pool: log.address,
-        pool_id,
-        sender,
-        amount0,
-        amount1,
-        sqrt_price_x96,
-        liquidity,
-        tick,
-        fee_pips,
-    };
     let topics = log.topics.iter().copied();
-    match event {
-        SwapEvent::V3 => match v3::Swap::decode_raw_log(topics, &log.data) {
-            Ok(e) => SwapDecode::Swap(base(
-                None,
-                e.sender,
-                e.amount0,
-                e.amount1,
-                U256::from(e.sqrtPriceX96),
-                e.liquidity,
-                e.tick.as_i32(),
-                None,
-            )),
-            Err(e) => SwapDecode::Malformed(SwapError::Abi(e)),
-        },
-        SwapEvent::V4 => match v4::Swap::decode_raw_log(topics, &log.data) {
-            Ok(e) => SwapDecode::Swap(base(
-                Some(e.id),
-                e.sender,
-                pool_side(e.amount0),
-                pool_side(e.amount1),
-                U256::from(e.sqrtPriceX96),
-                e.liquidity,
-                e.tick.as_i32(),
-                Some(e.fee.to::<u32>()),
-            )),
-            Err(e) => SwapDecode::Malformed(SwapError::Abi(e)),
-        },
+    let fields = match event {
+        SwapEvent::V3 => v3::Swap::decode_raw_log(topics, &log.data).map(|e| SwapFields {
+            pool_id: None,
+            sender: e.sender,
+            amount0: e.amount0,
+            amount1: e.amount1,
+            sqrt_price_x96: U256::from(e.sqrtPriceX96),
+            liquidity: e.liquidity,
+            tick: e.tick.as_i32(),
+            fee_pips: None,
+        }),
+        SwapEvent::V4 => v4::Swap::decode_raw_log(topics, &log.data).map(|e| SwapFields {
+            pool_id: Some(e.id),
+            sender: e.sender,
+            amount0: pool_side(e.amount0),
+            amount1: pool_side(e.amount1),
+            sqrt_price_x96: U256::from(e.sqrtPriceX96),
+            liquidity: e.liquidity,
+            tick: e.tick.as_i32(),
+            fee_pips: Some(e.fee.to::<u32>()),
+        }),
+    };
+    match fields {
+        Ok(f) => SwapDecode::Swap(f.into_swap(ctx, log, event)),
+        Err(e) => SwapDecode::Malformed(SwapError::Abi(e)),
+    }
+}
+
+/// Event-specific part of a [`PoolSwap`], already in the pool-side sign convention. Named fields
+/// instead of positional arguments: `amount0`/`amount1` share a type and are easy to swap.
+struct SwapFields {
+    pool_id: Option<B256>,
+    sender: Address,
+    amount0: I256,
+    amount1: I256,
+    sqrt_price_x96: U256,
+    liquidity: u128,
+    tick: i32,
+    fee_pips: Option<u32>,
+}
+
+impl SwapFields {
+    /// Adds the position and tx context shared by both events.
+    fn into_swap(self, ctx: TxCtx<'_>, log: &Log, event: SwapEvent) -> PoolSwap {
+        let Self { pool_id, sender, amount0, amount1, sqrt_price_x96, liquidity, tick, fee_pips } = self;
+        PoolSwap {
+            block_number: ctx.block,
+            tx_index: ctx.tx.index,
+            log_index: log.index,
+            tx_hash: ctx.tx.hash,
+            trader: ctx.tx.from,
+            router: ctx.tx.to,
+            event,
+            pool: log.address,
+            pool_id,
+            sender,
+            amount0,
+            amount1,
+            sqrt_price_x96,
+            liquidity,
+            tick,
+            fee_pips,
+        }
     }
 }
 

@@ -123,10 +123,10 @@ impl FundingEdge {
     pub const TX_LEVEL_LOG_INDEX: u32 = u32::MAX;
 
     /// Column order of the TSV line (and of the loader's `INSERT … (columns) FORMAT TSV`).
-    /// Types in ClickHouse: block_number UInt64, tx_index UInt32, from_addr/to_addr String,
-    /// value_wei String (decimal), kind Enum8, tx_hash String, log_index UInt32 (no NULL),
-    /// token/l1_token/gateway String DEFAULT '', gateway_status Enum8, l2_alias String,
-    /// tx_type UInt8, l1_request_id String DEFAULT '' (decimal), ticket_id String DEFAULT ''.
+    /// Types in ClickHouse: `block_number UInt64`, `tx_index UInt32`, `from_addr`/`to_addr String`,
+    /// `value_wei String` (decimal), `kind Enum8`, `tx_hash String`, `log_index UInt32` (no NULL),
+    /// `token`/`l1_token`/`gateway String DEFAULT ''`, `gateway_status Enum8`, `l2_alias String`,
+    /// `tx_type UInt8`, `l1_request_id String DEFAULT ''` (decimal), `ticket_id String DEFAULT ''`.
     pub const COLUMNS: [&'static str; 16] = [
         "block_number",
         "tx_index",
@@ -197,7 +197,7 @@ impl FundingEdge {
     }
 }
 
-/// ClickHouse TSV NULL.
+/// ClickHouse TSV `NULL`.
 pub(crate) const NULL: &str = "\\N";
 
 /// `Some(v)` as `{v:#x}`, `None` as the given placeholder.

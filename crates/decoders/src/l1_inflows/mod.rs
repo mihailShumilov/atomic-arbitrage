@@ -7,16 +7,16 @@
 //!
 //! What counts as an inflow (references/data-model.md, "L1-сообщения фида"; Nitro v3.11.4
 //! `arbos/tx_processor.go`):
-//! - `0x64` ArbitrumDepositTx (feed kind 12, also kind 7): ETH `value` minted to the alias
+//! - `0x64` `ArbitrumDepositTx` (feed kind 12, also kind 7): ETH `value` minted to the alias
 //!   `from` and transferred to `to` without EVM; receipt has no logs. Row only when `status == 1`.
-//! - `0x68` ArbitrumRetryTx (auto-redeem after `0x69` in kind 9 blocks, or a manual redeem in any
+//! - `0x68` `ArbitrumRetryTx` (auto-redeem after `0x69` in kind 9 blocks, or a manual redeem in any
 //!   block) with `status == 1` and `value > 0`: callvalue leaves the ticket escrow and is sent
 //!   to `to` (= `retryTo`).
 //! - `0x68` that calls an Arbitrum token gateway: the gateway emits `DepositFinalized` (we only
 //!   trust it when the emitter is the tx's own `to`), the recipient and amount come from that log,
 //!   the L2 token from the matching `Transfer`. Row kind [`InflowKind::BridgedToken`]; no ETH row
 //!   for the gateway contract.
-//! - `0x69` SubmitRetryable is NEVER an inflow row: its `depositValue` is minted to the alias and
+//! - `0x69` `SubmitRetryable` is NEVER an inflow row: its `depositValue` is minted to the alias and
 //!   split into fees, refunds and the escrowed callvalue that the `0x68` later moves. Counting it
 //!   too would double count.
 //!
@@ -27,6 +27,9 @@
 //! holds only `verified` entries of `references/contracts.md` (today: the L2 WETH gateway and
 //! L2 WETH); callers may add `observed` entries for research. Rows from gateways that are not in
 //! the registry are still emitted but carry `registry: None` and must be filtered downstream.
+//! When such a `0x68` also carries ETH equal to the token sum, an
+//! [`UnaccountedKind::UnregisteredGatewayEth`] record keeps that possible ETH inflow to `to`
+//! visible (the contract may be a fake gateway).
 
 mod registry;
 mod types;
@@ -199,6 +202,11 @@ fn retry(
         }
         if !tx.value.is_zero() && token_sum != Some(tx.value) {
             out.unaccounted(b, UnaccountedKind::GatewayEthUnexplained, Some(to), tx.value);
+        } else if !tx.value.is_zero() && registry.get(&to).is_none() {
+            // Review 017, З2: any contract may emit `DepositFinalized`. If `to` is not a real
+            // gateway, the ETH stayed with `to` and its `l1_token` rows (`gateway_status = none`)
+            // are dropped downstream, so the inflow would vanish from the graph.
+            out.unaccounted(b, UnaccountedKind::UnregisteredGatewayEth, Some(to), tx.value);
         }
         out.inflows.extend(token_rows);
     } else if !tx.value.is_zero() {

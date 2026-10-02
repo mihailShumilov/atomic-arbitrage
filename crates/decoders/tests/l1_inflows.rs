@@ -153,6 +153,7 @@ fn kind9_weth_gateway_builtin_verified() {
     assert_eq!(e.gateway_status, GatewayStatus::Verified);
 
     assert!(unaccounted(&r, UnaccountedKind::GatewayEthUnexplained).is_empty());
+    assert!(unaccounted(&r, UnaccountedKind::UnregisteredGatewayEth).is_empty());
     let s = unaccounted(&r, UnaccountedKind::SubmitFeeRefund);
     assert_eq!((s[0].addr, s[0].amount_wei), (Some(recipient), U256::from(12_996_694_115_787_776u64)));
     assert_eq!(r.counters.token_rows_registered.n, 1);
@@ -169,6 +170,15 @@ fn kind9_weth_gateway_unregistered_is_flagged() {
     assert_eq!(r.inflows[0].funding_edge().gateway_status, GatewayStatus::None);
     assert_eq!(r.counters.token_rows_unregistered.n, 1);
     assert_eq!(r.counters.token_rows_registered.n, 0);
+    // Review 017, З2: tx.value == token amount and the gateway is unknown, so the ETH may have
+    // stayed with `to` (a fake gateway): kept visible as an "unaccounted" record, not as a row.
+    // Block 77312169, 0x68 0x8a448fd9b19c63c41c5f3045b08b38745ed7bf80dd5deb3a34a9218424c05d4a.
+    let u = unaccounted(&r, UnaccountedKind::UnregisteredGatewayEth);
+    assert_eq!(u.len(), 1);
+    assert_eq!((u[0].tx_index, u[0].addr, u[0].amount_wei), (2, Some(L2_WETH_GATEWAY), r.inflows[0].tx_value));
+    assert_eq!(u[0].l1_sender, L1_L2_WETH_GATEWAY);
+    assert!(unaccounted(&r, UnaccountedKind::GatewayEthUnexplained).is_empty());
+    assert_eq!(r.counters.unaccounted[&UnaccountedKind::UnregisteredGatewayEth].n, 1);
 }
 
 #[test]
@@ -176,6 +186,8 @@ fn synthetic_registry_observed_entry() {
     let r = decode(77312169, &weth_registry(L2_WETH, RegistryStatus::Observed));
     assert_eq!(r.inflows[0].token.as_ref().unwrap().registry, Some(RegistryStatus::Observed));
     assert_eq!(r.inflows[0].funding_edge().gateway_status, GatewayStatus::Observed);
+    // A registered gateway (any status) is trusted with the ETH: no З2 record.
+    assert!(unaccounted(&r, UnaccountedKind::UnregisteredGatewayEth).is_empty());
 }
 
 #[test]

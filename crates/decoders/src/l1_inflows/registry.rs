@@ -130,7 +130,8 @@ impl GatewayRegistry {
     /// must not be fed to the decoder at all.
     ///
     /// # Errors
-    /// Fewer than 3 columns, a bad address, a status other than `verified`/`observed`, a duplicate.
+    /// Fewer than 3 columns, a bad address (`0x` + 40 hex digits required), a status other than
+    /// `verified`/`observed`, a duplicate.
     pub fn parse_tsv(text: &str) -> Result<Self> {
         let mut r = Self::default();
         for (i, raw) in text.lines().enumerate() {
@@ -195,6 +196,7 @@ mod tests {
         assert_eq!(a.l2_token, Some(address!("00000000000000000000000000000000000000bb")));
         assert_eq!(r.get(&address!("00000000000000000000000000000000000000cc")).unwrap().l2_token, None);
         assert!(GatewayRegistry::parse_tsv("0x00000000000000000000000000000000000000aa\t-\ttodo\n").is_err());
+        assert!(GatewayRegistry::parse_tsv("00000000000000000000000000000000000000aa\t-\tobserved\n").is_err());
         assert!(GatewayRegistry::parse_tsv("0x00000000000000000000000000000000000000aa\t-\trejected\n").is_err());
         assert!(GatewayRegistry::parse_tsv(
             "0x00000000000000000000000000000000000000aa\t-\tobserved\n0x00000000000000000000000000000000000000aa\t-\tverified\n"

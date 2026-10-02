@@ -13,12 +13,12 @@ pub mod v3 {
     }
 }
 
-/// Uniswap v4 PoolManager events.
+/// Uniswap v4 `PoolManager` events.
 pub mod v4 {
     alloy_sol_types::sol! {
-        /// Uniswap v4 PoolManager singleton: Pons v2 after graduation, pools.trade.
+        /// Uniswap v4 `PoolManager` singleton: Pons v2 after graduation, pools.trade.
         event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee);
-        /// Pool creation in the PoolManager.
+        /// Pool creation in the `PoolManager`.
         event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick);
     }
 }
@@ -35,7 +35,7 @@ pub mod erc20 {
 pub mod token_bridge {
     alloy_sol_types::sol! {
         /// Arbitrum token bridge, L2 side (`L2ArbitrumGateway.sol`). Emitted by the
-        /// L2 gateway when a deposit from L1 is finalized (inside a 0x68 RetryTx).
+        /// L2 gateway when a deposit from L1 is finalized (inside a `0x68` `RetryTx`).
         /// Source: OffchainLabs/token-bridge-contracts @ 0746a71321cdb2d6df6b15158c7ecbb9ece84b12,
         /// see abi/arbitrum-token-bridge/SOURCE.md.
         event DepositFinalized(address indexed l1Token, address indexed from, address indexed to, uint256 amount);

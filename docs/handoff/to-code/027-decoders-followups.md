@@ -1,5 +1,5 @@
 # 027 — decoders: хвосты ревью
-status: ready
+status: done
 phase: 1b
 depends-on: 022
 executor: indexer-engineer

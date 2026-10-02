@@ -1,0 +1,2 @@
+# Product names that are not code identifiers; ".." keeps the clippy defaults.
+doc-valid-idents = ["ClickHouse", ".."]

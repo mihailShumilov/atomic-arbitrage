@@ -59,27 +59,27 @@ pub struct Tx {
 pub enum ArbFields {
     /// Any other transaction type.
     None,
-    /// `0x64` ArbitrumDepositTx.
+    /// `0x64` `ArbitrumDepositTx`.
     Deposit {
         /// `requestId` (delayed message number), if the node returned it.
         request_id: Option<U256>,
     },
-    /// `0x68` ArbitrumRetryTx.
+    /// `0x68` `ArbitrumRetryTx`.
     Retry {
         /// `ticketId` (= hash of the `0x69`).
         ticket_id: B256,
         /// `maxRefund`.
         max_refund: U256,
-        /// `refundTo` (= the `0x69` FeeRefundAddr).
+        /// `refundTo` (= the `0x69` `FeeRefundAddr`).
         refund_to: Option<Address>,
     },
-    /// `0x69` ArbitrumSubmitRetryableTx.
+    /// `0x69` `ArbitrumSubmitRetryableTx`.
     SubmitRetryable {
         /// `depositValue` (L1 ETH minted to the alias).
         deposit_value: U256,
         /// `retryValue` (callvalue escrowed for the `0x68`).
         retry_value: U256,
-        /// `refundTo` (FeeRefundAddr).
+        /// `refundTo` (`FeeRefundAddr`).
         refund_to: Option<Address>,
     },
 }
@@ -177,13 +177,13 @@ fn parse_arb(ty: u8, tx: &RawTx) -> Result<ArbFields> {
     Ok(match ty {
         TX_TYPE_DEPOSIT => ArbFields::Deposit { request_id: tx.request_id.as_deref().map(quantity_u256).transpose()? },
         TX_TYPE_RETRY => ArbFields::Retry {
-            ticket_id: parse_b256(required(&tx.ticket_id, "ticketId")?)?,
-            max_refund: quantity_u256(required(&tx.max_refund, "maxRefund")?)?,
+            ticket_id: parse_b256(required(tx.ticket_id.as_deref(), "ticketId")?)?,
+            max_refund: quantity_u256(required(tx.max_refund.as_deref(), "maxRefund")?)?,
             refund_to: refund_to()?,
         },
         TX_TYPE_SUBMIT_RETRYABLE => ArbFields::SubmitRetryable {
-            deposit_value: quantity_u256(required(&tx.deposit_value, "depositValue")?)?,
-            retry_value: quantity_u256(required(&tx.retry_value, "retryValue")?)?,
+            deposit_value: quantity_u256(required(tx.deposit_value.as_deref(), "depositValue")?)?,
+            retry_value: quantity_u256(required(tx.retry_value.as_deref(), "retryValue")?)?,
             refund_to: refund_to()?,
         },
         _ => ArbFields::None,
@@ -202,8 +202,8 @@ fn parse_log(l: &RawLog, tx_hash: B256) -> Result<Log> {
     })
 }
 
-fn required<'a>(v: &'a Option<String>, field: &str) -> Result<&'a str> {
-    v.as_deref().ok_or_else(|| anyhow!("missing field {field}"))
+fn required<'a>(v: Option<&'a str>, field: &str) -> Result<&'a str> {
+    v.ok_or_else(|| anyhow!("missing field {field}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -212,13 +212,21 @@ fn required<'a>(v: &'a Option<String>, field: &str) -> Result<&'a str> {
 // alloy dependency and the decoders are the only alloy-based consumer.
 // ---------------------------------------------------------------------------
 
-/// RPC quantity: `0x` followed by at least one hex digit. `""`, `"0x"` and a missing prefix are
-/// errors (the enricher requires the prefix too, `crates/enricher/src/logs.rs`).
+/// Hex digits after a mandatory lowercase `0x` prefix. Every character is checked here:
+/// `const-hex` decoding would accept a second `0x` (`"0x0x…"`) and ruint's `from_str_radix`
+/// skips `_` (`"0x_"` would parse as 0).
+fn hex_digits<'a>(s: &'a str, what: &str) -> Result<&'a str> {
+    let h = s.strip_prefix("0x").ok_or_else(|| anyhow!("{what} {s:?} without 0x"))?;
+    ensure!(h.bytes().all(|b| b.is_ascii_hexdigit()), "bad {what} {s:?}");
+    Ok(h)
+}
+
+/// RPC quantity: `0x` followed by at least one hex digit (leading zeros allowed). `""`, `"0x"`
+/// and a missing prefix are errors (the enricher requires the prefix too,
+/// `crates/enricher/src/logs.rs`).
 pub(crate) fn quantity_u256(s: &str) -> Result<U256> {
-    let h = s.strip_prefix("0x").ok_or_else(|| anyhow!("quantity {s:?} without 0x"))?;
+    let h = hex_digits(s, "quantity")?;
     ensure!(!h.is_empty(), "empty quantity {s:?}");
-    // Checked explicitly: ruint's from_str_radix skips '_' ("0x_" would parse as 0).
-    ensure!(h.bytes().all(|b| b.is_ascii_hexdigit()), "bad quantity {s:?}");
     U256::from_str_radix(h, 16).map_err(|e| anyhow!("bad quantity {s:?}: {e}"))
 }
 
@@ -230,18 +238,24 @@ pub(crate) fn quantity_u32(s: &str) -> Result<u32> {
     u32::try_from(quantity_u256(s)?).map_err(|_| anyhow!("quantity {s:?} does not fit u32"))
 }
 
+/// Address: `0x` + exactly 40 hex digits (any case; the EIP-55 checksum is not checked).
 pub(crate) fn parse_addr(s: &str) -> Result<Address> {
-    s.parse::<Address>().map_err(|e| anyhow!("bad address {s:?}: {e}"))
+    let h = hex_digits(s, "address")?;
+    ensure!(h.len() == 2 * Address::len_bytes(), "bad address {s:?}: expected 40 hex digits");
+    Ok(Address::from_slice(&hex::decode(h).map_err(|e| anyhow!("bad address {s:?}: {e}"))?))
 }
 
+/// 32-byte hash: `0x` + exactly 64 hex digits.
 pub(crate) fn parse_b256(s: &str) -> Result<B256> {
-    s.parse::<B256>().map_err(|e| anyhow!("bad hash {s:?}: {e}"))
+    let h = hex_digits(s, "hash")?;
+    ensure!(h.len() == 2 * B256::len_bytes(), "bad hash {s:?}: expected 64 hex digits");
+    Ok(B256::from_slice(&hex::decode(h).map_err(|e| anyhow!("bad hash {s:?}: {e}"))?))
 }
 
 /// RPC data: `0x` + an even number of hex digits (`"0x"` = empty).
 pub(crate) fn parse_bytes(s: &str) -> Result<Bytes> {
-    let h = s.strip_prefix("0x").ok_or_else(|| anyhow!("data {s:?} without 0x"))?;
-    Ok(hex::decode(h).map_err(|e| anyhow!("bad data: {e}"))?.into())
+    let h = hex_digits(s, "data")?;
+    Ok(hex::decode(h).map_err(|e| anyhow!("bad data {s:?}: {e}"))?.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -341,5 +355,24 @@ mod tests {
         assert_eq!(parse_bytes("0x00ff").unwrap().as_ref(), &[0u8, 0xff]);
         assert!(parse_bytes("00ff").is_err());
         assert!(parse_bytes("0x0").is_err());
+        assert!(parse_bytes("0x0x00").is_err());
+    }
+
+    #[test]
+    fn addresses_and_hashes_require_prefix() {
+        let a = "0x00000000000000000000000000000000000000aB";
+        assert_eq!(parse_addr(a).unwrap(), Address::with_last_byte(0xab));
+        assert!(parse_addr(&a[2..]).is_err());
+        assert!(parse_addr("0X00000000000000000000000000000000000000ab").is_err());
+        assert!(parse_addr("0x0x000000000000000000000000000000000000ab").is_err());
+        assert!(parse_addr("0x000000000000000000000000000000000000ab").is_err());
+        assert!(parse_addr("0x0000000000000000000000000000000000000000ab").is_err());
+        assert!(parse_addr("0x00000000000000000000000000000000000000_b").is_err());
+        let h = format!("0x{}", "11".repeat(32));
+        assert_eq!(parse_b256(&h).unwrap(), B256::repeat_byte(0x11));
+        assert!(parse_b256(&h[2..]).is_err());
+        assert!(parse_b256(&h[..65]).is_err());
+        assert!(parse_b256(&format!("0x0x{}", "11".repeat(31))).is_err());
+        assert!(parse_b256("").is_err());
     }
 }

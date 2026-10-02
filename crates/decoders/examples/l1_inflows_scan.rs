@@ -166,7 +166,7 @@ fn main() -> Result<()> {
     let unaccounted = c.unaccounted.iter().map(|(k, a)| (k.as_str(), a));
     for (name, a) in named.into_iter().chain(unaccounted) {
         if a.overflowed {
-            println!("overflow {name}: sum={} is a lower bound (lower bound: overflowed)", a.sum);
+            println!("overflow {name}: sum={} (lower bound: overflowed)", a.sum);
         }
     }
     if let Some(mut w) = edges {

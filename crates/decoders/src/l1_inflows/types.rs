@@ -11,9 +11,9 @@ use crate::rows::{EdgeKind, FundingEdge, GatewayStatus, HexOr, NULL};
 /// What made an inflow row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InflowKind {
-    /// `0x64` ArbitrumDepositTx.
+    /// `0x64` `ArbitrumDepositTx`.
     EthDeposit,
-    /// `0x68` RetryTx with value > 0 to a non-gateway `to`.
+    /// `0x68` `RetryTx` with value > 0 to a non-gateway `to`.
     RetryEth,
     /// `0x68` into a token gateway, from `DepositFinalized`.
     BridgedToken,
@@ -138,6 +138,12 @@ pub enum UnaccountedKind {
     GatewayEthUnexplained,
     /// Successful 0x68 with value > 0 but `to` missing (contract creation): not attributed.
     RetryNoTo,
+    /// Successful 0x68 with value > 0 into a contract that is NOT in the gateway registry, emitted
+    /// `DepositFinalized`, and whose token amounts sum to exactly `tx.value`. The decoder made
+    /// `l1_token` rows with `gateway_status = none` (dropped downstream by default) and no
+    /// `l1_eth` row; if `to` is not a real gateway, this ETH reached `to` and is missing from the
+    /// graph (review 017, З2). `addr` = `to`, amount = `tx.value`. Not observed on data.
+    UnregisteredGatewayEth,
 }
 
 impl UnaccountedKind {
@@ -153,6 +159,7 @@ impl UnaccountedKind {
             Self::RetryFailed => "retry_failed",
             Self::GatewayEthUnexplained => "gateway_eth_unexplained",
             Self::RetryNoTo => "retry_no_to",
+            Self::UnregisteredGatewayEth => "unregistered_gateway_eth",
         }
     }
 }
@@ -260,7 +267,7 @@ pub struct Counters {
     pub deposit_finalized_foreign: u64,
     /// 0x69 status 1 (sum = depositValue; not an inflow, context only).
     pub submit_ok: Agg,
-    /// 0x68 status 1 with value 0 and no DepositFinalized: no money moved.
+    /// 0x68 status 1 with value 0 and no `DepositFinalized`: no money moved.
     pub retry_zero_value: u64,
     /// 0x69 with `maxRefund(0x68) > depositValue - retryValue` (should be 0 by Nitro code).
     pub refund_identity_anomaly: u64,

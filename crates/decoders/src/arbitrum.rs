@@ -3,11 +3,11 @@
 
 use alloy_primitives::{address, Address, U256};
 
-/// `0x64` ArbitrumDepositTx (feed kind 12, also kind 7).
+/// `0x64` `ArbitrumDepositTx` (feed kind 12, also kind 7).
 pub const TX_TYPE_DEPOSIT: u8 = 0x64;
-/// `0x68` ArbitrumRetryTx (auto-redeem after a `0x69`, or a manual redeem).
+/// `0x68` `ArbitrumRetryTx` (auto-redeem after a `0x69`, or a manual redeem).
 pub const TX_TYPE_RETRY: u8 = 0x68;
-/// `0x69` ArbitrumSubmitRetryableTx (feed kind 9).
+/// `0x69` `ArbitrumSubmitRetryableTx` (feed kind 9).
 pub const TX_TYPE_SUBMIT_RETRYABLE: u8 = 0x69;
 
 /// Nitro `AddressAliasOffset` (protocol constant, not a contract): L2 alias = L1 address + offset
