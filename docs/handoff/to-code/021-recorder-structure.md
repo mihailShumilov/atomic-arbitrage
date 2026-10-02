@@ -1,5 +1,5 @@
 # 021 — Структура recorder (задача C ревью 2026-10-02)
-status: ready
+status: done
 phase: 1a
 depends-on: 019
 executor: indexer-engineer

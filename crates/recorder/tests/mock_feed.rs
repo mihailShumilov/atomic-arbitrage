@@ -8,17 +8,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
+
+use recorder::now_ns;
 
 use futures::SinkExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 use yawc::{Frame, OpCode, Options, Role, WebSocket};
-
-fn now_ns() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
-}
 
 fn tmpdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("recorder-it-{tag}-{}-{}", std::process::id(), now_ns()));
@@ -190,22 +188,8 @@ async fn wait_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool)
 
 fn all_lines(out: &Path) -> Vec<String> {
     use std::io::Read;
-    let mut files = Vec::new();
-    fn walk(d: &Path, out: &mut Vec<PathBuf>) {
-        for e in std::fs::read_dir(d).unwrap().flatten() {
-            let p = e.path();
-            let n = e.file_name().to_string_lossy().into_owned();
-            if p.is_dir() && !n.starts_with('_') {
-                walk(&p, out);
-            } else if n.starts_with("feed-") && n.ends_with(".tsv.zst") {
-                out.push(p);
-            }
-        }
-    }
-    walk(out, &mut files);
-    files.sort();
     let mut s = String::new();
-    for f in files {
+    for f in recorder::list_feed_files(out) {
         zstd::stream::read::Decoder::new(std::fs::File::open(f).unwrap()).unwrap().read_to_string(&mut s).unwrap();
     }
     s.lines().map(str::to_owned).collect()
@@ -641,8 +625,8 @@ async fn idle_timeout_sends_close_then_resumes_from_memory() {
 
 // ------------------------------------------------------------- task 012 ---
 
-const CONN_HEADER: &str =
-    "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail";
+/// The header from the library (task 021: one definition of the format).
+const CONN_HEADER: &str = recorder::connlog::CONNECTIONS_HEADER;
 
 /// Start the recorder on a prepared out-dir, wait for its `startup_wait`
 /// row, check that nobody connects, SIGTERM it (exit 0) and return the row.
@@ -880,6 +864,93 @@ async fn block_idle_closes_and_resumes() {
     assert!(conns.lines().all(|l| l.split('\t').count() == 11), "{conns}");
     assert_eq!(gaps(&out), "");
     assert_eq!(recorded_seqs(&out), (300..=304).collect::<Vec<_>>());
+    std::fs::remove_dir_all(&out).ok();
+    std::fs::remove_file(out.with_extension("log")).ok();
+}
+
+// ------------------------------------------------------------- task 021 ---
+
+/// Task 021: a broken gaps.tsv line is skipped at start-up (as since 019)
+/// and now also visible in connections.tsv as `gaps_line_skipped` (11
+/// columns, reason `broken`). Rows healthcheck.sh looks at
+/// (`connected`/`disconnected`/`startup_wait`, `shutdown writer_error`,
+/// `writer_error`) are unaffected: the last connect-related row is still
+/// `connected`, recording works and the exit code is 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_gaps_line_is_logged_and_recording_goes_on() {
+    let out = seeded_out("gaps-skip");
+    std::fs::write(out.join("gaps.tsv"), "51\t99\t2\noops\n").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/", listener.local_addr().unwrap());
+    let mut child = spawn_recorder(&url, &out, &[]);
+    let (mut ws, req) = tokio::time::timeout(Duration::from_secs(10), accept_ws_req(&listener))
+        .await
+        .expect("recorder did not connect to the mock");
+    assert_eq!(header(&req, "Arbitrum-Requested-Sequence-Number").as_deref(), Some("105"), "{req}");
+    send_burst_then_live(&mut ws, &[105, 106], &[107]).await;
+    wait_until("backlog event", Duration::from_secs(5), || connections(&out).contains("\tbacklog\t")).await;
+    stop_recorder(&mut child, &mut ws, &out).await;
+
+    let conns = connections(&out);
+    eprintln!("connections.tsv:\n{conns}");
+    let skip = row(&conns, "gaps_line_skipped");
+    let c: Vec<&str> = skip.split('\t').collect();
+    assert_eq!(c.len(), 11, "{skip}");
+    assert_eq!((c[3], c[4], c[6], c[9]), ("broken", "-", "-", "-"), "{skip}");
+    assert_eq!(c[10], "gaps.tsv line 2: column from is not a number: \"oops\"", "{skip}");
+    assert!(conns.lines().all(|l| l.split('\t').count() == 11), "{conns}");
+    // healthcheck.sh `ban`: last row with $3 in connected/disconnected/startup_wait.
+    let last_connect_row = conns
+        .lines()
+        .rev()
+        .filter(|l| !l.starts_with('#'))
+        .find(|l| matches!(l.split('\t').nth(2), Some("connected" | "disconnected" | "startup_wait")))
+        .unwrap();
+    assert_eq!(last_connect_row.split('\t').nth(2), Some("connected"));
+    assert_eq!(gaps(&out), "51\t99\t2\noops\n", "gaps.tsv is not rewritten");
+    assert_eq!(recorded_seqs(&out), (100..=107).collect::<Vec<_>>());
+    std::fs::remove_dir_all(&out).ok();
+    std::fs::remove_file(out.with_extension("log")).ok();
+}
+
+/// Finding Б1 of the 021 data audit: a fresh 403 with a 3600 s pause and
+/// 700 broken gaps.tsv lines. The pause is read before any start-up row is
+/// written, and at most 20 + 1 `gaps_line_skipped` rows are written per
+/// start, so the `disconnected 403` row stays in the journal tail: two
+/// starts in a row both wait out the pause (before the fix: the second one
+/// connected at once).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn many_broken_gaps_lines_do_not_hide_a_ban() {
+    let out = seeded_out("b1-ban");
+    let now = now_ns();
+    let s = 1_000_000_000u128;
+    std::fs::write(
+        out.join("connections.tsv"),
+        format!(
+            "{CONN_HEADER}\n\
+             x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://127.0.0.1:9/\n\
+             x\t{}\tdisconnected\tforbidden\t403\t3600\t3600.000\t0.000\t0\t1\trule=retry_after upgrade\n\
+             x\t{}\tshutdown\tSIGTERM\t-\t-\t-\t-\t-\t-\t-\n",
+            now - 120 * s,
+            now - 60 * s,
+            now - 59 * s
+        ),
+    )
+    .unwrap();
+    let broken: String = (0..700).map(|i| format!("broken line {i} {}\n", "y".repeat(180))).collect();
+    std::fs::write(out.join("gaps.tsv"), broken).unwrap();
+    for start in 1..=2 {
+        startup_wait_row(&out).await;
+        let last_wait = connections(&out).lines().rev().find(|l| l.contains("\tstartup_wait\t")).unwrap().to_string();
+        assert!(last_wait.contains("\tstartup_wait\tpending_pause\t"), "start {start}: {last_wait}");
+        assert!(pause_of(&last_wait) > 3400.0, "start {start}: {last_wait}");
+        assert!(last_wait.ends_with("strikes=1"), "start {start}: {last_wait}");
+    }
+    let conns = connections(&out);
+    let skipped: Vec<&str> = conns.lines().filter(|l| l.contains("\tgaps_line_skipped\t")).collect();
+    assert_eq!(skipped.len(), 2 * 21, "20 + 1 summary per start");
+    assert!(skipped[20].contains("\tgaps_line_skipped\tmore\t"), "{}", skipped[20]);
+    assert!(skipped[20].ends_with("680 more skipped lines not listed (700 skipped in total)"), "{}", skipped[20]);
     std::fs::remove_dir_all(&out).ok();
     std::fs::remove_file(out.with_extension("log")).ok();
 }

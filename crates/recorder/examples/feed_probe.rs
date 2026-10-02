@@ -9,41 +9,39 @@
 //! Safety rails (feed bans are 403 + Retry-After: 3600, see chain-facts.md):
 //! - refuses to connect if the probe log already has any 403/429, has 3 or
 //!   more attempts, or the last attempt was less than `--min-gap-secs` ago;
+//! - the probe's own log is `<out-dir>/probe-connections.tsv` (task 021; before:
+//!   `connections.tsv`, so attempts logged by older runs are not counted);
 //! - refuses if the recorder's `connections.tsv` (`--recorder-log`) shows a
 //!   connection less than 3600 s ago;
 //! - the attempt is logged before the TCP connect, so a crash still counts.
 //!
-//! Minimal copy of the connect / HeadTap / close code from `src/net.rs`
-//! (the recorder is a binary crate, its modules are not importable).
-//! Research tool only; not used by the recorder.
+//! Connect, response head and close handshake come from the recorder's
+//! library (`recorder::transport`, task 021 item 6; before: a copy of
+//! `src/net.rs`). The feed URL defaults to `hood_core::FEED_URL`.
+//! Research tool only (task 005, closed); not used by the recorder.
 
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use base64::Engine as _;
 use clap::Parser;
-use futures::SinkExt;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::{rustls, TlsConnector};
-use yawc::close::CloseCode;
-use yawc::{frame::OpCode, CompressionLevel, Frame, HttpRequest, MaybeTlsStream, Options, WebSocket};
+use hood_core::FEED_URL;
+use recorder::connlog::{col, ConnEventKind};
+use recorder::now_ns;
+use recorder::transport::{close_handshake, close_summary, connect, opcode_name, tls_connector};
+use yawc::frame::OpCode;
+use yawc::Frame;
 
-const FEED_URL: &str = "wss://feed.mainnet.chain.robinhood.com";
-const HEAD_CAP: usize = 16 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-const CLOSE_REPLY_WAIT: Duration = Duration::from_secs(2);
 const RECORDER_MIN_GAP_NS: u128 = 3600 * 1_000_000_000;
 
 #[derive(Parser, Debug)]
 struct Args {
+    /// Feed URL.
+    #[arg(long, default_value = FEED_URL)]
+    url: String,
     /// Depth label (blocks back from `--tip`), used for file names and the log.
     #[arg(long)]
     depth: u64,
@@ -70,10 +68,6 @@ struct Args {
     max_attempts: usize,
 }
 
-fn now_ns() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
-}
-
 fn utc(ns: u128) -> String {
     chrono::DateTime::from_timestamp_nanos(ns as i64).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
@@ -84,6 +78,8 @@ fn clean(s: &str) -> String {
 
 // ------------------------------------------------------------ safety rails ---
 
+/// The probe's own journal in `--out-dir` (its schema is [`LOG_HEADER`]).
+const PROBE_LOG: &str = "probe-connections.tsv";
 const LOG_HEADER: &str = "# ts_utc\tts_unix_ns\tevent\tdepth\trequested\ttip\thttp_status\tretry_after\tdetail";
 
 fn check_rails(args: &Args, log: &PathBuf) -> Result<()> {
@@ -117,8 +113,9 @@ fn check_rails(args: &Args, log: &PathBuf) -> Result<()> {
             .filter(|l| !l.starts_with('#'))
             .filter_map(|l| {
                 let f: Vec<&str> = l.split('\t').collect();
-                (f.get(2) == Some(&"connected") || f.get(2) == Some(&"disconnected"))
-                    .then(|| f.get(1)?.parse::<u128>().ok())
+                let event = *f.get(col::EVENT)?;
+                (event == ConnEventKind::Connected.as_str() || event == ConnEventKind::Disconnected.as_str())
+                    .then(|| f.get(col::TS_UNIX_NS)?.parse::<u128>().ok())
                     .flatten()
             })
             .max();
@@ -158,70 +155,21 @@ fn log_row(log: &PathBuf, event: &str, args: &Args, requested: u64, status: &str
     let _ = f.sync_all();
 }
 
-// ----------------------------------------------------------------- HeadTap ---
-
-struct HeadTap<S> {
-    inner: S,
-    head: Arc<Mutex<Vec<u8>>>,
-    capturing: bool,
+/// A non-text frame as a probe line (`recorderFrame` with base64 payload).
+fn opaque_line(recv: u128, f: &Frame) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(f.payload());
+    format!(
+        "{recv}\t0\t0\t0\t{{\"recorderFrame\":{{\"opcode\":\"{}\",\"payloadBase64\":\"{b64}\"}}}}",
+        opcode_name(f.opcode())
+    )
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for HeadTap<S> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if self.capturing {
-            if let Poll::Ready(Ok(())) = &r {
-                let new = &buf.filled()[before..];
-                let mut h = self.head.lock().unwrap_or_else(|e| e.into_inner());
-                let room = HEAD_CAP.saturating_sub(h.len());
-                h.extend_from_slice(&new[..new.len().min(room)]);
-                let done = h.len() >= HEAD_CAP || h.windows(4).any(|w| w == b"\r\n\r\n");
-                drop(h);
-                if done || new.is_empty() {
-                    self.capturing = false;
-                }
-            }
-        }
-        r
+/// Any frame as a probe line: text as received, other opcodes wrapped.
+fn opaque_or_text_line(recv: u128, f: &Frame) -> String {
+    match f.opcode() {
+        OpCode::Text => format!("{recv}\t0\t0\t0\t{}", String::from_utf8_lossy(f.payload())),
+        _ => opaque_line(recv, f),
     }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for HeadTap<S> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, b: &[u8]) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, b)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-fn head_text(buf: &[u8]) -> String {
-    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
-}
-
-fn head_field(head: &str, name: &str) -> Option<String> {
-    head.split("\r\n").skip(1).find_map(|l| {
-        let (k, v) = l.split_once(':')?;
-        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
-    })
-}
-
-fn tls_connector() -> Result<TlsConnector> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
-    }
-    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsConnector::from(Arc::new(cfg)))
 }
 
 // -------------------------------------------------------------------- main ---
@@ -230,55 +178,24 @@ fn tls_connector() -> Result<TlsConnector> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     std::fs::create_dir_all(&args.out_dir)?;
-    let log = args.out_dir.join("connections.tsv");
+    // Not `connections.tsv`: that name and its 11-column schema belong to the
+    // recorder (healthcheck reads it); before task 021 the probe used it too.
+    let log = args.out_dir.join(PROBE_LOG);
     check_rails(&args, &log)?;
 
     let requested = args.tip.checked_sub(args.depth).context("depth > tip")?;
     let sent_headers = format!("Arbitrum-Feed-Client-Version: 2; Arbitrum-Requested-Sequence-Number: {requested}");
     log_row(&log, "attempt", &args, requested, "-", "-", &sent_headers);
 
-    let url: url::Url = FEED_URL.parse()?;
-    let host = url.host_str().unwrap_or_default().to_string();
     let tls = tls_connector()?;
     let t_conn = Instant::now();
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
-        let tcp = TcpStream::connect((host.as_str(), 443)).await?;
-        let _ = tcp.set_nodelay(true);
-        let name = ServerName::try_from(host.clone())?;
-        let tls_stream = tls.connect(name, tcp).await?;
-        anyhow::Ok(MaybeTlsStream::Tls(tls_stream))
-    })
-    .await;
-    let stream = match stream {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            log_row(&log, "failed", &args, requested, "-", "-", &format!("tcp/tls: {e}"));
-            bail!("tcp/tls: {e}");
-        }
-        Err(_) => {
-            log_row(&log, "failed", &args, requested, "-", "-", "tcp/tls timeout");
-            bail!("tcp/tls timeout");
-        }
-    };
-    let head_buf = Arc::new(Mutex::new(Vec::new()));
-    let tap = HeadTap { inner: stream, head: head_buf.clone(), capturing: true };
-    let req = HttpRequest::builder()
-        .header("Arbitrum-Feed-Client-Version", "2")
-        .header("Arbitrum-Requested-Sequence-Number", requested.to_string());
-    let opts = Options::default().with_compression_level(CompressionLevel::fast());
-    let hs = tokio::time::timeout(CONNECT_TIMEOUT, WebSocket::handshake_with_request(url, tap, opts, req)).await;
-    let head = head_text(&head_buf.lock().map(|h| h.clone()).unwrap_or_default());
-    let status = head.split_whitespace().nth(1).unwrap_or("-").to_string();
-    let retry = head_field(&head, "retry-after").unwrap_or_else(|| "-".into());
-    let mut ws = match hs {
-        Ok(Ok(ws)) => ws,
-        Ok(Err(e)) => {
-            log_row(&log, "failed", &args, requested, &status, &retry, &format!("upgrade: {e}; head: {head}"));
-            bail!("upgrade failed: {e}; status {status}, Retry-After {retry}");
-        }
-        Err(_) => {
-            log_row(&log, "failed", &args, requested, &status, &retry, &format!("upgrade timeout; head: {head}"));
-            bail!("upgrade timeout");
+    let mut ws = match connect(&args.url, &tls, Some(requested)).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            let status = e.http_status.map_or_else(|| "-".to_string(), |s| s.to_string());
+            let retry = e.retry_after_raw.unwrap_or_else(|| "-".into());
+            log_row(&log, "failed", &args, requested, &status, &retry, &e.detail);
+            bail!("connect failed: {}; status {status}, Retry-After {retry}", e.detail);
         }
     };
     let connected_ns = now_ns();
@@ -287,9 +204,9 @@ async fn main() -> Result<()> {
         "connected",
         &args,
         requested,
-        &status,
-        &retry,
-        &format!("upgrade_ms={} head: {head}", t_conn.elapsed().as_millis()),
+        "101",
+        "-",
+        &format!("upgrade_ms={} url={}", t_conn.elapsed().as_millis(), args.url),
     );
     eprintln!("connected, requested={requested} tip={}", args.tip);
 
@@ -352,15 +269,10 @@ async fn main() -> Result<()> {
                 }
                 writeln!(out, "{recv}\t{lo}\t{hi}\t{n}\t{text}")?;
             }
-            op => {
-                let name = format!("{op:?}").to_lowercase();
-                let b64 = base64::engine::general_purpose::STANDARD.encode(frame.payload());
-                writeln!(
-                    out,
-                    "{recv}\t0\t0\t0\t{{\"recorderFrame\":{{\"opcode\":\"{name}\",\"payloadBase64\":\"{b64}\"}}}}"
-                )?;
-                if op == OpCode::Close {
-                    end_reason = format!("server close code={:?}", frame.close_code().map(u16::from));
+            _ => {
+                writeln!(out, "{}", opaque_line(recv, &frame))?;
+                if let Some(c) = close_summary(&frame) {
+                    end_reason = format!("server {c}");
                     break;
                 }
             }
@@ -373,36 +285,16 @@ async fn main() -> Result<()> {
 
     // Client close: Close 1000, wait for the server's Close, then shut down.
     let t_close = Instant::now();
-    let deadline = tokio::time::Instant::now() + CLOSE_REPLY_WAIT;
-    let mut close_outcome = "send_failed".to_string();
-    if !end_reason.starts_with("server close") && !end_reason.starts_with("stream ended") {
-        if let Ok(Ok(())) =
-            tokio::time::timeout_at(deadline, ws.send(Frame::close(CloseCode::Normal, b"probe done"))).await
-        {
-            close_outcome = "no_reply".into();
-            while let Ok(r) = tokio::time::timeout_at(deadline, ws.next_frame()).await {
-                match r {
-                    Ok(f) => {
-                        let recv = now_ns();
-                        let name = format!("{:?}", f.opcode()).to_lowercase();
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(f.payload());
-                        writeln!(out, "{recv}\t0\t0\t0\t{{\"recorderFrame\":{{\"opcode\":\"{name}\",\"payloadBase64\":\"{b64}\"}}}}")?;
-                        if f.opcode() == OpCode::Close {
-                            close_outcome = format!("server_replied code={:?}", f.close_code().map(u16::from));
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        close_outcome = format!("stream_ended: {e}");
-                        break;
-                    }
-                }
-            }
+    let close_outcome = if !end_reason.starts_with("server close") && !end_reason.starts_with("stream ended") {
+        let mut late = Vec::new();
+        let c = close_handshake(&mut ws, "probe done", |f| late.push(opaque_or_text_line(now_ns(), f))).await;
+        for l in late {
+            writeln!(out, "{l}")?;
         }
-        let _ = tokio::time::timeout(Duration::from_millis(500), ws.close()).await;
+        format!("{} ({})", c.reply.as_str(), c.detail)
     } else {
-        close_outcome = "server ended first".into();
-    }
+        "server ended first".to_string()
+    };
     out.flush()?;
 
     let summary = format!(
@@ -412,7 +304,7 @@ async fn main() -> Result<()> {
         first_seq as i128 - requested as i128,
         frames_path.display()
     );
-    log_row(&log, "closed", &args, requested, &status, &retry, &summary);
+    log_row(&log, "closed", &args, requested, "101", "-", &summary);
     println!("{summary}");
     Ok(())
 }

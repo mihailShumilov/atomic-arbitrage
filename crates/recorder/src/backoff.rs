@@ -211,7 +211,7 @@ impl SessionEndSource {
 ///
 /// - `connected_ns` / `last_row_ns`: the last `connected` row of
 ///   connections.tsv and the newest row of any type after it
-///   ([`crate::net::LogSession`]). No `connected` -> None (no wait).
+///   ([`crate::connlog::LogSession`]). No `connected` -> None (no wait).
 /// - `data_mtime_ns`: mtime of the newest hourly data file, read before
 ///   crash recovery.
 ///
@@ -316,7 +316,7 @@ mod tests {
     fn interval_counts_from_last_row_after_connected() {
         let now = 1_790_800_000 * SEC;
         let min = Duration::from_secs(120);
-        let log = crate::net::parse_last_session(&format!(
+        let log = crate::connlog::parse_last_session(&format!(
             "# ts_utc\tts_unix_ns\tevent\treason\thttp_status\tretry_after\tpause_s\tsession_s\tenvelopes\tstrikes\tdetail\n\
              x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://a requested=- mode=no_data\n\
              x\t{}\tbacklog\tdone\t101\t-\t-\t0.500\t5\t-\trequested=-\n\
@@ -348,7 +348,7 @@ mod tests {
     fn interval_after_kill9_counts_from_data_mtime() {
         let now = 1_790_800_000 * SEC;
         let min = Duration::from_secs(120);
-        let log = crate::net::parse_last_session(&format!(
+        let log = crate::connlog::parse_last_session(&format!(
             "x\t{}\tdisconnected\tserver_closed\t101\t-\t2.000\t50.000\t9\t0\trule=jitter_1_5s\n\
              x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://a\n",
             now - 700 * SEC,
@@ -380,7 +380,7 @@ mod tests {
         let now = 1_790_800_000 * SEC;
         let min = Duration::from_secs(120);
         // disconnected 403 with a 900 s pause 100 s ago, then SIGTERM 99 s ago.
-        let log = crate::net::parse_last_session(&format!(
+        let log = crate::connlog::parse_last_session(&format!(
             "x\t{}\tconnected\t-\t101\t-\t-\t-\t-\t0\tws://a\n\
              x\t{}\tdisconnected\tforbidden\t403\t-\t900.000\t0.000\t0\t1\tupgrade\n\
              x\t{}\tshutdown\tSIGTERM\t-\t-\t-\t-\t-\t-\t-\n",
@@ -391,7 +391,7 @@ mod tests {
         .unwrap();
         let pause_row =
             format!("x\t{}\tdisconnected\tforbidden\t403\t-\t900.000\t0.000\t0\t1\tupgrade", now - 100 * SEC);
-        let pending = crate::net::parse_pause_row(&pause_row).unwrap();
+        let pending = crate::connlog::parse_pause_row(&pause_row).unwrap();
         let (end, _) = session_end_ns(Some(log.connected_ns), log.last_row_ns, None).unwrap();
         assert_eq!(end, now - 99 * SEC);
         let (w, r) = startup_wait(now, Some(pending.not_before_ns), Some(end), min).unwrap();

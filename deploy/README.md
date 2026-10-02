@@ -139,7 +139,7 @@ srv# journalctl -u recorder -f
 |---|---|---|
 | `unit` | `systemctl is-active recorder` ≠ `active` (в том числе пауза `RestartSec` после падения) | — |
 | `feed` | mtime `last_seq.txt` старше порога, то есть новые блоки не доходят до диска (recorder переписывает файл только при росте seq, на каждом закрытии фрейма, не реже раза в 60 с). Файлы текущего и прошлого часа берутся, **только если `last_seq.txt` ещё нет** (первые минуты на пустой папке): ping без блоков тоже пишутся в часовой файл, поэтому его свежесть ничего не говорит о блоках (задача 012, З1 из отзыва 011). Если файл часа свежий, а `last_seq.txt` старый, в тексте алерта будет подсказка «только ping?». В «восстановлено» её нет (задача 014: пока блоки идут, файл часа свежий всегда, и подсказка там была ложной). Источник виден в итоговой строке: `feed_src=last_seq.txt` / `hour_file`. Пока активен `ban`, отдельно не шлётся | `HC_FEED_MAX_AGE_S=300` |
-| `ban` | последняя строка `connected`/`disconnected`/`startup_wait` в `connections.tsv` — отказ 4xx (403, 429) или `startup_wait pending_pause` от 600 с. Строки `backlog`, `client_close`, `shutdown`, `writer_error`, `torn_repair`, `gap_reconciled` не учитываются; `startup_wait min_connect_interval`, `disconnected idle_timeout` и `disconnected block_idle` баном не считаются | `HC_BAN_MIN_PAUSE_S=600` |
+| `ban` | последняя строка `connected`/`disconnected`/`startup_wait` в `connections.tsv` — отказ 4xx (403, 429) или `startup_wait pending_pause` от 600 с. Строки `backlog`, `client_close`, `shutdown`, `writer_error`, `torn_repair`, `gap_reconciled`, `gaps_line_skipped` не учитываются; `startup_wait min_connect_interval`, `disconnected idle_timeout` и `disconnected block_idle` баном не считаются | `HC_BAN_MIN_PAUSE_S=600` |
 | `reconnects` | больше N строк `connected` за последний час (риск бана). Ловит и цикл переподключений по `block_idle`/`idle_timeout` | `HC_MAX_CONNECTS_PER_HOUR=6` |
 | `disk` | заполнение файловой системы `/srv/hood/data` | `HC_DISK_MAX_PCT=80` |
 | `writer` | в `connections.tsv` есть строка `shutdown writer_error` или `writer_error` (ошибка записи: диск, fsync; recorder вышел с кодом 2) моложе окна. «Восстановлено» — когда таких строк в окне не осталось, то есть через час без новых ошибок | `HC_WRITER_ERROR_WINDOW_S=3600` |
@@ -331,7 +331,7 @@ srv# echo 'HC_BACKUP_MAX_AGE_H=3' >> /etc/hoodchain/healthcheck.env
 | `YYYY/MM/DD/feed-YYYYMMDD-HH.tsv.zst` | Сырьё: `recv_unix_ns \t seq_first \t seq_last \t <JSON>`. Внутри часового файла много zstd-фреймов: фрейм закрывается не реже раза в 60 с (`--frame-secs`), при ротации часа и при остановке. Читать `zstd -dc` или ридером, который понимает несколько фреймов. |
 | `gaps.tsv` | `from \t to \t recv_ns` — пропущенные L2-блоки для дозаливки через RPC (enricher). Пишется только после fsync данных. |
 | `last_seq.txt` | Последний seq, который уже на диске (fsync). Заменяется атомарно. |
-| `connections.tsv` | События `connected`, `backlog`, `client_close`, `disconnected`, `startup_wait`, `shutdown`, `writer_error` (с 012), `torn_repair`, `gap_reconciled`: причина, HTTP-код, `Retry-After`, выбранная пауза, число страйков, `detail`. Первая строка — заголовок, 11 столбцов (`.claude/skills/hoodchain-mev/references/data-model.md`). healthcheck читает столбцы 1–7 по позиции, поэтому новые поля добавляются только в `detail` (последний столбец). |
+| `connections.tsv` | События `connected`, `backlog`, `client_close`, `disconnected`, `startup_wait`, `shutdown`, `writer_error` (с 012), `torn_repair`, `gap_reconciled`, `gaps_line_skipped` (с 021: строка `gaps.tsv`, пропущенная при старте, `reason` = `broken`/`unterminated`; не больше 20 за старт, остальное — одна строка `reason` = `more`): причина, HTTP-код, `Retry-After`, выбранная пауза, число страйков, `detail`. Первая строка — заголовок, 11 столбцов (`.claude/skills/hoodchain-mev/references/data-model.md`). healthcheck читает столбцы 1–7 по позиции, поэтому новые поля добавляются только в `detail` (последний столбец). |
 | `_torn/` | Оборванные хвосты zstd, отрезанные при старте после аварийного завершения. Хранятся для разбора, recorder их не удаляет. |
 
 Строки с `seq_first = seq_last = 0` (конверты без `messages`, ping и прочие кадры в обёртке `recorderFrame`) — норма, отбрасывать их — задача разбора (`.claude/skills/hoodchain-mev/references/data-model.md`).
@@ -345,7 +345,7 @@ srv# echo 'HC_BACKUP_MAX_AGE_H=3' >> /etc/hoodchain/healthcheck.env
 - **kill -9, падение, пропало питание.** Теряется только открытый фрейм, то есть не больше последних 60 с. При следующем старте оборванный хвост уходит в `_torn/`. Простой попадает в `gaps.tsv` одной строкой, когда придёт первый новый блок.
 - **Паузы переподключения.** Обычное закрытие: 1–5 с. 429: `Retry-After`, а без него 5 → 10 → 20 → 40 → 60 мин. 403 или отказ апгрейда: 15 → 30 → 60 мин, но не меньше `Retry-After`. Сетевые ошибки и 5xx: от 5 с до 5 мин. Сессия дольше 10 мин сбрасывает лестницу.
 - **Пауза переживает перезапуск.** При старте recorder ждёт дольшее из двух: остаток паузы из последней строки `disconnected` и остаток 120 с от конца прошлой сессии (задача 012, см. «Почему `RestartSec=120`»; раньше считалось от `connected`, и рестарт после долгой сессии подключался сразу). Обойти можно `--ignore-pending-pause`, но только если точно известно, что бан снят.
-- **Сверка дыр при старте.** Разрыв в двух последних часовых файлах, которого нет в `gaps.tsv`, дописывается туда, с событием `gap_reconciled`.
+- **Сверка дыр при старте.** Разрыв в двух последних часовых файлах, которого нет в `gaps.tsv`, дописывается туда, с событием `gap_reconciled`. Битая строка `gaps.tsv` не останавливает запуск: recorder её пропускает и пишет событие `gaps_line_skipped` (с задачи 021; не больше 20 строк за старт плюс одна итоговая `more`; паузу бана recorder читает из журнала до этих строк). Исправить строку нужно руками: enricher `--gaps` на ней падает.
 
 ## Проверка набора локально (без сервера)
 
@@ -357,14 +357,18 @@ docker run --rm --network none -e LANG=C.UTF-8 -v "$PWD/deploy":/mnt:ro koalaman
   $(cd deploy && ls *.sh test/*.sh | sed "s#^#/mnt/#")
 for f in deploy/*.sh deploy/test/*.sh; do bash -n "$f"; done
 
-# офлайн-тесты healthcheck, notify, mdadm-event и smartd-event (подставные данные, /proc/mdstat и окружение smartd, без сети); повторить с ubuntu:26.04
+# офлайн-тесты healthcheck, notify, mdadm-event, smartd-event и feed-audit-daily (подставные данные, /proc/mdstat и окружение smartd, без сети); повторить с ubuntu:26.04
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-healthcheck.sh
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-notify.sh
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-mdadm-event.sh
 docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-smartd-event.sh
+# обёртка ежедневного аудита: решение по коду выхода feed_audit.py (подставной python3; случаи на настоящем
+# feed_audit.py печатают SKIP — в образе нет python3 и zstd, они идут в run-systemd-container.sh и на Mac)
+docker run --rm --network none -v "$PWD/deploy":/deploy:ro ubuntu:24.04 bash /deploy/test/test-feed-audit-daily.sh
 
 # bootstrap дважды под настоящим systemd, verify юнитов, тест бэкапа, chrony, ufw,
 # часового пояса, PROGRAM для mdadm, smartd (конфиг, drop-in, smartd_warning.sh -> notify.sh -> journald)
+# и test-feed-audit-daily.sh от hood с настоящим feed_audit.py (рабочая копия .claude/skills/feed-audit/scripts)
 bash deploy/test/run-systemd-container.sh                  # ubuntu:24.04; --build — проверить и сборку
 bash deploy/test/run-systemd-container.sh --ubuntu 26.04   # как на сервере hood-rec
 docker rmi hood-deploy-test-systemd:24.04 hood-deploy-test-systemd:26.04   # образы стенда после проверки
