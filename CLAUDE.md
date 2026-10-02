@@ -30,21 +30,23 @@ docs/               общая папка с Cowork: STATE.md, costs.md, decisio
 .claude/skills/     hoodchain-mev — конституция проекта;
                     cowork-handoff — протокол работы с Cowork и шаблоны;
                     feed-audit — скрипт проверки записи фида;
+                    architect-review — порядок и чек-листы архитектурного ревью кода;
                     clickhouse-best-practices, clickhouse-architecture-advisor —
                     сторонние (clickhouse/agent-skills, skills-lock.json); при
                     расхождении прав hoodchain-mev (data-model.md)
 .claude/agents/     indexer-engineer, data-auditor, skeptic-analyst, arb-researcher,
-                    engine-engineer, infra-ops, contract-reviewer, contract-registrar
+                    engine-engineer, infra-ops, contract-reviewer, contract-registrar,
+                    architect-reviewer
 ```
 
 ## Кто исполняет и кто проверяет
 
 | Тип задачи | Исполнитель | Обязательная проверка |
 |---|---|---|
-| Конвейер: recorder, enricher, декодеры, загрузка, схема | indexer-engineer | data-auditor |
+| Конвейер: recorder, enricher, декодеры, загрузка, схема | indexer-engineer | data-auditor + architect-reviewer (код) |
 | Аналитика: арбитраж, импульс, портреты конкурентов | arb-researcher | data-auditor (данные) + skeptic-analyst (выводы) |
 | Движок: revm, состояние пулов, маршруты, симулятор повтора, бумажная торговля, латентность | engine-engineer | бенчмарки; skeptic-analyst для оценок прибыли |
-| Серверы, мониторинг, бэкапы, деплой, учёт расходов | infra-ops | траты утверждает Михаил |
+| Серверы, мониторинг, бэкапы, деплой, учёт расходов | infra-ops | траты утверждает Михаил; architect-reviewer для скриптов `deploy/` |
 | Реестр контрактов: адреса, ABI, статусы в `contracts.md` | contract-registrar | `verified` ставит Михаил |
 | Смарт-контракт исполнителя (фаза 2+) | engine-engineer | contract-reviewer — обязательно до развёртывания |
 | Любой вывод «стратегия прибыльна» | — | skeptic-analyst, затем решение Михаила |
@@ -65,6 +67,7 @@ Docker: только уникальные порты хоста и только 
 ## Как работать
 
 - Изменения кода — через индексатора (indexer-engineer); после изменения декодеров/загрузчиков — data-auditor; любой результат для Михаила — через skeptic-analyst.
+- Любое нетривиальное изменение кода (Rust, Python, Bash, SQL) перед закрытием задачи — ревью architect-reviewer (скилл `architect-review`): дубли, структура типов и модулей, паттерны, разбиение на файлы, линт, лучшие практики. Блокирующие замечания исправляет исполнитель.
 - Разделяй «проверено на данных (дата, как)» и «предполагается».
 - Не добавляй зависимости без причины; предпочитай то, что уже в `[workspace.dependencies]`.
 - Не коммить `data/`, `.env`, ключи провайдеров.
