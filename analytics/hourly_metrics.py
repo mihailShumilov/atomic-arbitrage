@@ -2,36 +2,38 @@
 """Per-block metrics for a blocks-format jsonl.zst file (task 010). Offline, no RPC.
 
 Input lines: {"block":{...full txs...},"number":N,"receipts":[...]}  (enricher format).
-Output TSV, one row per block, header in the first line.
+Output TSV, one row per block, header in the first line; written to a temporary
+file next to --out and renamed on success (no partial file on failure).
 
-Definitions (task 006 + data-auditor 006, M1-M3):
+Definitions (task 006 + data-auditor 006, M1-M3; constants in hoodlib.py):
   system tx      type 0x6a (ArbitrumInternalTx) only
   user tx        every tx that is not 0x6a; subclasses
                    l2  = signed on L2, types 0x0-0x4
                    l1  = arrived from L1, types 0x64-0x69 and 0x78
                    other = anything else (should be 0)
+  receipts       must pair with txs one to one (count and hash), else the run stops
   revert         receipt status 0x0 among user txs
   swap log       receipt log with topics[0] = Uniswap v3 Swap or v4 Swap, any emitter
                  (logs, not trades; launchpad curve trades are not counted)
   tx_with_swap   user txs with >= 1 swap log
-  fee            gasUsed * effectiveGasPrice of a user tx, wei (includes the L1 part)
+  fee            gasUsed * effectiveGasPrice of a user tx, wei (includes the L1 part);
+                 fee_median_wei is an integer median (mean of the two middle values floored)
   sizes          compact sorted-key JSON of "block" / "receipts" (same bytes as
                  enricher's raw counter); line_zstd3 = the whole line compressed alone
                  with `zstd -3` (no cross-block context, see report for calibration)
 """
 
+from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json
-import statistics as st
+import os
 import subprocess
 import sys
 
-V3_SWAP = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
-V4_SWAP = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"
-SYS = "0x6a"
-L2_TYPES = {"0x0", "0x1", "0x2", "0x3", "0x4"}
-L1_TYPES = {"0x64", "0x65", "0x66", "0x67", "0x68", "0x69", "0x78"}
+import hoodlib as hl
+
 WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 COLS = [
@@ -68,19 +70,20 @@ COLS = [
 ]
 
 
-def dumps(o):
+def dumps(o: object) -> bytes:
     return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def zlen(b):
+def zlen(b: bytes) -> int:
     return len(subprocess.run(["zstd", "-3", "-q", "-c"], input=b, capture_output=True, check=True).stdout)
 
 
-def metrics(line, hour_start=None):
+def metrics(line: bytes, hour_start: int | None = None) -> dict:
+    """One output row (COLS) for one blocks-format line."""
     o = json.loads(line)
     b, rc = o["block"], o["receipts"]
     txs = b["transactions"]
-    assert len(txs) == len(rc), f"block {o['number']}: tx/receipt count"
+    pairs = hl.tx_receipt_pairs(b, rc)
     ts = int(b["timestamp"], 16)
     hs = hour_start if hour_start is not None else ts - ts % 3600
     d = dt.datetime.fromtimestamp(hs, dt.timezone.utc)
@@ -99,14 +102,12 @@ def metrics(line, hour_start=None):
         size_field=int(b.get("size", "0x0"), 16),
     )
     fees = []
-    for t, r in zip(txs, rc):
-        assert t["hash"] == r["transactionHash"]
-        ty = t["type"]
-        if ty == SYS:
+    for t, r in pairs:
+        if t["type"] == hl.SYS:
             m["n_sys"] += 1
             continue
         m["n_user"] += 1
-        cls = "l2" if ty in L2_TYPES else "l1" if ty in L1_TYPES else "other"
+        cls = hl.tx_class(t["type"])
         m["n_" + cls] += 1
         if r["status"] == "0x0":
             m["reverts"] += 1
@@ -115,18 +116,18 @@ def metrics(line, hour_start=None):
         sw = 0
         for lg in r["logs"]:
             t0 = lg["topics"][0] if lg["topics"] else None
-            if t0 == V3_SWAP:
+            if t0 == hl.V3_SWAP:
                 m["swap_v3"] += 1
                 sw += 1
-            elif t0 == V4_SWAP:
+            elif t0 == hl.V4_SWAP:
                 m["swap_v4"] += 1
                 sw += 1
         m["swap_logs"] += sw
         m["tx_with_swap"] += 1 if sw else 0
-        if int(r.get("gasUsedForL1", "0x0"), 16) > 0:
+        if hl.gas_used_for_l1(r) > 0:
             m["n_l1gas_pos"] += 1
-        fees.append(int(r["gasUsed"], 16) * int(r["effectiveGasPrice"], 16))
-    m["fee_median_wei"] = int(st.median(fees)) if fees else ""
+        fees.append(hl.fee_wei(r))
+    m["fee_median_wei"] = hl.median_int(fees) if fees else ""
     m["fee_sum_wei"] = sum(fees)
     m["block_raw_b"] = len(dumps(b))
     m["receipts_raw_b"] = len(dumps(rc))
@@ -145,19 +146,27 @@ def main():
     if a.index:
         with open(a.index) as f:
             next(f)
-            for l in f:
-                p = l.rstrip("\n").split("\t")
+            for row in f:
+                p = row.rstrip("\n").split("\t")
                 if p[2]:
                     hour_of[int(p[2])] = int(p[1])
-    raw = subprocess.run(["zstd", "-dc", a.input], capture_output=True, check=True).stdout
     n = 0
-    with open(a.out, "w") as w:
-        w.write("\t".join(COLS) + "\n")
-        for line in raw.splitlines():
-            num = json.loads(line)["number"]
-            m = metrics(line, hour_of.get(num))
-            w.write("\t".join(str(m[c]) for c in COLS) + "\n")
-            n += 1
+    # Write next to --out and rename only after the whole input was read: a failed
+    # run (receipt mismatch, zstd error) never leaves a partial or clobbered TSV.
+    tmp = f"{a.out}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w") as w:
+            w.write("\t".join(COLS) + "\n")
+            for line in hl.iter_block_lines(a.input):
+                num = json.loads(line)["number"]
+                m = metrics(line, hour_of.get(num))
+                w.write("\t".join(str(m[c]) for c in COLS) + "\n")
+                n += 1
+        os.replace(tmp, a.out)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     print(f"{n} rows -> {a.out}", file=sys.stderr)
 
 

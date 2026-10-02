@@ -1,5 +1,5 @@
 # 024 — feed_audit.py, обёртка аудита, общий модуль analytics (задача G ревью 2026-10-02)
-status: ready
+status: done
 phase: 1a
 depends-on: 018
 executor: indexer-engineer (Python), infra-ops (deploy/feed-audit-daily.sh и выкладка)

@@ -9,7 +9,8 @@
 #     --build   also run build-on-server.sh (downloads rustup + crates; ~minutes)
 #     --keep    do not remove the container (name: hood-deploy-test-boot-<ver>)
 #
-# Source: committed tree (git archive HEAD) + the working copy of deploy/.
+# Source: committed tree (git archive HEAD) + the working copy of deploy/ and of
+# .claude/skills/feed-audit/scripts (bootstrap installs feed_audit.py from there).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -38,6 +39,8 @@ trap cleanup EXIT
 
 git -C "$ROOT" archive HEAD | tar -x -C "$WORK"
 rm -rf "$WORK/deploy" && cp -R "$ROOT/deploy" "$WORK/deploy"
+rm -rf "$WORK/.claude/skills/feed-audit/scripts" && mkdir -p "$WORK/.claude/skills/feed-audit" &&
+    cp -R "$ROOT/.claude/skills/feed-audit/scripts" "$WORK/.claude/skills/feed-audit/scripts"
 
 docker build -q --build-arg UBUNTU="$ubuntu" -t "$IMAGE" -f "$HERE/Dockerfile.systemd" "$HERE" > /dev/null
 docker rm -f "$NAME" > /dev/null 2>&1 || true
@@ -177,6 +180,10 @@ ok "enricher-gaps refuses to start without /etc/hoodchain/enricher.env" "enriche
 # shellcheck disable=SC2016  # PIPESTATUS must expand inside the container
 ok "backup test (rclone, local remote) as hood" "backup test" \
     x 'runuser -u hood -- bash /opt/hoodchain-mev/src/deploy/test/test-backup.sh | tail -n 1; exit "${PIPESTATUS[0]}"'
+# python3 and zstd come from bootstrap, so the cases against the real feed_audit.py run too.
+# shellcheck disable=SC2016  # PIPESTATUS must expand inside the container
+ok "test-feed-audit-daily.sh incl. the real feed_audit.py, as hood" "test-feed-audit-daily.sh" \
+    x 'runuser -u hood -- bash /opt/hoodchain-mev/src/deploy/test/test-feed-audit-daily.sh | tail -n 1; exit "${PIPESTATUS[0]}"'
 ok "chrony active after bootstrap" "chrony not active" x 'systemctl is-active --quiet chrony'
 # shellcheck disable=SC2016  # $(...) must expand inside the container
 ok "ufw active, only ssh allowed in" "ufw rules" \
