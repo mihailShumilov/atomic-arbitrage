@@ -1,5 +1,5 @@
 # 043 — Сколько чтений состояния нужно на повтор блока (оценка без сети)
-status: ready
+status: done
 phase: 1b-подготовка
 depends-on: 035
 executor: engine-engineer
