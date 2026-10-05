@@ -1,5 +1,5 @@
 # 030 — Залить две дыры от плановых рестартов через публичный RPC
-status: ready
+status: done
 phase: 1a
 depends-on: 026
 executor: indexer-engineer
