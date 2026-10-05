@@ -1,5 +1,5 @@
 # 037 — Токенизированные акции как валюта котировки
-status: ready
+status: done
 phase: 1b
 depends-on: 035
 executor: contract-registrar (адреса), indexer-engineer (реестр токенов, прогон)

@@ -423,7 +423,8 @@ pub struct TokenEntry {
     /// `None` = unknown (the row's `price` is then `nan`). At most [`MAX_DECIMALS`].
     pub decimals: Option<u8>,
     /// `Some(rank)` = a quote currency; in a pool of two quotes the lower rank is the quote
-    /// (e.g. USDG 1 < WETH 2: a WETH/USDG pool is priced in USDG). Requires `decimals`.
+    /// (e.g. USDG 1 < WETH 2: a WETH/USDG pool is priced in USDG; WETH 2 < a stock token 3).
+    /// Two quotes of the same rank: see [`ADDRESS_TIEBREAK_MIN_RANK`]. Requires `decimals`.
     pub quote_rank: Option<u8>,
     pub status: RegistryStatus,
 }
@@ -434,9 +435,35 @@ pub struct TokenRegistry {
     tokens: HashMap<Address, TokenEntry>,
 }
 
-/// Quote rank of the built-in quotes (WETH and native ETH share it: an ETH/WETH pool has no
-/// quote and is skipped as ambiguous). Rank 1 is left for a stablecoin (USDG, `verified` since 2026-10-05, passed as caller input).
+/// Quote rank of native ETH and L2 WETH (the built-in quotes).
+///
+/// Both share it, so an ETH/WETH pool has no quote and is skipped as ambiguous (see
+/// [`ADDRESS_TIEBREAK_MIN_RANK`]). Rank 1 is left for a stablecoin (USDG, `verified` since
+/// 2026-10-05, passed as caller input).
 pub const ETH_QUOTE_RANK: u8 = 2;
+
+/// Quote rank of every Robinhood Stock Token (tokenized stocks and ETFs).
+///
+/// The `verified` class of references/contracts.md (task 037, Mihail's decision 2026-10-05). Not
+/// built in: the 194 addresses are caller input (token registry TSV, e.g.
+/// `data/registry/tokens-037-verified.tsv`). A stock is priced in USDG or ETH/WETH when paired
+/// with them and is the quote against any non-quote token; stock/stock pools: see
+/// [`ADDRESS_TIEBREAK_MIN_RANK`]. Prices stay in raw token units: the ERC-8056 `uiMultiplier`
+/// (shares = tokens x multiplier) is NOT applied (references/data-model.md, "hood.swaps").
+pub const STOCK_QUOTE_RANK: u8 = 3;
+
+/// Lowest rank at which two quotes of the same rank are resolved by address.
+///
+/// From this rank up, in a pool of two quotes of one rank the lower address (`currency0`, as
+/// `currency0 < currency1` is a [`PoolRegistry`] invariant) is the quote, so a stock/stock pool
+/// is priced deterministically, whatever the registry load order. Below it (stablecoin 1,
+/// ETH/WETH 2) two quotes of one rank are ambiguous and get no row
+/// ([`crate::swap_rows::SkipReason::AmbiguousQuote`]): an ETH/WETH pool is a wrap, not a price.
+/// Used by [`crate::swap_rows::swap_row`]; also described in references/data-model.md
+/// ("hood.swaps", "quote / token").
+pub const ADDRESS_TIEBREAK_MIN_RANK: u8 = STOCK_QUOTE_RANK;
+
+const _: () = assert!(ETH_QUOTE_RANK < ADDRESS_TIEBREAK_MIN_RANK, "an ETH/WETH pool is a wrap, not a price");
 
 impl TokenRegistry {
     /// Native ETH (`address(0)`, the v4 `Currency` of ETH; 18 decimals by protocol) and L2 WETH

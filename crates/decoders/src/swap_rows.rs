@@ -6,7 +6,8 @@
 //!   registered pool addresses, v4 rows only for pools of a registered (or allowed) `PoolManager`.
 //!   A row is built only if the pool entry and the quote entry are both at least `min_status`.
 //! - **Quote**: the currency of the pool that is a quote in the token registry; two quotes -> the
-//!   lower `quote_rank`; none, or two of the same rank -> no row.
+//!   lower `quote_rank`; two of the same rank -> see [`ADDRESS_TIEBREAK_MIN_RANK`]; none -> no
+//!   row.
 //! - **Signs**: [`PoolSwap`] amounts are pool-side (positive = into the pool, v4 already
 //!   normalized). Token out of the pool = the trader bought it (`buy`); amounts are written
 //!   unsigned.
@@ -25,11 +26,12 @@
 //!   the Pons v2 meme hook have venue `pons_v2_hook` (task 036, [`crate::pools`] module doc), so
 //!   analytics tells them apart by `venue`; other hooked pools are `other`.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, U256};
 
-use crate::pools::{PoolEntry, PoolRef, PoolRegistry, TokenRegistry};
+use crate::pools::{PoolEntry, PoolRef, PoolRegistry, TokenRegistry, ADDRESS_TIEBREAK_MIN_RANK};
 use crate::registry::RegistryStatus;
 use crate::rows::{Side, SwapPool, SwapRow, Venue};
 use crate::swaps::{PoolSwap, SwapEvent};
@@ -43,7 +45,8 @@ pub enum SkipReason {
     BelowMinStatus,
     /// Neither currency of the pool is a quote.
     NoQuote,
-    /// Both currencies are quotes of the same rank.
+    /// Both currencies are quotes of the same rank that is not resolved by address (see
+    /// [`ADDRESS_TIEBREAK_MIN_RANK`]).
     AmbiguousQuote,
     /// The token or the quote amount is zero.
     ZeroAmount,
@@ -97,14 +100,19 @@ pub struct MappedSwap<'a> {
 pub fn swap_row<'a>(s: &PoolSwap, inputs: &RowInputs<'a>) -> Result<MappedSwap<'a>, SkipReason> {
     let pool_ref = PoolRef::of(s).ok_or(SkipReason::NoPoolMeta)?;
     let pool = inputs.pools.get(&pool_ref).ok_or(SkipReason::NoPoolMeta)?;
-    let quote_of = |c: &Address| inputs.tokens.get(c).filter(|t| t.quote_rank.is_some());
+    let rank_of = |c: &Address| inputs.tokens.get(c).and_then(|t| t.quote_rank);
     // `quote_is_1`: currency1 is the quote.
-    let quote_is_1 = match (quote_of(&pool.currency0), quote_of(&pool.currency1)) {
+    let quote_is_1 = match (rank_of(&pool.currency0), rank_of(&pool.currency1)) {
         (None, None) => return Err(SkipReason::NoQuote),
         (Some(_), None) => false,
         (None, Some(_)) => true,
-        (Some(q0), Some(q1)) if q0.quote_rank == q1.quote_rank => return Err(SkipReason::AmbiguousQuote),
-        (Some(q0), Some(q1)) => q1.quote_rank < q0.quote_rank,
+        (Some(r0), Some(r1)) => match r0.cmp(&r1) {
+            Ordering::Less => false,
+            Ordering::Greater => true,
+            // Same rank: the lower address is the quote (ADDRESS_TIEBREAK_MIN_RANK doc).
+            Ordering::Equal if r0 >= ADDRESS_TIEBREAK_MIN_RANK => pool.currency1 < pool.currency0,
+            Ordering::Equal => return Err(SkipReason::AmbiguousQuote),
+        },
     };
     let (token, quote, token_delta, quote_delta) = if quote_is_1 {
         (pool.currency0, pool.currency1, s.amount0, s.amount1)
@@ -245,7 +253,7 @@ impl SwapRowCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pools::{PoolSource, TokenEntry};
+    use crate::pools::{PoolSource, TokenEntry, ETH_QUOTE_RANK, STOCK_QUOTE_RANK};
     use alloy_primitives::{address, B256, I256};
 
     const T: Address = address!("00000000000000000000000000000000000000aa");
@@ -390,27 +398,57 @@ mod tests {
         assert_eq!(map(&v4, &p, &t, RegistryStatus::Observed).map(|_| ()), Err(SkipReason::NoPoolMeta));
         let empty = TokenRegistry::default();
         assert_eq!(map(&swap(-1, 1), &p, &empty, RegistryStatus::Observed).map(|_| ()), Err(SkipReason::NoQuote));
-        let mut both = TokenRegistry::default();
-        for token in [T, Q] {
-            both.insert(TokenEntry {
-                token,
-                decimals: Some(18),
-                quote_rank: Some(2),
-                status: RegistryStatus::Verified,
-            })
-            .unwrap();
-        }
+        let both = tokens(&[(T, 18, Some(2)), (Q, 18, Some(2))]);
         assert_eq!(map(&swap(-1, 1), &p, &both, RegistryStatus::Observed).map(|_| ()), Err(SkipReason::AmbiguousQuote));
         // Two quotes of different ranks: the lower rank (here currency0 = T) is the quote.
-        let mut ranked = TokenRegistry::default();
-        ranked
-            .insert(TokenEntry { token: T, decimals: Some(6), quote_rank: Some(1), status: RegistryStatus::Verified })
-            .unwrap();
-        ranked
-            .insert(TokenEntry { token: Q, decimals: Some(18), quote_rank: Some(2), status: RegistryStatus::Verified })
-            .unwrap();
+        let ranked = tokens(&[(T, 6, Some(1)), (Q, 18, Some(2))]);
         let r = map(&swap(-1, 1), &p, &ranked, RegistryStatus::Observed).unwrap();
         assert_eq!((r.token, r.quote, r.side), (Q, T, Side::Sell));
+    }
+
+    /// Verified entries `(token, decimals, quote_rank)`.
+    fn tokens(entries: &[(Address, u8, Option<u8>)]) -> TokenRegistry {
+        let mut t = TokenRegistry::default();
+        for &(token, decimals, quote_rank) in entries {
+            t.insert(TokenEntry { token, decimals: Some(decimals), quote_rank, status: RegistryStatus::Verified })
+                .unwrap();
+        }
+        t
+    }
+
+    #[test]
+    fn same_rank_from_threshold_is_priced_in_the_lower_address() {
+        let (p, _) = registries(RegistryStatus::Verified, None);
+        assert!(T < Q, "T is currency0 of the test pool");
+        assert_eq!(ADDRESS_TIEBREAK_MIN_RANK, STOCK_QUOTE_RANK);
+        for rank in [ADDRESS_TIEBREAK_MIN_RANK, ADDRESS_TIEBREAK_MIN_RANK + 1, u8::MAX] {
+            let t = tokens(&[(Q, 0, Some(rank)), (T, 0, Some(rank))]);
+            // Q (currency1) left the pool, T came in: the trader bought Q, priced in T.
+            let r = map(&swap(3, -2), &p, &t, RegistryStatus::Verified).unwrap();
+            assert_eq!((r.token, r.quote, r.side, r.price), (Q, T, Side::Buy, 1.5), "rank {rank}");
+        }
+    }
+
+    #[test]
+    fn same_rank_below_threshold_is_ambiguous() {
+        let (p, _) = registries(RegistryStatus::Verified, None);
+        for rank in 1..ADDRESS_TIEBREAK_MIN_RANK {
+            let t = tokens(&[(Q, 0, Some(rank)), (T, 0, Some(rank))]);
+            assert_eq!(
+                map(&swap(3, -2), &p, &t, RegistryStatus::Verified).map(|_| ()),
+                Err(SkipReason::AmbiguousQuote),
+                "rank {rank}"
+            );
+        }
+    }
+
+    #[test]
+    fn stock_against_lower_rank_is_token() {
+        let (p, _) = registries(RegistryStatus::Verified, None);
+        // The stock is currency0 (the lower address), still the token against ETH/WETH.
+        let t = tokens(&[(T, 18, Some(STOCK_QUOTE_RANK)), (Q, 18, Some(ETH_QUOTE_RANK))]);
+        let r = map(&swap(3, -2), &p, &t, RegistryStatus::Verified).unwrap();
+        assert_eq!((r.token, r.quote, r.side), (T, Q, Side::Sell));
     }
 
     #[test]
