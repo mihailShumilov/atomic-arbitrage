@@ -15,6 +15,9 @@
 #   writer     `shutdown writer_error` / `writer_error` row in connections.tsv
 #              younger than HC_WRITER_ERROR_WINDOW_S (disk/fsync failure, exit 2)
 #   backfill   gaps older than HC_BACKFILL_MAX_LAG_H not covered by filled.tsv
+#              (union of the rows; missing/unreadable/empty filled.tsv = nothing
+#              filled)
+#   backfill_calc  the backfill count failed (awk gave no numbers)
 #   clock      chrony not synchronised or |offset| > HC_CLOCK_MAX_OFFSET_S
 #   backup     last successful backup older than HC_BACKUP_MAX_AGE_H (0 = off)
 #   raid       an md array in HC_MDSTAT (/proc/mdstat) is degraded ([U_], [_U])
@@ -294,25 +297,61 @@ fi
 summary+=("gaps_rows=$n_lines")
 
 # --------------------------------------------------------------- backfill ---
+# Task 034 (review 030, B3): filled.tsv is told apart from gaps.tsv by name
+# (FILENAME == ARGV[1]), not by FNR == NR. With FNR == NR an empty first file
+# (missing filled.tsv -> /dev/null, or an empty one) made every gaps.tsv row
+# look "filled", so the alert never fired. Missing, unreadable or empty
+# filled.tsv now means "nothing filled".
+# Coverage of a gap is the union of its intersections with the filled.tsv
+# rows (review 034, item 1): duplicate or overlapping rows (repeated
+# --from/--to runs append again) must not count twice, as in
+# hood_core::ranges::{merge, subtract}.
+# An awk failure (no numbers) is its own condition `backfill_calc` (review
+# 034, item 2), so it never hides or is hidden by a real `backfill` lag.
 if (( HC_BACKFILL_MAX_LAG_H > 0 )) && [[ -r $gaps ]]; then
     filled="$HC_BLOCKS_DIR/filled.tsv"
-    [[ -r $filled ]] || filled=/dev/null
-    read -r u_n u_blocks < <(awk -F'\t' -v cutoff="$(( now_s - HC_BACKFILL_MAX_LAG_H * 3600 ))" '
-        FNR == NR { if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/) { nf++; ff[nf] = $1; ft[nf] = $2 }; next }
+    filled_src=/dev/null
+    [[ -r $filled ]] && filled_src=$filled
+    u_n="" u_blocks="" u_ranges=""
+    # test-healthcheck.sh 3c keys its awk shim on the cutoff= argument.
+    read -r u_n u_blocks u_ranges < <(awk -F'\t' -v cutoff="$(( now_s - HC_BACKFILL_MAX_LAG_H * 3600 ))" '
+        FILENAME == ARGV[1] { if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/) { nf++; ff[nf] = $1; ft[nf] = $2 }; next }
         $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && ($3 / 1e9) < cutoff {
-            len = $2 - $1 + 1; cov = 0
+            len = $2 - $1 + 1; k = 0
             for (i = 1; i <= nf; i++) {
                 lo = ($1 > ff[i]) ? $1 : ff[i]; hi = ($2 < ft[i]) ? $2 : ft[i]
-                if (hi >= lo) cov += hi - lo + 1
+                if (hi >= lo) { k++; L[k] = lo; H[k] = hi }
+            }
+            for (i = 2; i <= k; i++) {    # insertion sort by lo; k is small
+                l = L[i]; h = H[i]
+                for (j = i - 1; j >= 1 && L[j] > l; j--) { L[j + 1] = L[j]; H[j + 1] = H[j] }
+                L[j + 1] = l; H[j + 1] = h
+            }
+            cov = 0; end = $1 - 1
+            for (i = 1; i <= k; i++) {
+                if (H[i] > end) { st = (L[i] > end + 1) ? L[i] : end + 1; cov += H[i] - st + 1; end = H[i] }
             }
             if (cov < len) { n++; b += len - cov }
         }
-        END { print n + 0, b + 0 }' "$filled" "$gaps")
-    if (( u_n > 0 )); then
-        raise backfill "дозаливка отстаёт: $u_n дыр, $u_blocks блоков старше ${HC_BACKFILL_MAX_LAG_H} ч не залиты" \
-            "Проверить enricher-gaps.timer (systemctl list-timers; journalctl -u enricher-gaps). Пока провайдер RPC не выбран, таймер выключен."
+        END { print n + 0, b + 0, nf + 0 }' "$filled_src" "$gaps")
+    if [[ $filled_src == /dev/null ]]; then
+        if [[ -e $filled ]]; then filled_state="не читается"; else filled_state="нет"; fi
     else
-        resolved backfill
+        filled_state="диапазонов: ${u_ranges:-?}"
+    fi
+    backfill_hint="$filled — $filled_state. Проверить enricher-gaps.timer (systemctl list-timers; journalctl -u enricher-gaps). Пока провайдер RPC не выбран, таймер выключен."
+    if [[ ! $u_n =~ ^[0-9]+$ || ! $u_blocks =~ ^[0-9]+$ ]]; then
+        # `backfill` keeps its last state: unknown is neither ok nor a new lag.
+        raise backfill_calc "не удалось посчитать отставание дозаливки" \
+            "awk по $gaps и $filled не вернул чисел; состояние backfill не менялось. $backfill_hint"
+    else
+        resolved backfill_calc
+        if (( u_n > 0 )); then
+            raise backfill "дозаливка отстаёт: $u_n дыр, $u_blocks блоков старше ${HC_BACKFILL_MAX_LAG_H} ч не залиты" \
+                "$backfill_hint"
+        else
+            resolved backfill
+        fi
     fi
 fi
 

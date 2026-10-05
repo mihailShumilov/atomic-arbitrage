@@ -1,5 +1,5 @@
 # 034 — healthcheck: `backfill` молчит при отсутствующем/пустом `filled.tsv`
-status: in-progress
+status: done
 phase: 1a
 depends-on: 028
 executor: infra-ops

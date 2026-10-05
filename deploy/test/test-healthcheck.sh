@@ -153,6 +153,101 @@ run; expect 0 "backfill half filled: still lagging, no repeat"
 printf '76500500\t76500999\tblocks-76500500-76500999.jsonl.zst\t%s\n' "$now" >> "$T/blocks/filled.tsv"
 run; expect 1 "backfill filled: recovered" '^ok\|восстановлено: дозаливка'
 
+# ------------------------- 3c. missing / empty filled.tsv (task 034, B3) ---
+# Review 030 B3: with FNR == NR an empty first file (missing filled.tsv ->
+# /dev/null, or an empty file) made the gaps.tsv rows count as filled, and
+# `backfill` stayed silent. Here the old gap 76500000..76500999 (25 h) is
+# the only gap older than the lag.
+bf_summary() { grep -o 'backfill=[^ ]*' "$T/last.out" | tail -n 1; }
+bf_body_has() { tail -n 1 "$NLOG.body" | grep -qF -- "$1"; }
+cp "$T/blocks/filled.tsv" "$T/filled.full"
+rm "$T/blocks/filled.tsv"
+run; expect 1 "no filled.tsv: the old gap is unfilled, one alert" '^alert\|дозаливка отстаёт: 1 дыр, 1000 блоков'
+check "no filled.tsv: body says the file is missing; backfill=BAD" \
+    'bf_body_has "filled.tsv — нет." && [[ $(bf_summary) == backfill=BAD ]]'
+run; expect 0 "no filled.tsv: no repeat"
+cp "$T/filled.full" "$T/blocks/filled.tsv"
+run; expect 1 "filled.tsv back, full cover: recovered" '^ok\|восстановлено: дозаливка'
+: > "$T/blocks/filled.tsv"
+run; expect 1 "empty filled.tsv: one alert" '^alert\|дозаливка отстаёт: 1 дыр, 1000 блоков'
+check "empty filled.tsv: body says 0 ranges" 'bf_body_has "filled.tsv — диапазонов: 0."'
+printf '# from\tto\tfile\tfilled_unix_s\n' > "$T/blocks/filled.tsv"
+run; expect 0 "header-only filled.tsv: still raised, no repeat"
+check "header-only filled.tsv: backfill=BAD" '[[ $(bf_summary) == backfill=BAD ]]'
+cp "$T/filled.full" "$T/blocks/filled.tsv"
+run; expect 1 "full cover again: recovered" '^ok\|восстановлено: дозаливка'
+# Partial cover, no header line: the first line of filled.tsv is data.
+printf '76500000\t76500499\tblocks-76500000-76500499.jsonl.zst\t%s\n' "$now" > "$T/blocks/filled.tsv"
+run; expect 1 "partial cover (first half): one alert, 500 blocks" '^alert\|дозаливка отстаёт: 1 дыр, 500 блоков'
+check "partial cover: body says 1 range" 'bf_body_has "filled.tsv — диапазонов: 1."'
+cp "$T/filled.full" "$T/blocks/filled.tsv"
+run; expect 1 "full cover: recovered" '^ok\|восстановлено: дозаливка'
+# Review 034, item 1: duplicate / overlapping filled.tsv rows. Coverage is
+# the union of the rows (as hood_core::ranges::subtract after merge); the sum
+# of intersections counted a row twice and showed a half-filled gap as filled.
+fill_row() { printf '%s\t%s\tblocks-%s-%s.jsonl.zst\t%s\n' "$1" "$2" "$1" "$2" "$now"; }
+{ fill_row 76500000 76500499; fill_row 76500000 76500499; } > "$T/blocks/filled.tsv"
+run; expect 1 "duplicate row (first half twice): one alert, 500 blocks" '^alert\|дозаливка отстаёт: 1 дыр, 500 блоков'
+check "duplicate row: body says 2 ranges" 'bf_body_has "filled.tsv — диапазонов: 2."'
+cp "$T/filled.full" "$T/blocks/filled.tsv"
+run; expect 1 "full cover: recovered" '^ok\|восстановлено: дозаливка'
+# Overlapping rows, out of order, one nested: union 76500000..76500899.
+{ fill_row 76500300 76500899; fill_row 76500000 76500699; fill_row 76500100 76500199; } > "$T/blocks/filled.tsv"
+run; expect 1 "overlapping rows (union leaves 100): one alert, 100 blocks" '^alert\|дозаливка отстаёт: 1 дыр, 100 блоков'
+{ fill_row 76500400 76500999; fill_row 76500000 76500600; fill_row 76500100 76500199; } > "$T/blocks/filled.tsv"
+run; expect 1 "overlapping rows covering the whole gap: recovered" '^ok\|восстановлено: дозаливка'
+check "overlapping full cover: backfill=ok" '[[ $(bf_summary) == backfill=ok ]]'
+cp "$T/filled.full" "$T/blocks/filled.tsv"
+run; expect 0 "back to the plain full cover: silent"
+# Two old gaps and an empty filled.tsv: both are counted (with FNR == NR the
+# first gaps.tsv rows were read as filled ranges).
+printf '76400000\t76400099\t%s\n' "$(ns $((now - 30 * 3600)))" >> "$T/feed/gaps.tsv"
+: > "$T/blocks/filled.tsv"
+run; expect 2 "second old gap + empty filled.tsv: gap event + alert for both" \
+    '^(info\|новые дыры в фиде: 1 шт., 100 блоков|alert\|дозаливка отстаёт: 2 дыр, 1100 блоков)'
+cp "$T/filled.full" "$T/blocks/filled.tsv"
+printf '76400000\t76400099\tblocks-76400000-76400099.jsonl.zst\t%s\n' "$now" >> "$T/blocks/filled.tsv"
+cp "$T/blocks/filled.tsv" "$T/filled.full"
+run; expect 1 "both old gaps filled: recovered" '^ok\|восстановлено: дозаливка'
+# awk fails in the backfill count: an alert, not a silent ok (the old code
+# read empty numbers as 0). Its own key `backfill_calc` (review 034, item 2):
+# it neither hides nor is hidden by a real lag. The shim fails only the
+# backfill awk call (it keys on the cutoff= argument of healthcheck.sh).
+mkdir -p "$T/awkfail"
+real_awk=$(command -v awk)
+cat > "$T/awkfail/awk" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [[ \$a == cutoff=* ]] && { echo "awk: simulated failure" >&2; exit 2; }; done
+exec "$real_awk" "\$@"
+EOF
+chmod +x "$T/awkfail/awk"
+calc_summary() { grep -o 'backfill_calc=[^ ]*' "$T/last.out" | tail -n 1; }
+# Order A: the count fails, then it works and shows a real lag.
+PATH="$T/awkfail:$PATH" run; expect 1 "A: backfill awk fails: one backfill_calc alert" '^alert\|не удалось посчитать отставание дозаливки'
+check "A: backfill_calc=BAD, backfill not reported, no backfill.alert" \
+    '[[ $(calc_summary) == backfill_calc=BAD && -z $(bf_summary) && ! -e $T/state/backfill.alert ]]'
+PATH="$T/awkfail:$PATH" run; expect 0 "A: still failing: no repeat"
+: > "$T/blocks/filled.tsv"
+run; expect 2 "A: awk works, real lag: calc recovered + lag alert" \
+    '^(ok\|восстановлено: не удалось посчитать|alert\|дозаливка отстаёт: 2 дыр, 1100 блоков)'
+# Order B: the lag is raised, then the count fails, then all is well.
+PATH="$T/awkfail:$PATH" run; expect 1 "B: lag raised, awk fails: one backfill_calc alert" '^alert\|не удалось посчитать'
+check "B: backfill.alert kept with the lag title" 'grep -q "дозаливка отстаёт" "$T/state/backfill.alert"'
+cp "$T/filled.full" "$T/blocks/filled.tsv"
+run; expect 2 "B: awk works, all filled: both recovered" \
+    '^ok\|восстановлено: (не удалось посчитать|дозаливка отстаёт)'
+check "B: backfill=ok backfill_calc=ok" '[[ $(bf_summary) == backfill=ok && $(calc_summary) == backfill_calc=ok ]]'
+# Unreadable filled.tsv (non-root only: root reads it anyway).
+if (( EUID != 0 )); then
+    chmod 000 "$T/blocks/filled.tsv"
+    run; expect 1 "unreadable filled.tsv: one alert, both gaps unfilled" '^alert\|дозаливка отстаёт: 2 дыр, 1100 блоков'
+    check "unreadable filled.tsv: body says so" 'bf_body_has "filled.tsv — не читается."'
+    chmod 644 "$T/blocks/filled.tsv"
+    run; expect 1 "filled.tsv readable again: recovered" '^ok\|восстановлено: дозаливка'
+else
+    echo "SKIP  unreadable filled.tsv (needs a non-root user: docker run --user 1000:1000)"
+fi
+
 # ---------------------------------------------------------------- 4. disk ---
 export FAKE_DF_PCT=85
 run; expect 1 "disk 85% >= 80%: one alert" '^alert\|диск заполнен на 85%'
