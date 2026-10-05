@@ -1,5 +1,5 @@
 # 040 — Бесплатные проверки Alchemy для решения 0002 (≤ 50 вызовов)
-status: ready
+status: done
 phase: 1b-подготовка
 depends-on: 035, 038
 executor: indexer-engineer
