@@ -1,0 +1,96 @@
+[
+ {
+  "type": "event",
+  "name": "TokenDeployed",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "deployer",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "dexFactory",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "pairToken",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "dexId",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "launchConfigId",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "TokenLaunched",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "deployer",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "dexFactory",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "pairToken",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "pool",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "dexId",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "launchConfigId",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "positionId",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "restrictionsEndBlock",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "initialBuyAmount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ }
+]

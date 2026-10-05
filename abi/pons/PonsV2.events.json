@@ -1,0 +1,431 @@
+[
+ {
+  "type": "event",
+  "name": "CurveBuy",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "buyer",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "recipient",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "quoteIn",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tokensOut",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "fee",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tax",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "CurveBuyRefunded",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "buyer",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "refund",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "CurveSell",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "seller",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "recipient",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "tokensIn",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "quoteOut",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "fee",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tax",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "FeesSwept",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "protocolAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "buybackAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "creatorAmount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "BuybackLocked",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "quoteSpent",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tokensLocked",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "CurveCompleted",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "recipient",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "quoteOut",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tokenOut",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "AutoGraduationFailed",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "gasRemaining",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Locked",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "depositor",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "newVestingStart",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Released",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "creatorAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "protocolAmount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "TokenLaunched",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "curve",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "deployer",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "pairToken",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "launchConfigId",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "graduationThreshold",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "LaunchSwept",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "quoteOut",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tokenOut",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "PoolGraduated",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "positionId",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tokenAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "pairTokenAmount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "PoolRegistered",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "poolId",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "memecoin",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "quoteToken",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "creator",
+    "type": "address",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "HookFeeCollected",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "poolId",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "currency",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "feeAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "taxAmount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "PoolFeesSwept",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "poolId",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "protocolAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "buybackAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "creatorAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tokensLocked",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "PoolBuybackSkipped",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "poolId",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "foldedBackQuote",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "PoolConversionSkipped",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "poolId",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "retainedMemecoin",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ }
+]

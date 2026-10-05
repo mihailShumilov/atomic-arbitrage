@@ -1,0 +1,167 @@
+[
+ {
+  "type": "event",
+  "name": "Initialize",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "id",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "currency0",
+    "type": "address",
+    "internalType": "Currency",
+    "indexed": true
+   },
+   {
+    "name": "currency1",
+    "type": "address",
+    "internalType": "Currency",
+    "indexed": true
+   },
+   {
+    "name": "fee",
+    "type": "uint24",
+    "indexed": false
+   },
+   {
+    "name": "tickSpacing",
+    "type": "int24",
+    "indexed": false
+   },
+   {
+    "name": "hooks",
+    "type": "address",
+    "internalType": "IHooks",
+    "indexed": false
+   },
+   {
+    "name": "sqrtPriceX96",
+    "type": "uint160",
+    "indexed": false
+   },
+   {
+    "name": "tick",
+    "type": "int24",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "ModifyLiquidity",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "id",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "sender",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "tickLower",
+    "type": "int24",
+    "indexed": false
+   },
+   {
+    "name": "tickUpper",
+    "type": "int24",
+    "indexed": false
+   },
+   {
+    "name": "liquidityDelta",
+    "type": "int256",
+    "indexed": false
+   },
+   {
+    "name": "salt",
+    "type": "bytes32",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Swap",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "id",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "sender",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "amount0",
+    "type": "int128",
+    "indexed": false
+   },
+   {
+    "name": "amount1",
+    "type": "int128",
+    "indexed": false
+   },
+   {
+    "name": "sqrtPriceX96",
+    "type": "uint160",
+    "indexed": false
+   },
+   {
+    "name": "liquidity",
+    "type": "uint128",
+    "indexed": false
+   },
+   {
+    "name": "tick",
+    "type": "int24",
+    "indexed": false
+   },
+   {
+    "name": "fee",
+    "type": "uint24",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Donate",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "id",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "sender",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "amount0",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "amount1",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ }
+]

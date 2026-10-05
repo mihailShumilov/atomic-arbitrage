@@ -1,5 +1,5 @@
 # 031 — Реестр: USDG, Uniswap v3 Factory, Uniswap v4 PoolManager, Pons v1/v2, pools.trade
-status: ready
+status: done
 phase: 1b-подготовка
 depends-on: 016
 executor: contract-registrar

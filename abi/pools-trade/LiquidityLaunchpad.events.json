@@ -1,0 +1,294 @@
+[
+ {
+  "type": "event",
+  "name": "TokenLaunched",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "poolId",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "finalPositionRecipient",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "key",
+    "type": "tuple",
+    "internalType": "struct PoolKey",
+    "components": [
+     {
+      "name": "currency0",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "currency1",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "fee",
+      "type": "uint24"
+     },
+     {
+      "name": "tickSpacing",
+      "type": "int24"
+     },
+     {
+      "name": "hooks",
+      "type": "address",
+      "internalType": "IHooks"
+     }
+    ],
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "TokenCreated",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "tokenAddress",
+    "type": "address",
+    "indexed": true
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "TokenDistributed",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "tokenAddress",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "strategy",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "FeesCollected",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "indexed": true
+   },
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "nativeAmount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "tokenAmount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "FeesForwarded",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "recipient",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "currency",
+    "type": "address",
+    "internalType": "Currency",
+    "indexed": true
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "TokensReceived",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "totalSupply",
+    "type": "uint128",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "BidSubmitted",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "id",
+    "type": "uint256",
+    "indexed": true
+   },
+   {
+    "name": "owner",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "priceQ96",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "amount",
+    "type": "uint128",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "CheckpointUpdated",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "blockNumber",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "clearingPriceQ96",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "cumulativeMps",
+    "type": "uint24",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "ClearingPriceUpdated",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "blockNumber",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "clearingPriceQ96",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "BidExited",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "bidId",
+    "type": "uint256",
+    "indexed": true
+   },
+   {
+    "name": "owner",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "tokensFilled",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "currencyRefunded",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "TokensClaimed",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "bidId",
+    "type": "uint256",
+    "indexed": true
+   },
+   {
+    "name": "owner",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "tokensFilled",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "AuctionCreated",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "auction",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "configData",
+    "type": "bytes",
+    "indexed": false
+   }
+  ]
+ }
+]

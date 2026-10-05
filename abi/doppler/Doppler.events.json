@@ -1,0 +1,254 @@
+[
+ {
+  "type": "event",
+  "name": "Create",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "asset",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "numeraire",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "initializer",
+    "type": "address",
+    "indexed": false
+   },
+   {
+    "name": "poolOrHook",
+    "type": "address",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Migrate",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "asset",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "pool",
+    "type": "address",
+    "indexed": true
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Collect",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "to",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "token",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Lock",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "pool",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "beneficiaries",
+    "type": "tuple[]",
+    "internalType": "struct BeneficiaryData[]",
+    "components": [
+     {
+      "name": "beneficiary",
+      "type": "address"
+     },
+     {
+      "name": "shares",
+      "type": "uint96"
+     }
+    ],
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Graduate",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "asset",
+    "type": "address",
+    "indexed": true
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "ModifyLiquidity",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "key",
+    "type": "tuple",
+    "internalType": "struct PoolKey",
+    "components": [
+     {
+      "name": "currency0",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "currency1",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "fee",
+      "type": "uint24"
+     },
+     {
+      "name": "tickSpacing",
+      "type": "int24"
+     },
+     {
+      "name": "hooks",
+      "type": "address",
+      "internalType": "IHooks"
+     }
+    ],
+    "indexed": false
+   },
+   {
+    "name": "params",
+    "type": "tuple",
+    "internalType": "struct ModifyLiquidityParams",
+    "components": [
+     {
+      "name": "tickLower",
+      "type": "int24"
+     },
+     {
+      "name": "tickUpper",
+      "type": "int24"
+     },
+     {
+      "name": "liquidityDelta",
+      "type": "int256"
+     },
+     {
+      "name": "salt",
+      "type": "bytes32"
+     }
+    ],
+    "indexed": false
+   }
+  ]
+ },
+ {
+  "type": "event",
+  "name": "Swap",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "sender",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "poolKey",
+    "type": "tuple",
+    "internalType": "struct PoolKey",
+    "components": [
+     {
+      "name": "currency0",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "currency1",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "fee",
+      "type": "uint24"
+     },
+     {
+      "name": "tickSpacing",
+      "type": "int24"
+     },
+     {
+      "name": "hooks",
+      "type": "address",
+      "internalType": "IHooks"
+     }
+    ],
+    "indexed": true
+   },
+   {
+    "name": "poolId",
+    "type": "bytes32",
+    "internalType": "PoolId",
+    "indexed": true
+   },
+   {
+    "name": "params",
+    "type": "tuple",
+    "internalType": "struct SwapParams",
+    "components": [
+     {
+      "name": "zeroForOne",
+      "type": "bool"
+     },
+     {
+      "name": "amountSpecified",
+      "type": "int256"
+     },
+     {
+      "name": "sqrtPriceLimitX96",
+      "type": "uint160"
+     }
+    ],
+    "indexed": false
+   },
+   {
+    "name": "amount0",
+    "type": "int128",
+    "indexed": false
+   },
+   {
+    "name": "amount1",
+    "type": "int128",
+    "indexed": false
+   },
+   {
+    "name": "hookData",
+    "type": "bytes",
+    "indexed": false
+   }
+  ]
+ }
+]
