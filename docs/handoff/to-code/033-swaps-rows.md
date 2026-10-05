@@ -1,5 +1,5 @@
 # 033 — Строки `hood.swaps` из декодера свопов v3/v4
-status: ready
+status: done
 phase: 1b
 depends-on: 022, 029
 executor: indexer-engineer

@@ -1,28 +1,42 @@
 //! Uniswap v3 / v4 `Swap` logs -> venue-agnostic [`PoolSwap`] with its position and tx context.
 //! Base of `hood.swaps`; the mapping to token/quote and buy/sell needs pool metadata (which
-//! currency is the meme token) and happens downstream.
+//! currency is the meme token) and lives in [`crate::swap_rows`].
 //!
 //! Every log is classified ([`SwapDecode`]): not a swap, a swap, or malformed (topic0 of a
 //! `Swap` but the topics/data do not decode). Malformed logs are counted, never dropped silently,
 //! so the data-auditor can prove `hood.swaps` complete.
 //!
-//! The emitter is not checked: filtering by the `verified` `PoolManager` / pool registry happens
-//! downstream (loader), like `registry: None` rows of `l1_inflows`. Any contract can emit a log
-//! with these topic0.
+//! The emitter is not checked here: any contract can emit a log with these topic0. The filter is
+//! the pool registry of the `hood.swaps` mapping ([`crate::pools`], [`crate::swap_rows`]): a swap
+//! becomes a row only if its pool (v3 emitter, or v4 `PoolManager` + pool id) is registered.
+
+use std::io::{self, Write};
 
 use alloy_primitives::{Address, B256, I256, U256};
 use alloy_sol_types::SolEvent;
 
 use crate::events::{v3, v4, TOPIC_SWAP_V3, TOPIC_SWAP_V4};
 use crate::model::{Block, Log, TxCtx};
+use crate::rows::{DecOr, HexOr};
 
 /// Which `Swap` event a [`PoolSwap`] comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SwapEvent {
     /// Uniswap v3 pool `Swap` (emitter = the pool).
     V3,
     /// Uniswap v4 `PoolManager` `Swap` (emitter = the `PoolManager`, pool = `pool_id`).
     V4,
+}
+
+impl SwapEvent {
+    /// Name for reports and the audit TSV.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V3 => "v3",
+            Self::V4 => "v4",
+        }
+    }
 }
 
 /// Venue-agnostic swap.
@@ -61,6 +75,65 @@ pub struct PoolSwap {
     pub tick: i32,
     /// v4 only: fee of this swap in pips (hundredths of a bip; dynamic-fee aware).
     pub fee_pips: Option<u32>,
+}
+
+impl PoolSwap {
+    /// Columns of the audit TSV ([`Self::write_tsv`]): every field of the decoded swap, amounts in
+    /// the pool-side sign convention. Not a ClickHouse table: the input of data-auditor checks
+    /// against raw logs (`hood.swaps` rows are [`crate::rows::SwapRow`]).
+    pub const COLUMNS: [&'static str; 16] = [
+        "block_number",
+        "tx_index",
+        "log_index",
+        "tx_hash",
+        "event",
+        "emitter",
+        "pool_id",
+        "sender",
+        "trader",
+        "router",
+        "amount0",
+        "amount1",
+        "sqrt_price_x96",
+        "liquidity",
+        "tick",
+        "fee_pips",
+    ];
+
+    /// Header line: [`Self::COLUMNS`] joined by tabs.
+    ///
+    /// # Errors
+    /// I/O errors of `w`.
+    pub fn write_tsv_header(w: &mut impl Write) -> io::Result<()> {
+        writeln!(w, "{}", Self::COLUMNS.join("\t"))
+    }
+
+    /// One TSV line in [`Self::COLUMNS`] order; absent `pool_id`/`router`/`fee_pips` are `''`.
+    ///
+    /// # Errors
+    /// I/O errors of `w`.
+    pub fn write_tsv(&self, w: &mut impl Write) -> io::Result<()> {
+        writeln!(
+            w,
+            "{}\t{}\t{}\t{:#x}\t{}\t{:#x}\t{}\t{:#x}\t{:#x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.block_number,
+            self.tx_index,
+            self.log_index,
+            self.tx_hash,
+            self.event.as_str(),
+            self.pool,
+            HexOr(self.pool_id, ""),
+            self.sender,
+            self.trader,
+            HexOr(self.router, ""),
+            self.amount0,
+            self.amount1,
+            self.sqrt_price_x96,
+            self.liquidity,
+            self.tick,
+            DecOr(self.fee_pips, ""),
+        )
+    }
 }
 
 /// Why a log with a `Swap` topic0 did not decode.

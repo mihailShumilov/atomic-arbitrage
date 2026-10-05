@@ -6,26 +6,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::addresses::{L2_WETH, L2_WETH_GATEWAY};
 use crate::model::parse_addr;
+pub use crate::registry::RegistryStatus;
 use crate::rows::GatewayStatus;
-
-/// Status of a registry entry, mirrors `references/contracts.md`. Only `verified` may be used for
-/// final conclusions; `observed` is research-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RegistryStatus {
-    Observed,
-    Verified,
-}
-
-impl RegistryStatus {
-    /// Name as in `contracts.md` and in the registry TSV.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Observed => "observed",
-            Self::Verified => "verified",
-        }
-    }
-}
 
 impl From<Option<RegistryStatus>> for GatewayStatus {
     /// `None` = gateway not in the registry.
@@ -149,10 +131,8 @@ impl GatewayRegistry {
                 "-" | "" => None,
                 s => Some(parse_addr(s).with_context(|| format!("line {ln}"))?),
             };
-            let status = match cols[2] {
-                "verified" => RegistryStatus::Verified,
-                "observed" => RegistryStatus::Observed,
-                other => bail!("gateway registry line {ln}: status {other:?} not allowed (verified|observed)"),
+            let Some(status) = RegistryStatus::parse(cols[2]) else {
+                bail!("gateway registry line {ln}: status {:?} not allowed (verified|observed)", cols[2]);
             };
             r.push_unique(GatewayEntry { gateway, l2_token, status })
                 .with_context(|| format!("gateway registry line {ln}: duplicate gateway"))?;

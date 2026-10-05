@@ -5,9 +5,12 @@
 //! - [`arbitrum`] — Nitro tx types and L1 address aliasing;
 //! - [`addresses`] — ONLY `verified` addresses of references/contracts.md;
 //! - [`events`] — event ABIs (`sol!`) and topic0 constants, [`ALL_TOPIC0`];
-//! - [`rows`] — ClickHouse row types and their TSV ([`rows::FundingEdge`]);
+//! - [`rows`] — ClickHouse row types and their TSV ([`rows::FundingEdge`], [`rows::SwapRow`]);
 //! - [`l1_inflows`] — inflows from L1 (`0x64`/`0x68`) -> `funding_edges`;
-//! - [`swaps`] — Uniswap v3/v4 `Swap` -> [`swaps::PoolSwap`].
+//! - [`swaps`] — Uniswap v3/v4 `Swap` -> [`swaps::PoolSwap`];
+//! - [`registry`] — status of caller-supplied registry entries (`verified`/`observed`);
+//! - [`pools`] — pool/token metadata for `hood.swaps` (caller input, also the emitter filter);
+//! - [`swap_rows`] — [`swaps::PoolSwap`] + [`pools`] -> [`rows::SwapRow`] (`hood.swaps`).
 //!
 //! Launchpad-specific events (Pons v1, Pons v2 curve, pools.trade) are TODO: their ABIs must come
 //! from official sources and be recorded in .claude/skills/hoodchain-mev/references/contracts.md
@@ -21,7 +24,10 @@ pub mod arbitrum;
 pub mod events;
 pub mod l1_inflows;
 pub mod model;
+pub mod pools;
+pub mod registry;
 pub mod rows;
+pub mod swap_rows;
 pub mod swaps;
 
 pub use events::{
