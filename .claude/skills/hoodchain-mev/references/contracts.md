@@ -9,6 +9,8 @@
 
 Поиск и проверку адресов ведёт агент `contract-registrar`.
 
+**Производные адреса (решение Михаила 2026-10-05).** Пул, параметры которого доказаны хешем от `verified` фабрики или менеджера — CREATE2 от Uniswap v3 Factory (`token0`, `token1`, `fee`) или `keccak(PoolKey)` = pool id от Uniswap v4 PoolManager, — получает статус `verified` без отдельной проверки на Blockscout. Поштучно такие пулы в реестр не вносятся, они живут в реестре пулов (`data/registry/pools-*.tsv`, вход `crates/decoders/src/pools.rs`) с указанием источника вывода.
+
 ## Процедура верификации
 
 1. Найти адрес в официальной документации (docs.robinhood.com/chain, документация Pons, pools.trade / Uniswap). Не с агрегаторов, не из чатов, не из поиска по картинкам.
