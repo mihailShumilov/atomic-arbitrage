@@ -161,3 +161,7 @@ srv# ls -l $F/$(date -u +%Y/%m/%d)/ | tail -n 2; cat $F/last_seq.txt            
 - `crates/recorder/src/{route,rawline,writer,recovery,connlog,app}.rs`
 - `crates/enricher/src/lib.rs` (одна строка, вызов `subtract`)
 - `.claude/skills/hoodchain-mev/references/data-model.md`
+
+## Решение Михаила (2026-10-05)
+
+Политика для не-UTF-8 `gaps.tsv` (чтение с заменой + WARN + `gaps_line_skipped`, без crash-loop) — **принята**; выкачена на сервер 2026-10-03 (сборка `6f9fc9c`).

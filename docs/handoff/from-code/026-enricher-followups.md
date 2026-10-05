@@ -111,3 +111,8 @@
 - `crates/enricher/src/atomic.rs`, `crates/enricher/src/lib.rs`, `crates/enricher/src/rpc.rs`, `crates/enricher/src/ranges.rs`, `crates/enricher/src/testdir.rs` (новый)
 - `crates/enricher/tests/common/mod.rs`, `crates/enricher/tests/exit_codes.rs`, `crates/enricher/tests/range.rs` (новый)
 - `.claude/skills/hoodchain-mev/references/data-model.md`, `deploy/README.md`
+
+## Решения Михаила (2026-10-05)
+
+- `--max-calls` в `deploy/enricher-gaps.service` — **4201** (1 вызов `eth_chainId` + 2 файла по 1 000 блоков + 200 вызовов запаса на повторы); юнит, комментарий и `deploy/README.md` обновлены. При `--rps 2` прогон ~35 мин, `TimeoutStartSec=55min` хватает.
+- Старые файлы enricher перепаковать с контрольной суммой — **да**. Выполнено координатором 2026-10-05 на Mac: 9 файлов (`data/blocks` 7, `data/logs` 1, `data/samples` 1; у последнего сумма уже была), содержимое после `zstd -dc` побайтно то же (sha256 до/после), `zstd -t` проходит, mtime сохранён. На сервере файлов enricher нет (`/srv/hood/data/blocks`, `/srv/hood/data/logs` пусты).
