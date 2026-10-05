@@ -1,5 +1,5 @@
 # 036 — Отдельная площадка для пулов Pons v2 (хук мем-пулов)
-status: ready
+status: done
 phase: 1b
 depends-on: 033, 035
 executor: indexer-engineer

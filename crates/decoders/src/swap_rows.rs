@@ -21,7 +21,9 @@
 //!   the same for both sides (approximation: rounding inside the pool is ignored).
 //! - **v4 with hooks**: `Swap` is emitted before `afterSwap`, so amounts are the AMM leg, not
 //!   necessarily what the trader paid/received (hook deltas are not in the event). Not a column;
-//!   counted in [`SwapRowCounters::v4_rows_with_hooks`] when the pool's hooks are known.
+//!   counted in [`SwapRowCounters::v4_rows_with_hooks`] when the pool's hooks are known. Pools of
+//!   the Pons v2 meme hook have venue `pons_v2_hook` (task 036, [`crate::pools`] module doc), so
+//!   analytics tells them apart by `venue`; other hooked pools are `other`.
 
 use std::collections::BTreeMap;
 

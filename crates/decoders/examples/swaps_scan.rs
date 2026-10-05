@@ -6,12 +6,15 @@
 //! `decoders::rows::SwapRow` and `decoders::swaps::PoolSwap`.
 //!
 //! cargo run -p decoders --example swaps_scan -- [--pools pools.tsv]... [--tokens tokens.tsv]...
-//!     [--no-builtin-tokens] [--v4-manager ADDR=observed|verified]... [--min-status verified|observed]
-//!     [--rows-out swaps.tsv] [--pool-swaps-out pool_swaps.tsv] FILE...
+//!     [--no-builtin-tokens] [--v4-manager ADDR=observed|verified]...
+//!     [--no-builtin-hooks] [--v4-hook ADDR=VENUE:observed|verified]...
+//!     [--min-status verified|observed] [--rows-out swaps.tsv] [--pool-swaps-out pool_swaps.tsv] FILE...
 //!
 //! Registry formats: `decoders::pools::PoolRegistry::parse_tsv`, `TokenRegistry::parse_tsv`.
-//! Nothing beyond the `verified` built-ins (native ETH, L2 WETH) is assumed: without `--pools` /
-//! `--v4-manager` every swap is counted as `no_pool_meta` and no row is written.
+//! Nothing beyond the `verified` built-ins (native ETH, L2 WETH; the Pons v2 meme hook ->
+//! venue `pons_v2_hook`, `decoders::pools::BUILTIN_V4_HOOKS`) is assumed: without `--pools` /
+//! `--v4-manager` every swap is counted as `no_pool_meta` and no row is written. Hooks are applied
+//! to pools of the TSVs and of `Initialize` logs alike (`decoders::pools` module doc).
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read};
@@ -37,30 +40,38 @@ fn status(s: &str) -> Result<RegistryStatus> {
     RegistryStatus::parse(s).with_context(|| format!("status {s:?} (verified|observed)"))
 }
 
+fn address(s: &str) -> Result<alloy_primitives::Address> {
+    s.parse().with_context(|| format!("address {s:?}"))
+}
+
 fn read(path: &str) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("read {path}"))
 }
 
 fn parse_args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
-    let mut pools = PoolRegistry::default();
+    let (mut pool_files, mut managers, mut hooks) = (Vec::new(), Vec::new(), Vec::new());
     let mut extra_tokens = Vec::new();
-    let mut builtin_tokens = true;
+    let (mut builtin_tokens, mut builtin_hooks) = (true, true);
     let mut min_status = RegistryStatus::Verified;
     let (mut rows_out, mut pool_swaps_out, mut files) = (None, None, Vec::new());
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--pools" => {
-                let p = args.next().context("--pools PATH")?;
-                pools.extend(PoolRegistry::parse_tsv(&read(&p)?).with_context(|| p.clone())?)?;
-            }
+            "--pools" => pool_files.push(args.next().context("--pools PATH")?),
             "--tokens" => extra_tokens.push(args.next().context("--tokens PATH")?),
             "--no-builtin-tokens" => builtin_tokens = false,
             "--v4-manager" => {
                 let v = args.next().context("--v4-manager ADDR=STATUS")?;
                 let (addr, st) = v.split_once('=').context("--v4-manager ADDR=observed|verified")?;
-                let addr: alloy_primitives::Address = addr.parse().with_context(|| format!("address {addr:?}"))?;
-                pools.allow_v4_manager(addr, status(st)?)?;
+                managers.push((address(addr)?, status(st)?));
+            }
+            "--no-builtin-hooks" => builtin_hooks = false,
+            "--v4-hook" => {
+                let v = args.next().context("--v4-hook ADDR=VENUE:STATUS")?;
+                let (addr, rest) = v.split_once('=').context("--v4-hook ADDR=VENUE:observed|verified")?;
+                let (venue, st) = rest.split_once(':').context("--v4-hook ADDR=VENUE:observed|verified")?;
+                let venue = Venue::parse(venue).with_context(|| format!("venue {venue:?}"))?;
+                hooks.push((address(addr)?, venue, status(st)?));
             }
             "--min-status" => min_status = status(&args.next().context("--min-status STATUS")?)?,
             "--rows-out" => rows_out = Some(args.next().context("--rows-out PATH")?),
@@ -68,6 +79,17 @@ fn parse_args() -> Result<Args> {
             s if s.starts_with("--") => bail!("unknown flag {s}"),
             _ => files.push(a),
         }
+    }
+    // Hooks before pools: the registry then classifies every pool on insert (either order works).
+    let mut pools = if builtin_hooks { PoolRegistry::builtin() } else { PoolRegistry::default() };
+    for (hook, venue, st) in hooks {
+        pools.allow_v4_hook(hook, venue, st)?;
+    }
+    for p in &pool_files {
+        pools.extend(PoolRegistry::parse_tsv(&read(p)?).with_context(|| p.clone())?).with_context(|| p.clone())?;
+    }
+    for (m, st) in managers {
+        pools.allow_v4_manager(m, st)?;
     }
     let mut tokens = if builtin_tokens { TokenRegistry::builtin() } else { TokenRegistry::default() };
     for p in &extra_tokens {
@@ -160,6 +182,9 @@ fn main() -> Result<()> {
     );
     for (m, s) in pools.v4_managers() {
         println!("  v4 manager {m:#x} {}", s.as_str());
+    }
+    for h in pools.v4_hooks() {
+        println!("  v4 hook {:#x} -> {} {}", h.hook(), h.venue().as_str(), h.status().as_str());
     }
     let inits: Vec<String> = inits.iter().map(|(k, v)| format!("{}={v}", k.as_str())).collect();
     println!("initialize: {}", if inits.is_empty() { "none".to_owned() } else { inits.join(" ") });

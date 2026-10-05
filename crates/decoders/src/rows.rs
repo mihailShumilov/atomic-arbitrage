@@ -198,7 +198,8 @@ impl FundingEdge {
     }
 }
 
-/// `hood.swaps.venue` / `hood.tokens.venue` (Enum8, sql/004). Discriminants are the Enum8 values.
+/// `hood.swaps.venue` / `hood.tokens.venue` (Enum8, sql/005). Discriminants are the Enum8 values;
+/// a new venue is a new value (never a renumbering) plus a `MODIFY COLUMN` migration of both tables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(i8)]
 pub enum Venue {
@@ -210,14 +211,18 @@ pub enum Venue {
     UniV4 = 4,
     /// pools.trade. Assigned only from a pool registry entry.
     PoolsTrade = 5,
+    /// Uniswap v4 pool whose `PoolKey.hooks` is the Pons v2 meme hook (sql/005, task 036). Set by
+    /// [`crate::pools::PoolRegistry`] from a hook allowed with this venue. Rows carry only the AMM
+    /// leg: the v4 `Swap` is emitted before `afterSwap`, hook fees and deltas are not in it.
+    PonsV2Hook = 6,
     /// Known pool, venue not established (e.g. a v4 pool with a hook that is not in the registry).
     Other = 9,
 }
 
 impl Venue {
     /// Every variant, in Enum8 value order.
-    pub const ALL: [Self; 6] =
-        [Self::PonsV1, Self::PonsV2Curve, Self::UniV3, Self::UniV4, Self::PoolsTrade, Self::Other];
+    pub const ALL: [Self; 7] =
+        [Self::PonsV1, Self::PonsV2Curve, Self::UniV3, Self::UniV4, Self::PoolsTrade, Self::PonsV2Hook, Self::Other];
 
     /// Enum8 name.
     #[must_use]
@@ -228,6 +233,7 @@ impl Venue {
             Self::UniV3 => "uni_v3",
             Self::UniV4 => "uni_v4",
             Self::PoolsTrade => "pools_trade",
+            Self::PonsV2Hook => "pons_v2_hook",
             Self::Other => "other",
         }
     }
@@ -331,7 +337,7 @@ pub struct SwapRow {
 
 impl SwapRow {
     /// Column order of the TSV line (and of the loader's `INSERT … (columns) FORMAT TSV`); equal
-    /// to the last `CREATE TABLE hood.swaps*` (sql/004, checked by a test). Types in ClickHouse:
+    /// to the current `hood.swaps` (sql/004 + sql/005, checked by a test). Types in ClickHouse:
     /// `block_number UInt64`, `tx_index`/`log_index UInt32`, `venue Enum8`, `pool`/`token`/`quote`/
     /// `trader String`, `router String DEFAULT ''`, `side Enum8`, `token_amount_raw`/
     /// `quote_amount_raw String` (decimal), `quote_amount`/`price`/`fee_quote Float64`.
@@ -477,9 +483,11 @@ mod tests {
         enum8_values(&last.unwrap_or_else(|| panic!("no `{column} Enum8(` in sql/")))
     }
 
-    /// Column lines of the LAST `CREATE TABLE hood.<table>[_NNN]` (migrations build `<table>_NNN`
-    /// and RENAME it), checking that no later `ALTER TABLE hood.<table>` changes it.
-    fn last_create_table(table: &str) -> Vec<String> {
+    /// Current column lines of `hood.<table>`: the body of the LAST `CREATE TABLE
+    /// hood.<table>[_NNN]` (migrations build `<table>_NNN` and RENAME it) with every later
+    /// `ALTER TABLE [IF EXISTS] hood.<table> MODIFY COLUMN [IF EXISTS] <column> <type>;` applied in
+    /// place (sql/005). Any other later ALTER of the table fails the test: teach this helper first.
+    fn current_table(table: &str) -> Vec<String> {
         let lines = sql_lines();
         let name = format!("hood.{table}");
         let is_create = |l: &str| {
@@ -493,9 +501,55 @@ mod tests {
                 })
         };
         let start = lines.iter().rposition(|l| is_create(l)).unwrap_or_else(|| panic!("no CREATE TABLE {name}*"));
-        let later_alter = lines[start..].iter().any(|l| l.contains(&format!("ALTER TABLE {name} ")));
-        assert!(!later_alter, "ALTER of {table} after its last CREATE: update this test");
-        lines[start + 1..].iter().map(|l| l.trim().to_owned()).take_while(|l| !l.starts_with(')')).collect()
+        let mut body: Vec<String> =
+            lines[start + 1..].iter().map(|l| l.trim().to_owned()).take_while(|l| !l.starts_with(')')).collect();
+        apply_alters(table, &mut body, &lines[start..]);
+        body
+    }
+
+    /// Applies to `body` (column lines of `hood.<table>`) every `ALTER TABLE [IF EXISTS]
+    /// hood.<table> MODIFY COLUMN [IF EXISTS] <column> <type>;` of `lines`; panics on any other
+    /// ALTER of the table.
+    fn apply_alters(table: &str, body: &mut [String], lines: &[String]) {
+        let name = format!("hood.{table}");
+        // ALTERs are found on the token stream of everything after the CREATE (any case, any line
+        // breaks, `IF EXISTS`), so no form of ALTER of this table slips through (review 036, Р1).
+        let tokens: Vec<&str> = lines.iter().flat_map(|l| l.split_whitespace()).collect();
+        let is = |i: usize, kw: &str| tokens.get(i).is_some_and(|t| t.eq_ignore_ascii_case(kw));
+        for i in (0..tokens.len()).filter(|&i| is(i, "ALTER") && is(i + 1, "TABLE")) {
+            let mut j = i + 2;
+            if is(j, "IF") && is(j + 1, "EXISTS") {
+                j += 2;
+            }
+            if tokens.get(j).map(|t| t.trim_end_matches(';')) != Some(name.as_str()) {
+                continue;
+            }
+            assert!(
+                is(j + 1, "MODIFY") && is(j + 2, "COLUMN"),
+                "unsupported ALTER of {table} after its last CREATE (only MODIFY COLUMN): update this test"
+            );
+            j += 3;
+            if is(j, "IF") && is(j + 1, "EXISTS") {
+                j += 2;
+            }
+            let end = (j..tokens.len()).find(|&k| tokens[k].ends_with(';')).unwrap_or(tokens.len() - 1);
+            let def = tokens[j..=end].join(" ");
+            let def = def.trim_end_matches(';');
+            assert!(
+                !tokens[j + 1..=end].iter().any(|t| {
+                    ["MODIFY", "ADD", "DROP", "RENAME", "COMMENT", "CLEAR", "MATERIALIZE"]
+                        .iter()
+                        .any(|kw| t.eq_ignore_ascii_case(kw))
+                }),
+                "ALTER of {table} with several commands: update this test"
+            );
+            let column = def.split_whitespace().next().expect("MODIFY COLUMN without a column");
+            let slot = body
+                .iter_mut()
+                .find(|c| c.split_whitespace().next() == Some(column))
+                .unwrap_or_else(|| panic!("MODIFY COLUMN of unknown {table}.{column}"));
+            *slot = format!("{def},");
+        }
     }
 
     fn column_names(body: &[String]) -> Vec<&str> {
@@ -516,16 +570,16 @@ mod tests {
     }
 
     /// `venue` and `side` of the current `hood.swaps`, and `venue` of `hood.tokens` (one type for
-    /// one concept, sql/004), equal the Rust enums.
+    /// one concept, sql/004; `pons_v2_hook` added by sql/005 MODIFY COLUMN), equal the Rust enums.
     #[test]
     fn swaps_enum8_in_sql_equals_rust_enums() {
         let venues = rust_enum8(&Venue::ALL, Venue::as_str, Venue::enum8);
         for table in ["swaps", "tokens"] {
-            let body = last_create_table(table);
+            let body = current_table(table);
             let line = body.iter().find(|l| is_enum8_of(l, "venue")).unwrap_or_else(|| panic!("{table}.venue"));
             assert_eq!(enum8_values(line), venues, "{table}.venue");
         }
-        let body = last_create_table("swaps");
+        let body = current_table("swaps");
         let side = body.iter().find(|l| is_enum8_of(l, "side")).expect("swaps.side");
         assert_eq!(enum8_values(side), rust_enum8(&Side::ALL, Side::as_str, Side::enum8));
         for v in Venue::ALL {
@@ -535,17 +589,45 @@ mod tests {
     }
 
     /// Column order of the LAST `CREATE TABLE hood.funding_edges*` (sql/003: built as
-    /// funding_edges_003, then RENAME) equals COLUMNS, and no later ALTER changes the table.
+    /// funding_edges_003, then RENAME) equals COLUMNS (later ALTERs: see [`current_table`]).
     #[test]
     fn funding_edges_column_order_in_sql_equals_columns() {
-        assert_eq!(column_names(&last_create_table("funding_edges")), FundingEdge::COLUMNS);
+        assert_eq!(column_names(&current_table("funding_edges")), FundingEdge::COLUMNS);
     }
 
-    /// Column order of the LAST `CREATE TABLE hood.swaps*` (sql/004: swaps_004, then RENAME)
-    /// equals COLUMNS, and no later ALTER changes the table.
+    /// Column order of the current `hood.swaps` (sql/004: swaps_004, then RENAME; sql/005 only
+    /// modifies the type of `venue`) equals COLUMNS.
+    fn sql(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// Synthetic SQL: multi-line, lower-case and `IF EXISTS` forms of MODIFY COLUMN are applied;
+    /// other tables are ignored.
+    #[test]
+    fn apply_alters_finds_every_form() {
+        let mut body = vec!["a UInt8,".to_owned(), "b Enum8('x' = 1),".to_owned()];
+        let text = "alter table if exists hood.t\n  MODIFY COLUMN IF EXISTS b Enum8('x' = 1, 'y' = 2);\n\
+                    ALTER TABLE hood.t2 ADD COLUMN c UInt8;\nALTER TABLE hood.t MODIFY COLUMN a UInt16;";
+        apply_alters("t", &mut body, &sql(text));
+        assert_eq!(body, ["a UInt16,", "b Enum8('x' = 1, 'y' = 2),"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported ALTER")]
+    fn apply_alters_rejects_other_commands() {
+        apply_alters("t", &mut ["a UInt8,".to_owned()], &sql("ALTER TABLE\nhood.t\nADD COLUMN c UInt8;"));
+    }
+
+    #[test]
+    #[should_panic(expected = "several commands")]
+    fn apply_alters_rejects_several_commands() {
+        let text = "ALTER TABLE hood.t MODIFY COLUMN a UInt16, DROP COLUMN b;";
+        apply_alters("t", &mut ["a UInt8,".to_owned(), "b UInt8,".to_owned()], &sql(text));
+    }
+
     #[test]
     fn swaps_column_order_in_sql_equals_columns() {
-        assert_eq!(column_names(&last_create_table("swaps")), SwapRow::COLUMNS);
+        assert_eq!(column_names(&current_table("swaps")), SwapRow::COLUMNS);
     }
 
     /// Weak check (a column name defined in any table passes): catches typos in COLUMNS. The
