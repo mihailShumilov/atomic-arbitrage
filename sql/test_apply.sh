@@ -18,6 +18,7 @@ cp "$HERE/apply.sh" "$T/sql/apply.sh"
 cat > "$T/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 for a in "$@"; do case "$a" in */ping) exit 0 ;; esac; done
+printf '%s\n' "${!#}" >> "$FAKE_DIR/urls"   # last argument = the URL apply.sh connects to
 q=$(cat)
 case "$q" in
     *broken_guard*) echo "Code: 47. DB::Exception: Unknown identifier broken_guard"; exit 22 ;;
@@ -127,5 +128,23 @@ case "$out" in *"are banned"*) check ;; *) fail "banned + guard 1: message: $out
 # ...but a column or a value named like them is fine.
 run "" "CREATE TABLE t (exchange String, replace UInt8) ENGINE = Memory; SELECT 'EXCHANGE x';"
 [ "$rc" -eq 0 ] || fail "banned false positive: rc=$rc $out"; check
+
+# Н1 (review 032 data-auditor): CLICKHOUSE_URL is read from ENV_FILE too; the environment wins;
+# without a URL the port comes from CLICKHOUSE_HTTP_PORT (file), default 18123.
+url_run() {
+    rm -f "$T/urls" "$T"/sql/[0-9]*.sql
+    printf 'SELECT 1;\n' > "$T/sql/001_t.sql"
+    printf '%b' "$1" > "$T/env"
+    set +e; out=$(env -u CLICKHOUSE_URL -u CLICKHOUSE_HTTP_PORT ENV_FILE="$T/env" ${2:+CLICKHOUSE_URL="$2"} bash "$T/sql/apply.sh" --dry-run 2>&1); rc=$?; set -e
+    urls=$(sort -u "$T/urls" 2>/dev/null || true)
+}
+url_run 'CLICKHOUSE_PASSWORD=x\nCLICKHOUSE_URL=http://127.0.0.1:28999/\n'
+[ "$rc" -eq 0 ] && [ "$urls" = "http://127.0.0.1:28999/" ] || fail "URL from env file: rc=$rc urls=$urls $out"; check
+url_run 'CLICKHOUSE_PASSWORD=x\nCLICKHOUSE_URL=http://127.0.0.1:28999/\n' "http://127.0.0.1:28111/"
+[ "$urls" = "http://127.0.0.1:28111/" ] || fail "environment must win: urls=$urls"; check
+url_run 'CLICKHOUSE_PASSWORD=x\nCLICKHOUSE_HTTP_PORT=28222\n'
+[ "$urls" = "http://127.0.0.1:28222/" ] || fail "port from env file: urls=$urls"; check
+url_run 'CLICKHOUSE_PASSWORD=x\n'
+[ "$urls" = "http://127.0.0.1:18123/" ] || fail "default port: urls=$urls"; check
 
 echo "ok: $n checks"

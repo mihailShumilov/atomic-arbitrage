@@ -22,7 +22,8 @@
 crates/hood-core    общие типы, константы, разбор конверта фида, детектор дыр
 crates/recorder     фид → data/feed/…/feed-*.tsv.zst, gaps.tsv, last_seq.txt
 crates/enricher     RPC: блоки(full) + receipts → data/blocks/*.jsonl.zst
-crates/decoders     события Uniswap v3/v4, ERC-20; launchpad'ы — TODO
+crates/decoders     модель блока, свопы v3/v4, входы с L1, строки для ClickHouse; launchpad'ы — TODO
+crates/loader       загрузка блоков, времени прихода из фида и дыр фида в ClickHouse
 sql/                схема ClickHouse (миграции: 001_, 002_, …)
 analytics/          Python: исследования и бэктесты (после PASS от data-auditor)
 docs/               общая папка с Cowork: STATE.md, costs.md, decisions/, research/,

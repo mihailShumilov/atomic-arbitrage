@@ -1,5 +1,5 @@
 # 032 — Загрузчик в ClickHouse (локально): фид, блоки, рёбра L1
-status: ready
+status: done
 phase: 1b
 depends-on: 022, 023, 029
 executor: indexer-engineer

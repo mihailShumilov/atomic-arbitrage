@@ -90,7 +90,7 @@ pub struct EnvSeqs {
 /// The one place that derives `seq_max` and the holes from an envelope's
 /// messages (task 025 item 1, remark Р3 of the 021 review): used for live
 /// frames ([`route_text`]) and for raw lines read back from disk
-/// (`rawline::RawLine::seqs`). None for an envelope without messages.
+/// (`rawline::line_seqs`). None for an envelope without messages.
 pub fn envelope_seqs(env: &FeedEnvelope) -> Option<EnvSeqs> {
     let (seq_first, seq_last) = env.seq_range()?;
     let seqs: Vec<u64> = env.messages.iter().map(|m| m.sequence_number).collect();

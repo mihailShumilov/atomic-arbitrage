@@ -19,7 +19,7 @@ use hood_core::ranges::{parse_ranges_file_lenient, subtract, to_lines, GapRow, L
 use tracing::warn;
 
 use crate::layout::{list_feed_files, read_state, GAPS_FILE, STATE_FILE, TORN_DIR};
-use crate::rawline::{file_seq_max, for_each_raw_line};
+use crate::rawline::{file_seq_max, for_each_raw_line, line_seqs};
 use crate::seqtrack::{Seen, SeqTracker};
 
 // fs helpers (atomic write, fsync of a directory, append + fsync) are in
@@ -174,7 +174,7 @@ pub fn read_gap_ranges(out: &Path) -> Result<GapsRead> {
 pub fn scan_seq_holes(path: &Path, seq: &mut SeqTracker, holes: &mut Vec<GapRow>) -> Result<Option<u64>> {
     let mut best: Option<u64> = None;
     for_each_raw_line(path, |l| {
-        let Some(s) = l.seqs() else { return };
+        let Some(s) = line_seqs(&l) else { return };
         best = Some(best.map_or(s.seq_max, |b| b.max(s.seq_max)));
         // A stale line is skipped by the writer: it is never on disk.
         if let Seen::Fresh { seam, intra } = seq.observe(l.seq_first, s.seq_max, &s.intra_gaps) {

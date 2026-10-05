@@ -6,11 +6,13 @@
 //! - `header.timestamp` has 1-second resolution (~10 L2 blocks per second),
 //!   so ordering must always use (block_number, tx_index, log_index).
 //!
-//! Modules (pure logic and thin std helpers shared by recorder and enricher):
-//! [`ranges`] (block ranges, `gaps.tsv` / `filled.tsv`), [`http`]
+//! Modules (pure logic and thin std helpers shared by recorder, enricher and
+//! loader): [`ranges`] (block ranges, `gaps.tsv` / `filled.tsv`), [`feedline`]
+//! (one line of the raw feed on disk), [`http`]
 //! (`Retry-After`), [`fsutil`] (atomic write, fsync, append), [`hex`]
 //! (JSON-RPC quantities), [`jitter`] (random spread of retry pauses).
 
+pub mod feedline;
 pub mod fsutil;
 pub mod hex;
 pub mod http;

@@ -6,7 +6,7 @@
 #   sql/apply.sh --dry-run    list what would be applied, change nothing
 #
 # Connection (environment wins over .env; .env is parsed, never executed):
-#   CLICKHOUSE_URL        default http://127.0.0.1:${CLICKHOUSE_HTTP_PORT:-18123}/
+#   CLICKHOUSE_URL        default http://127.0.0.1:${CLICKHOUSE_HTTP_PORT:-18123}/ (also read from .env)
 #   CLICKHOUSE_USER       default hood
 #   CLICKHOUSE_PASSWORD   required; sent in a curl config on a pipe, never in argv
 #   ENV_FILE              default <repo>/.env
@@ -77,7 +77,10 @@ CH_USER=${CH_USER:-hood}
 CH_PASSWORD=${CLICKHOUSE_PASSWORD:-$(env_get CLICKHOUSE_PASSWORD)}
 [ -n "$CH_PASSWORD" ] || die "CLICKHOUSE_PASSWORD is not set (environment or $ENV_FILE)"
 CH_PORT=${CLICKHOUSE_HTTP_PORT:-$(env_get CLICKHOUSE_HTTP_PORT)}
-CH_URL=${CLICKHOUSE_URL:-http://127.0.0.1:${CH_PORT:-18123}/}
+# CLICKHOUSE_URL from the environment, then from .env (like the loader, crates/loader/src/config.rs;
+# review 032 data-auditor, Н1: an env file pointing at a temporary server must not fall through to 18123).
+CH_URL=${CLICKHOUSE_URL:-$(env_get CLICKHOUSE_URL)}
+CH_URL=${CH_URL:-http://127.0.0.1:${CH_PORT:-18123}/}
 
 # curl config with credentials, produced by builtins only (not visible in ps).
 curl_auth() {

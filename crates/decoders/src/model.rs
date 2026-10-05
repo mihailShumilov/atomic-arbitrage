@@ -22,6 +22,12 @@ pub struct Block {
     pub number: u64,
     /// `block.hash`.
     pub hash: B256,
+    /// `block.timestamp`, unix seconds (1 s resolution, ~10 blocks per second: never order by it).
+    pub timestamp: u64,
+    /// `block.l1BlockNumber`: the L1 (Ethereum) block the sequencer saw, not an L2 number.
+    pub l1_block_number: u64,
+    /// `block.baseFeePerGas`, wei.
+    pub base_fee_per_gas: U256,
     /// Transactions in block order (`txs[i].index == i`, checked).
     pub txs: Vec<Tx>,
 }
@@ -47,6 +53,16 @@ pub struct Tx {
     pub value: U256,
     /// Receipt `status == 0x1`. A receipt without `status` is an error, not a failure.
     pub status: bool,
+    /// First 4 bytes of `input`; `None` if the input is shorter than 4 bytes.
+    pub selector: Option<[u8; 4]>,
+    /// Length of `input` in bytes.
+    pub input_len: u32,
+    /// Receipt `gasUsed` (on Arbitrum it includes `gasUsedForL1`).
+    pub gas_used: u64,
+    /// Receipt `gasUsedForL1` (Arbitrum: the L1 data part of `gasUsed`).
+    pub gas_used_for_l1: u64,
+    /// Receipt `effectiveGasPrice`, wei.
+    pub effective_gas_price: U256,
     /// Arbitrum-specific fields of L1-message transactions.
     pub arb: ArbFields,
     /// Receipt logs in log-index order.
@@ -134,7 +150,16 @@ pub fn parse_block_line(line: &str) -> Result<Block> {
         }
         txs.push(tx);
     }
-    Ok(Block { number: n, hash, txs })
+    Ok(Block {
+        number: n,
+        hash,
+        timestamp: quantity_u64(&raw.block.timestamp).with_context(|| format!("block {n}: block.timestamp"))?,
+        l1_block_number: quantity_u64(&raw.block.l1_block_number)
+            .with_context(|| format!("block {n}: block.l1BlockNumber"))?,
+        base_fee_per_gas: quantity_u256(&raw.block.base_fee_per_gas)
+            .with_context(|| format!("block {n}: block.baseFeePerGas"))?,
+        txs,
+    })
 }
 
 fn parse_tx(position: usize, block_hash: B256, tx: &RawTx, rc: &RawReceipt) -> Result<Tx> {
@@ -154,6 +179,7 @@ fn parse_tx(position: usize, block_hash: B256, tx: &RawTx, rc: &RawReceipt) -> R
         1 => true,
         s => bail!("receipt status {s}"),
     };
+    let (selector, input_len) = input_head(&tx.input).context("input")?;
     let logs = rc
         .logs
         .iter()
@@ -167,6 +193,11 @@ fn parse_tx(position: usize, block_hash: B256, tx: &RawTx, rc: &RawReceipt) -> R
         to: tx.to.as_deref().map(parse_addr).transpose()?,
         value: quantity_u256(&tx.value)?,
         status,
+        selector,
+        input_len,
+        gas_used: quantity_u64(&rc.gas_used).context("receipt gasUsed")?,
+        gas_used_for_l1: quantity_u64(&rc.gas_used_for_l1).context("receipt gasUsedForL1")?,
+        effective_gas_price: quantity_u256(&rc.effective_gas_price).context("receipt effectiveGasPrice")?,
         arb: parse_arb(ty, tx)?,
         logs,
     })
@@ -252,6 +283,23 @@ pub(crate) fn parse_b256(s: &str) -> Result<B256> {
     Ok(B256::from_slice(&hex::decode(h).map_err(|e| anyhow!("bad hash {s:?}: {e}"))?))
 }
 
+/// Selector and byte length of RPC data (`0x` + an even number of hex digits) without decoding
+/// all of it: transaction inputs can be large and only their head is stored.
+fn input_head(s: &str) -> Result<(Option<[u8; 4]>, u32)> {
+    let h = hex_digits(s, "data")?;
+    ensure!(h.len() % 2 == 0, "bad data {s:?}: odd number of hex digits");
+    let len = u32::try_from(h.len() / 2).map_err(|_| anyhow!("data of {} hex digits does not fit u32", h.len()))?;
+    let selector = match h.get(..8) {
+        Some(head) => {
+            let mut sel = [0u8; 4];
+            hex::decode_to_slice(head, &mut sel).map_err(|e| anyhow!("bad data {s:?}: {e}"))?;
+            Some(sel)
+        }
+        None => None,
+    };
+    Ok((selector, len))
+}
+
 /// RPC data: `0x` + an even number of hex digits (`"0x"` = empty).
 pub(crate) fn parse_bytes(s: &str) -> Result<Bytes> {
     let h = hex_digits(s, "data")?;
@@ -269,10 +317,18 @@ struct RawLine {
     receipts: Vec<RawReceipt>,
 }
 
+/// Fields added in task 032 (`timestamp`, `l1BlockNumber`, `baseFeePerGas`; tx `input`; receipt
+/// `gasUsed`, `gasUsedForL1`, `effectiveGasPrice`) are required: present in every block of
+/// data/blocks + data/samples (2 712 blocks, 34 344 tx) and of the test fixtures, checked
+/// 2026-10-05 with a Python scan of the raw files.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawBlock {
     number: String,
     hash: String,
+    timestamp: String,
+    l1_block_number: String,
+    base_fee_per_gas: String,
     transactions: Vec<RawTx>,
 }
 
@@ -286,6 +342,7 @@ struct RawTx {
     #[serde(default)]
     to: Option<String>,
     value: String,
+    input: String,
     transaction_index: String,
     // 0x64
     #[serde(default)]
@@ -316,6 +373,9 @@ struct RawReceipt {
     /// Required: on Robinhood Chain every receipt has it (2026-10-02: 2 712 blocks of
     /// data/blocks + data/samples, and the 017 fixtures).
     status: String,
+    gas_used: String,
+    gas_used_for_l1: String,
+    effective_gas_price: String,
     logs: Vec<RawLog>,
 }
 
@@ -347,6 +407,18 @@ mod tests {
         assert!(quantity_u256("0x 1").is_err());
         assert!(quantity_u32("0x100000000").is_err());
         assert_eq!(quantity_u64("0xffffffffffffffff").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn input_head_takes_selector_and_length() {
+        assert_eq!(input_head("0x").unwrap(), (None, 0));
+        assert_eq!(input_head("0xa9059c").unwrap(), (None, 3));
+        assert_eq!(input_head("0xa9059cbb").unwrap(), (Some([0xa9, 0x05, 0x9c, 0xbb]), 4));
+        assert_eq!(input_head("0xA9059CBB00").unwrap(), (Some([0xa9, 0x05, 0x9c, 0xbb]), 5));
+        assert!(input_head("a9059cbb").is_err());
+        assert!(input_head("0xa9059cb").is_err());
+        assert!(input_head("0xzz059cbb").is_err());
+        assert!(input_head("0xa9059cbbz0").is_err());
     }
 
     #[test]

@@ -507,7 +507,7 @@ mod tests {
             }
             let text = zstd::stream::decode_all(complete).unwrap();
             for l in text.split(|&b| b == b'\n').filter_map(crate::rawline::parse_raw_line) {
-                if let Some(s) = l.seqs() {
+                if let Some(s) = crate::rawline::line_seqs(&l) {
                     out.push((l.recv_ns, s.seq_max));
                 }
             }

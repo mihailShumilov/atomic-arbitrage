@@ -276,6 +276,35 @@ impl fmt::Display for GapRow {
     }
 }
 
+/// Rows of `gaps.tsv` with their `recv_ns` (the ClickHouse loader, task 032).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedGaps<'a> {
+    /// Rows of all complete lines, in file order (duplicates kept).
+    pub rows: Vec<GapRow>,
+    /// Unterminated last line that was ignored (the caller logs a WARN).
+    pub unterminated: Option<&'a str>,
+}
+
+/// Strict read of `gaps.tsv` with the third column: the same policy as
+/// [`parse_ranges_file`] (unterminated last line cut off and returned, a
+/// broken `\n`-terminated line is an error), and `recv_ns` must be a decimal
+/// number too. Columns after the third are not looked at.
+///
+/// # Errors
+/// The first broken `\n`-terminated line, as a [`LineError`].
+pub fn parse_gaps_file(text: &str) -> Result<ParsedGaps<'_>, LineError> {
+    let (complete, unterminated) = split_unterminated(text);
+    let mut rows = Vec::new();
+    for (i, line) in complete.lines().enumerate() {
+        let err = |reason| LineError { line_no: i + 1, line: line.to_owned(), reason };
+        let Some(range) = parse_range_line(line).map_err(err)? else { continue };
+        let recv = line.trim().split('\t').nth(2).ok_or_else(|| err(LineFault::MissingColumn("recv_ns")))?;
+        let recv_ns = recv.trim().parse::<u128>().map_err(|_| err(LineFault::NotANumber("recv_ns")))?;
+        rows.push(GapRow { range, recv_ns });
+    }
+    Ok(ParsedGaps { rows, unterminated })
+}
+
 /// One `filled.tsv` row: `from \t to \t file_name \t filled_unix_s`
 /// (`Display` gives the line without `\n`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +405,32 @@ mod tests {
         assert_eq!(e.reason, LineFault::BadRange(RangeError { from: 9, to: 5 }));
         assert_eq!(parse_ranges_file("9\n").unwrap_err().reason, LineFault::MissingColumn("to"));
         assert_eq!(parse_ranges_file("x\t5\n").unwrap_err().reason, LineFault::NotANumber("from"));
+    }
+
+    #[test]
+    fn parses_gaps_with_recv_ns() {
+        let t = "100\t199\t1790000000000000000\n# c\n\n100\t199\t1790000000000000005\n300\t300\t7\textra\n400\t4";
+        let p = parse_gaps_file(t).unwrap();
+        assert_eq!(
+            p.rows,
+            vec![
+                GapRow { range: r(100, 199), recv_ns: 1790000000000000000 },
+                GapRow { range: r(100, 199), recv_ns: 1790000000000000005 },
+                GapRow { range: r(300, 300), recv_ns: 7 },
+            ]
+        );
+        assert_eq!(p.unterminated, Some("400\t4"));
+        let e = parse_gaps_file("1\t2\t3\n5\t6\n").unwrap_err();
+        assert_eq!((e.line_no, e.reason), (2, LineFault::MissingColumn("recv_ns")));
+        assert_eq!(parse_gaps_file("5\t6\tx\n").unwrap_err().reason, LineFault::NotANumber("recv_ns"));
+        assert_eq!(parse_gaps_file("5\t6\t\n").unwrap_err().reason, LineFault::MissingColumn("recv_ns"));
+        assert_eq!(
+            parse_gaps_file("6\t5\t1\n").unwrap_err().reason,
+            LineFault::BadRange(RangeError { from: 6, to: 5 })
+        );
+        // Same line as in the recorder's own Display.
+        let row = GapRow { range: r(77169135, 77169712), recv_ns: 1790837152631000000 };
+        assert_eq!(parse_gaps_file(&format!("{row}\n")).unwrap().rows, vec![row]);
     }
 
     /// Task 025: the typed reason prints exactly the texts of the former
