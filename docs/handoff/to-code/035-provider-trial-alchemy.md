@@ -1,5 +1,5 @@
 # 035 — Замер провайдера на бесплатном ключе Alchemy (решение 0002) + метаданные пулов
-status: in-progress
+status: done
 phase: 1b-подготовка
 depends-on: 006, 033
 executor: indexer-engineer

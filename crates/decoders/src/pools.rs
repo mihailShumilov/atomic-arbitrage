@@ -4,9 +4,9 @@
 //!
 //! Everything here is caller input, like [`crate::l1_inflows::GatewayRegistry`]. Nothing is
 //! hardcoded beyond the `verified` entries of [`crate::addresses`] (and native ETH). In
-//! particular the Uniswap v4 `PoolManager` is `observed` (references/contracts.md, 2026-09-28)
-//! and is NOT built in: a caller that wants pools from v4 `Initialize` logs names the manager
-//! with [`PoolRegistry::allow_v4_manager`] and its status.
+//! particular the Uniswap v4 `PoolManager` is NOT built in (it is `verified` since 2026-10-05,
+//! references/contracts.md, but kept as caller input): a caller that wants pools from v4
+//! `Initialize` logs names the manager with [`PoolRegistry::allow_v4_manager`] and its status.
 //!
 //! The registry is also the emitter filter of `hood.swaps`: a swap gets a row only if its pool
 //! (v3: the emitting pool; v4: the pair emitting `PoolManager` + pool id) is in the registry, so a
@@ -293,7 +293,7 @@ pub struct TokenRegistry {
 }
 
 /// Quote rank of the built-in quotes (WETH and native ETH share it: an ETH/WETH pool has no
-/// quote and is skipped as ambiguous). Rank 1 is left for a stablecoin (USDG is `todo`).
+/// quote and is skipped as ambiguous). Rank 1 is left for a stablecoin (USDG, `verified` since 2026-10-05, passed as caller input).
 pub const ETH_QUOTE_RANK: u8 = 2;
 
 impl TokenRegistry {
