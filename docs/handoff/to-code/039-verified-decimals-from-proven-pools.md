@@ -1,5 +1,5 @@
 # 039 — Decimals токенов из доказанных пулов → verified
-status: ready
+status: done
 phase: 1b
 depends-on: 035, 037
 executor: indexer-engineer
