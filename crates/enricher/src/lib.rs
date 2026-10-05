@@ -59,9 +59,10 @@ use tracing::{info, warn};
 
 use hood_core::hex::quantity;
 use hood_core::ranges::{self as hr, Range};
+use hood_core::redact::redact_url;
 
 use crate::atomic::OutDirLock;
-use crate::rpc::{redact_url, RetryPolicy, Rpc, M_CHAIN_ID};
+use crate::rpc::{RetryPolicy, Rpc, M_CHAIN_ID};
 use crate::stats::{Stats, Summary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

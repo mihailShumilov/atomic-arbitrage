@@ -203,3 +203,35 @@ async fn other_errors_still_exit_1() {
     ]);
     assert_eq!(code, Some(1), "{err}");
 }
+
+/// Task 038: a refused connection to an endpoint with the key in its path (Alchemy form
+/// `/v2/<key>`). Neither the start-up log, the "retrying" WARN nor the final `Error:` may show
+/// the key; the host stays visible for diagnosis.
+#[test]
+fn connection_error_does_not_print_the_key() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/v2/SECRETKEY");
+    let d = scratch("exit-redact");
+    let (code, out) = run_bin(&[
+        "--rpc-url",
+        &url,
+        "--from",
+        "1",
+        "--to",
+        "1",
+        "--rps",
+        "0",
+        "--max-attempts",
+        "2",
+        "--backoff-ms",
+        "1",
+        "--out-dir",
+        d.join("blocks").to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("retrying") && out.contains("transport"), "the transport error path was not hit: {out}");
+    // The cause from the source chain is visible (macOS / Linux differ in the first letter's case).
+    assert!(out.contains("onnection refused"), "cause missing: {out}");
+    assert!(out.contains(&format!("127.0.0.1:{port}")), "host is kept: {out}");
+    assert!(!out.contains("SECRETKEY") && !out.contains("/v2/"), "key leaked: {out}");
+}

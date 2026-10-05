@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hood_core::ranges::GapRow;
+use hood_core::redact::redact_url;
 use tracing::warn;
 
 use crate::backoff::{Rule, SessionEndSource, StartupWaitReason};
@@ -142,7 +143,8 @@ impl<'a> ConnEvent<'a> {
     /// Upgrade succeeded. `detail`: `<url> requested=<N|-> mode=<mode>` (task 009).
     pub fn connected(url: &str, requested: Option<u64>, mode: ResumeMode, strikes: u32) -> Self {
         let req = requested.map_or_else(|| "-".to_string(), |n| n.to_string());
-        let detail = format!("{url} requested={req} mode={}", mode.as_str());
+        // Task 038: scheme and host only (unchanged for the public feed URL, which has no path).
+        let detail = format!("{} requested={req} mode={}", redact_url(url), mode.as_str());
         Self { http_status: Some(101), strikes: Some(strikes), ..Self::new(ConnEventKind::Connected, "-", detail) }
     }
 
@@ -431,6 +433,17 @@ mod tests {
     /// the same format with the event's current detail. Changing any of
     /// these strings breaks `deploy/healthcheck.sh`, `feed_audit.py` or the
     /// recorder's own reading of old logs.
+    /// Task 038: a feed URL with a path or query (a possible key) is written to
+    /// `connections.tsv` as scheme and host only; URLs without them (the public
+    /// feed, golden rows below) keep their bytes.
+    #[test]
+    fn connected_detail_masks_url_path_and_query() {
+        let e = ConnEvent::connected("wss://u:PW@feed.example.com/v2/SECRETKEY?k=Q", Some(7), ResumeMode::Header, 0);
+        assert_eq!(e.detail, "wss://feed.example.com/*** requested=7 mode=header");
+        let e = ConnEvent::connected("ws://127.0.0.1:9/", None, ResumeMode::NoData, 0);
+        assert!(e.detail.starts_with("ws://127.0.0.1:9/ requested=- "), "{}", e.detail);
+    }
+
     #[test]
     fn golden_rows_of_every_event() {
         let ms = Duration::from_millis;

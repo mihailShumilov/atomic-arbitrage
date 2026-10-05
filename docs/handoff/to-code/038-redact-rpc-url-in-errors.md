@@ -1,5 +1,5 @@
 # 038 — Не допускать ключа провайдера в журналы enricher
-status: ready
+status: done
 phase: 1a
 depends-on: 035
 executor: indexer-engineer

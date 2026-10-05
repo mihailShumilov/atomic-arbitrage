@@ -13,6 +13,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use hood_core::redact::redact_url;
 
 /// Default HTTP port of the local ClickHouse (`docker-compose.yml`, `.env.example`).
 pub const DEFAULT_HTTP_PORT: u16 = 18123;
@@ -103,7 +104,7 @@ pub(crate) fn env_file_value(text: &str, key: &str) -> Option<String> {
 /// `http://` URL whose host is 127.0.0.1, localhost or [::1].
 fn check_loopback(url: &str) -> Result<()> {
     let Some(rest) = url.strip_prefix("http://") else {
-        bail!("CLICKHOUSE_URL {url:?}: only http:// to a loopback address is supported");
+        bail!("CLICKHOUSE_URL {}: only http:// to a loopback address is supported", redact_url(url));
     };
     let authority = rest.split('/').next().unwrap_or_default();
     if authority.contains('@') {

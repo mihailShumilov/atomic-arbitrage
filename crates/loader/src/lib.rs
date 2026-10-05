@@ -35,6 +35,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use decoders::l1_inflows::GatewayRegistry;
 use hood_core::ranges::{self, Range};
+use hood_core::redact::redact_url;
 use tracing::{info, warn};
 
 use crate::blocks_file::{range_from_name, read_blocks_file};
@@ -163,7 +164,7 @@ pub async fn run(a: &Args) -> Result<Summary> {
     } else {
         let ch = Client::new(ChConfig::load(&a.env_file)?)?;
         let v = ch.query("SELECT version() FORMAT TabSeparated").await?;
-        info!("ClickHouse {} version {}", ch.url(), v.trim());
+        info!("ClickHouse {} version {}", redact_url(ch.url()), v.trim());
         load::check_schema(&ch).await?;
         Some(ch)
     };

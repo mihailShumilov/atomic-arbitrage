@@ -21,6 +21,7 @@ use tracing::warn;
 use hood_core::hex::parse_quantity;
 use hood_core::http::parse_retry_after;
 use hood_core::jitter::rand01;
+use hood_core::redact::scrub_url;
 
 use crate::stats::Stats;
 
@@ -328,18 +329,6 @@ impl RateLimiter {
     }
 }
 
-/// Keep only scheme and host: provider URLs often carry the API key in the path.
-pub fn redact_url(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let host = rest.split(['/', '?']).next().unwrap_or("");
-            let host = host.rsplit('@').next().unwrap_or(host);
-            format!("{scheme}://{host}/…")
-        }
-        None => "<rpc>".into(),
-    }
-}
-
 /// Read-only JSON-RPC client with rate limit, retries and call budget.
 pub struct Rpc {
     client: reqwest::Client,
@@ -511,9 +500,28 @@ impl Rpc {
             Failure::Timeout
         } else {
             self.stats.update(|s| s.transport_errors += 1);
-            Failure::retry(FailKind::Transient, format!("transport: {e:#}"), None)
+            Failure::retry(FailKind::Transient, transport_text(e, &self.url), None)
         }
     }
+}
+
+/// `transport: <error>: <source>: …` without the endpoint URL (task 038).
+///
+/// `reqwest::Error`'s `Display` shows only the kind and the URL, never the cause, so the
+/// `source()` chain is joined by hand: refused / DNS / TLS stay distinguishable in journald.
+/// The provider key is part of the URL (Alchemy: `/v2/<key>`): reqwest's own URL is dropped
+/// with `without_url`, and the joined text is scrubbed of `url` as well, since the source
+/// chain comes from libraries we do not control.
+fn transport_text(e: reqwest::Error, url: &str) -> String {
+    let e = e.without_url();
+    let mut text = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        text.push_str(": ");
+        text.push_str(&s.to_string());
+        src = s.source();
+    }
+    format!("transport: {}", scrub_url(&text, url))
 }
 
 /// Parse a batch response and reorder it to match `calls`. Every call must
@@ -704,9 +712,37 @@ mod tests {
         assert_eq!(t.elapsed(), Duration::from_millis(300));
     }
 
-    #[test]
-    fn url_redaction() {
-        assert_eq!(redact_url("https://x.example.com/v2/SECRETKEY"), "https://x.example.com/…");
-        assert_eq!(redact_url("https://user:pw@h.io?key=1"), "https://h.io/…");
+    /// URL of a port that was free a moment ago: nothing listens there, the connect is refused.
+    fn closed_port_url() -> String {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        format!("http://127.0.0.1:{port}/v2/SECRETKEY")
+    }
+
+    /// Task 038 on a real reqwest error chain (closed port on loopback): reqwest itself puts the
+    /// key in the error; `transport_text` keeps the cause and drops the key.
+    #[tokio::test]
+    async fn transport_text_keeps_the_cause_and_drops_the_key() {
+        let url = closed_port_url();
+        let e = reqwest::Client::new().post(&url).body("{}").send().await.expect_err("nothing listens on the port");
+        assert!(std::error::Error::source(&e).is_some(), "a real source chain: {e:?}");
+        assert!(format!("{e:?}").contains("SECRETKEY"), "precondition: reqwest's own Debug carries the URL");
+        let text = transport_text(e, &url);
+        assert!(!text.contains("SECRETKEY") && !text.contains("/v2/"), "key leaked: {text}");
+        assert!(text.starts_with("transport: error sending request"), "{text}");
+        // macOS and Linux differ in the case of the first letter.
+        assert!(text.contains("onnection refused"), "the cause is kept: {text}");
+    }
+
+    /// The same through `Rpc` (retry loop, `CallError`): Display, alternate, Debug.
+    #[tokio::test]
+    async fn connection_error_does_not_leak_the_key() {
+        let url = closed_port_url();
+        let rpc = Rpc::new(&url, 0.0, Duration::from_secs(5), policy(1), Arc::new(Stats::default())).unwrap();
+        let err = rpc.chain_id().await.expect_err("nothing listens on the port");
+        assert!(matches!(err, CallError::Failed(_)), "expected a transport failure, got {err}");
+        for text in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+            assert!(!text.contains("SECRETKEY"), "key leaked: {text}");
+            assert!(text.contains("transport") && text.contains("onnection refused"), "{text}");
+        }
     }
 }

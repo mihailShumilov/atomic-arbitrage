@@ -10,7 +10,8 @@
 //! loader): [`ranges`] (block ranges, `gaps.tsv` / `filled.tsv`), [`feedline`]
 //! (one line of the raw feed on disk), [`http`]
 //! (`Retry-After`), [`fsutil`] (atomic write, fsync, append), [`hex`]
-//! (JSON-RPC quantities), [`jitter`] (random spread of retry pauses).
+//! (JSON-RPC quantities), [`jitter`] (random spread of retry pauses), [`redact`]
+//! (endpoint URLs without provider keys in logs and errors).
 
 pub mod feedline;
 pub mod fsutil;
@@ -18,6 +19,7 @@ pub mod hex;
 pub mod http;
 pub mod jitter;
 pub mod ranges;
+pub mod redact;
 
 use serde::Deserialize;
 

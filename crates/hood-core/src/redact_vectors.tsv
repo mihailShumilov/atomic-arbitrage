@@ -1,0 +1,21 @@
+# Shared test vectors of URL redaction (task 038): input <TAB> expected redact_url(input).
+# Read by crates/hood-core/src/redact.rs (tests) and by
+# .claude/skills/feed-audit/scripts/test_feed_audit.py: both copies must agree.
+# Lines starting with # are comments; inputs are taken verbatim (spaces included).
+https://robinhood-mainnet.g.alchemy.com/v2/SECRETKEY	https://robinhood-mainnet.g.alchemy.com/***
+https://user:pw@h.io?key=SECRET	https://h.io/***
+https://h.io#SECRET	https://h.io/***
+http://127.0.0.1:18123/	http://127.0.0.1:18123/
+ws://u:pw@127.0.0.1:9/	ws://127.0.0.1:9/
+wss://feed.mainnet.chain.robinhood.com	wss://feed.mainnet.chain.robinhood.com
+https://rpc.mainnet.chain.robinhood.com	https://rpc.mainnet.chain.robinhood.com
+ http://[::1]:8545/v2/K 	http://[::1]:8545/***
+https://h.io\v2\SECRETKEY	https://h.io/***
+svn+ssh.x-1://h.io/p	svn+ssh.x-1://h.io/***
+	***
+SECRETKEY	***
+robinhood.g.alchemy.com/v2/SECRETKEY	***
+h.io/v2/SECRETKEY?r=https://x	***
+1http://h.io/SECRETKEY	***
+https://	***
+https:///v2/SECRETKEY	***

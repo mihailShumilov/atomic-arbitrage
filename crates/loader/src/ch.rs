@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use hood_core::redact::redact_url;
+
 use crate::config::ChConfig;
 
 /// Upper bound of rows in one atomic INSERT ([`INSERT_SETTINGS`] sets `max_insert_block_size`
@@ -96,9 +98,12 @@ impl Client {
             .body(body)
             .send()
             .await
-            .with_context(|| format!("POST {}", self.cfg.url))?;
+            // Task 038: reqwest's error text carries the full URL with the query (the SQL); keep
+            // endpoints in errors to scheme and host only.
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("POST {}", redact_url(&self.cfg.url)))?;
         let status = resp.status();
-        let text = resp.text().await.context("read ClickHouse response")?;
+        let text = resp.text().await.map_err(reqwest::Error::without_url).context("read ClickHouse response")?;
         if !status.is_success() {
             return Err(ServerError { status: status.as_u16(), message: text.trim().to_owned() }.into());
         }

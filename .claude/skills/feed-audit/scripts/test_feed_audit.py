@@ -20,14 +20,20 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import feed_audit as fa
+
+# Test vectors shared with crates/hood-core/src/redact.rs (task 038).
+REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), *[".."] * 4))
+REDACT_VECTORS = os.path.join(REPO_ROOT, "crates", "hood-core", "src", "redact_vectors.tsv")
 
 HAVE_ZSTD = shutil.which("zstd") is not None
 # 2026-10-01 06:00:00 UTC in ns; all synthetic hours are 2026-10-01 06 and 07.
@@ -182,6 +188,39 @@ class PureFunctions(unittest.TestCase):
         self.assertEqual(fa.frame_len(b"garbage!", 0), (None, "invalid"))
         self.assertEqual(fa.split_frames(skippable + skippable), (2, 22, None))
         self.assertEqual(fa.split_frames(skippable + b"garbage!"), (1, 11, "invalid"))
+
+    @unittest.skipUnless(os.path.exists(REDACT_VECTORS), "repo checkout without crates/hood-core")
+    def test_redact_shared_vectors(self):
+        # Task 038: the same vectors as hood_core::redact (crates/hood-core/src/redact_vectors.tsv).
+        n = 0
+        with open(REDACT_VECTORS, encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                if line.startswith("#"):
+                    continue
+                given, want = line.split("\t")
+                self.assertEqual(fa.redact_url(given), want, repr(given))
+                n += 1
+        self.assertGreaterEqual(n, 15, "vectors file looks truncated")
+
+    def test_scrub_url(self):
+        url = "https://u:PW@h.io/v2/SECRETKEY"
+        s = fa.scrub_url(f"<urlopen error for {url}> /v2/SECRETKEY u:PW", url)
+        self.assertNotIn("SECRETKEY", s)
+        self.assertNotIn("PW", s)
+        self.assertIn("https://h.io/***", s)
+        self.assertEqual(fa.scrub_url("GET https://h.io/ failed", "https://h.io/"), "GET https://h.io/ failed")
+        self.assertEqual(fa.scrub_url("bad value SECRET", "SECRET"), "bad value ***")
+
+    def test_rpc_failure_does_not_print_the_key(self):
+        # A closed port on loopback: no network outside this machine.
+        with socket.socket() as sk:
+            sk.bind(("127.0.0.1", 0))
+            port = sk.getsockname()[1]
+        url = f"http://127.0.0.1:{port}/v2/SECRETKEY"
+        t = types.SimpleNamespace(blocks={1: ("0x", 1, 3, 1)}, fails=[], warns=[])
+        fa.check_rpc(t, url, 1, 1)
+        self.assertTrue(t.fails, "the refused connection is reported")
+        self.assertFalse(any("SECRETKEY" in f for f in t.fails), t.fails)
 
     def test_rpc_pick_is_deterministic_for_a_seed(self):
         # blocks: seq -> (blockHash, header.blockNumber, kind, running max); every 7th is delayed (kind 9)

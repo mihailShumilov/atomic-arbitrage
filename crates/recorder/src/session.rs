@@ -6,6 +6,7 @@
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
+use hood_core::redact::redact_url;
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
@@ -217,7 +218,7 @@ pub async fn run_connection(
         Ok(ws) => ws,
         Err(e) => return e.into(),
     };
-    info!(url = p.url, requested = ?requested, "connected");
+    info!(url = %redact_url(p.url), requested = ?requested, "connected");
     on_connected();
     let started = Instant::now();
     // Last frame with a block; the session start counts as one.

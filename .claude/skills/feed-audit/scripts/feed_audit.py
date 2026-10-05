@@ -322,6 +322,53 @@ def parse_messages(env):
     return out
 
 
+_SCHEME_FIRST = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+_SCHEME_CHARS = _SCHEME_FIRST | frozenset("0123456789+-.")
+
+
+def _url_parts(url):
+    """(scheme, userinfo, host, rest) of scheme://[userinfo@]host[/path?query#frag], or None.
+
+    The scheme must match RFC 3986 (ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )), so a
+    value like h.io/v2/KEY?r=https://x is not a URL. A backslash ends the authority too:
+    the Rust url crate (reqwest) reads it as a path separator.
+    """
+    scheme, sep, after = url.partition("://")
+    if not sep or not scheme or scheme[0] not in _SCHEME_FIRST or not set(scheme) <= _SCHEME_CHARS:
+        return None
+    end = min([i for i in (after.find(c) for c in "/\\?#") if i >= 0] or [len(after)])
+    authority, rest = after[:end], after[end:]
+    userinfo, at, host = authority.rpartition("@")
+    return scheme, userinfo if at else "", host, rest
+
+
+def redact_url(url):
+    """Scheme and host only (task 038): provider keys live in the path, query or userinfo.
+
+    Same rule as hood_core::redact::redact_url: a non-trivial path/query/fragment
+    becomes /***, a value that is not scheme://host is masked whole.
+    """
+    p = _url_parts(url.strip())
+    if p is None or not p[2]:
+        return "***"
+    scheme, _, host, rest = p
+    return "%s://%s%s" % (scheme, host, rest) if rest in ("", "/") else "%s://%s/***" % (scheme, host)
+
+
+def scrub_url(text, url):
+    """text without url (replaced by redact_url) and without its userinfo and path/query."""
+    url = url.strip()
+    if not url:
+        return text
+    out = text.replace(url, redact_url(url))
+    p = _url_parts(url)
+    if p is not None:
+        for secret in (p[1], "" if p[3] == "/" else p[3]):
+            if secret:
+                out = out.replace(secret, "***")
+    return out
+
+
 def rpc_blocks(url, numbers):
     calls = [{"jsonrpc": "2.0", "id": n, "method": "eth_getBlockByNumber", "params": [hex(n), False]} for n in numbers]
     req = urllib.request.Request(
@@ -603,7 +650,7 @@ def check_rpc(t, url, sample, seed):
     try:
         res = rpc_blocks(url, pick)
     except Exception as e:  # report, don't crash the audit
-        t.fails.append("rpc check failed: %s" % e)
+        t.fails.append("rpc check failed: %s" % scrub_url(str(e), url))
         res = None
     hash_bad, l1_bad = [], []
     for s in pick if res else []:
